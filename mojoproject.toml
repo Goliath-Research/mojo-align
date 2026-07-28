@@ -1,0 +1,18 @@
+[project]
+name = "methylGrapher-mojo"
+version = "0.1.0"
+description = "Mojo port of methylGrapher: pangenome graph methylation calling"
+license = "MIT"
+authors = ["David Izada Rodriguez <davidizadar@GoliathResearch.com>"]
+
+[dependencies]
+# Mojo standard library is bundled with the MAX/Mojo toolchain.
+# Add third-party Magic / conda packages here when needed.
+# e.g.: numpy = ">=1.26"
+
+[tool.magic]
+channel = "https://conda.modular.com/max"
+
+[scripts]
+run = "mojo src/main.mojo"
+test = "mojo test/"
