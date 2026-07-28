@@ -1,259 +1,227 @@
-# main.mojo
-# CLI dispatcher — port of main.py
+# src/main.mojo
+# methylGrapher-mojo CLI dispatcher — Mojo 1.0 entry point.
 #
-# Commands (same as Python version):
-#   preparegenome  — convert GFA + index for vg giraffe
-#   align          — FASTQ -> bisulfite conversion -> vg giraffe
-#   methylcall     — GAF -> methylation calls
-#   conversionrate — estimate bisulfite conversion rate
-#   mergecpg       — merge cytosine calls into CpG-level output
-#   main           — align + methylcall in sequence
-#   mergegaf       — manual GAF merge (low-memory fallback)
-#   vg_check       — verify vg binary
-#   help / -h      — print usage
+# `help` and `vg_check` are implemented natively in Mojo (no Python engine
+# needed for either). Every other command (`PrepareGenome`, `Align`,
+# `MethylCall`, `MergeCpG`, `Main`, `ConversionRate`) is forwarded, argv
+# unchanged, to the faithful-ported Python engine at `engine/cli.py` via
+# Mojo-Python interop — this is the "cutover" step: business logic still
+# lives in the well-tested Python engine while the CLI surface, process
+# entry point, and hot per-record parsers (`src/mcall_core.mojo`) move to
+# Mojo. See MIGRATION_LOG.md for the full rationale and phased plan.
+#
+# Usage (same argv shape as upstream methylGrapher / `engine.cli`):
+#   mojo src/main.mojo help
+#   mojo src/main.mojo MethylCall -work_dir <dir> -index_prefix <prefix> ...
+#
+# Mojo 1.0.0b2 notes: `fn` was removed (all `def`); stdlib imports need the
+# `std.` prefix; Python interop is `from std.python import Python`.
 
-from sys import argv, exit
-from .utility import (
-    ConfigParser, gfa_converter, bool_from_str,
-    system_execute, read_graph_methyl
-)
-from .alignments import alignment_main, alignment_merge_main, alignment_cleanup
-from .gfa import (
-    GraphicalFragmentAssembly, add_lambda_genome_to_gfa,
-    get_all_cpg_from_graph
-)
-from .mcall import mcall_main
+from std.python import Python
+from std.sys import argv as sys_argv, exit
 
-# ---------------------------------------------------------------------------
-# Version & help text
-# ---------------------------------------------------------------------------
+from utility import system_execute
 
-alias VERSION = "0.1.0-mojo"
+comptime VERSION = "0.1.0-mojo"
 
-fn help_text() -> String:
-    return """
-methylGrapher-mojo v""" + VERSION + """
+# Kept in sync with engine/cli.py and stock methylGrapher 0.2.0 main.py CLI
+# defaults (identity=20, mapq=0). Pipeline does not pass these flags.
+comptime DEFAULT_MINIMUM_IDENTITY = 20
+comptime DEFAULT_MINIMUM_MAPQ = 0
 
-Usage: mojo src/main.mojo <command> [arguments]
 
-Commands:
-  help            Print this message
-  PrepareGenome   Add lambda spike-in, convert GFA, build vg index
-  Align           Convert FASTQs and run vg giraffe alignment
-  MethylCall      Call methylation from GAF alignments
-  ConversionRate  Estimate bisulfite conversion rate (requires spike-in)
-  MergeCpG        Merge per-cytosine calls into CpG-level output
-  Main            Run Align + MethylCall in sequence
-  MergeGAF        Manually merge split GAF files (low-memory fallback)
-  vg_check        Verify vg binary installation
+def header() -> String:
+    return String(
+        "███╗   ███╗███████╗████████╗██╗  ██╗██╗   ██╗██╗      ██████╗ "
+        "██████╗  █████╗ ██████╗ ██╗  ██╗███████╗██████╗ \n"
+        "████╗ ████║██╔════╝╚══██╔══╝██║  ██║╚██╗ ██╔╝██║     ██╔════╝ "
+        "██╔══██╗██╔══██╗██╔══██╗██║  ██║██╔════╝██╔══██╗\n"
+        "██╔████╔██║█████╗     ██║   ███████║ ╚████╔╝ ██║     ██║  ███╗"
+        "██████╔╝███████║██████╔╝███████║█████╗  ██████╔╝\n"
+        "██║╚██╔╝██║██╔══╝     ██║   ██╔══██║  ╚██╔╝  ██║     ██║   ██║"
+        "██╔══██╗██╔══██║██╔═══╝ ██╔══██║██╔══╝  ██╔══██╗\n"
+        "██║ ╚═╝ ██║███████╗   ██║   ██║  ██║   ██║   ███████╗╚██████╔╝"
+        "██║  ██║██║  ██║██║     ██║  ██║███████╗██║  ██║\n"
+        "╚═╝     ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝ "
+        "╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝"
+    )
 
-Arguments (same as Python version):
-  -gfa            Input GFA file path
-  -prefix         Output file prefix
-  -fq1 / -fq2     FASTQ input files
-  -index_prefix   Path prefix of vg giraffe index
-  -work_dir       Working directory (default: ./)
-  -t              Thread count (default: 1)
-  -lp             Lambda phage reference FASTA (for PrepareGenome)
-  -minimum_identity   Min alignment identity % (default: 20)
-  -minimum_mapq       Min mapping quality (default: 0)
-  -discard_multimapped  Y/N (default: Y)
-  -cg_only          Y/N — output only CG context (default: Y)
-  -batch_size       Reads per processing batch (default: 4096)
-  -directional      Y/N — directional library (default: Y)
-  -compress         Y/N — gzip intermediate files (default: N)
-"""
 
-# ---------------------------------------------------------------------------
-# Argument parser  (mirrors manual argv parsing in main.py)
-# ---------------------------------------------------------------------------
+def help_text() -> String:
+    var identity = String(DEFAULT_MINIMUM_IDENTITY)
+    var mapq = String(DEFAULT_MINIMUM_MAPQ)
 
-fn parse_args(args: List[String]) raises -> Dict[String, String]:
-    """Parse -key value pairs from command-line arguments."""
-    var kv = Dict[String, String]()
+    var body = String(
+        "Usage: mojo src/main.mojo <command> <arguments>\n"
+        "Or (via bin/methylGrapher): methylGrapher <command> <arguments>\n"
+        "Commands:\n"
+        "    help\n"
+        "    PrepareGenome\n"
+        "    Main\n"
+        "    Align\n"
+        "    MethylCall\n"
+        "    ConversionRate\n"
+        "    MergeCpG\n"
+        "    vg_check\n"
+        "\n"
+        "Native Mojo commands:\n"
+        "    help       Print this message.\n"
+        "    vg_check   Verify the `vg` binary is installed and reachable.\n"
+        "\n"
+        "Commands below are dispatched to the Python engine (engine/cli.py)\n"
+        "with the same arguments as upstream methylGrapher; run `methylGrapher\n"
+        "help` (which this text mirrors) or see README.md for full details.\n"
+        "\n"
+        "PrepareGenome:\n"
+        "    methylGrapher PrepareGenome -gfa <path> -prefix <prefix> [-lp <lambda_fa>] [-t <threads>]\n"
+        "\n"
+        "Main:\n"
+        "    methylGrapher Main   # runs Align then MethylCall in sequence\n"
+        "\n"
+        "Align:\n"
+        "    methylGrapher Align -index_prefix <prefix> -fq1 <fastq> [-fq2 <fastq>] -work_dir <dir>\n"
+        "        [-t <threads>] [-directional <Y/N>] [-compress <Y/N>]\n"
+        "\n"
+        "MethylCall:\n"
+        "    methylGrapher MethylCall -work_dir <dir> -index_prefix <prefix>\n"
+        "        [-minimum_identity <n>] (default: "
+        + identity
+        + ")\n"
+        "        [-minimum_mapq <n>] (default: "
+        + mapq
+        + ")\n"
+        "        [-discard_multimapped <Y/N>] (default: Y)\n"
+        "        [-cg_only <Y/N>] (default: Y)\n"
+        "        [-genotyping_cytosine <Y/N>] (default: N)\n"
+        "        [-t <threads>] [-batch_size <n>] (default: 4096)\n"
+        "\n"
+        "ConversionRate:\n"
+        "    methylGrapher ConversionRate -index_prefix <prefix> -work_dir <dir>\n"
+        "\n"
+        "MergeCpG:\n"
+        "    methylGrapher MergeCpG -index_prefix <prefix> -work_dir <dir>\n"
+        "\n"
+        "vg_check:\n"
+        "    methylGrapher vg_check [-vg_path <path>]\n"
+    )
+
+    return "\n\n" + header() + "\n\nmethylGrapher-mojo\nVersion: " + VERSION + "\n\n" + body + "\n\n"
+
+
+def get_kv_value(args: List[String], key: String, default: String) -> String:
+    """Scan `args` for a `-<key> <value>` pair (mirrors the `-key value`
+    convention used throughout methylGrapher's argv parsing)."""
     var i = 0
     while i < len(args):
-        var arg = args[i]
-        if arg.startswith("-"):
-            var key = arg[1:]
+        var a = args[i]
+        if a.byte_length() > 1 and a.startswith("-") and a[byte=1 : a.byte_length()] == key:
             if i + 1 < len(args):
-                kv[key] = args[i + 1]
-                i += 2
-            else:
-                raise Error("Missing value for argument: " + arg)
-        else:
-            raise Error("Unknown positional argument: " + arg)
-    return kv
+                return args[i + 1]
+            return default
+        i += 1
+    return default
 
-# ---------------------------------------------------------------------------
-# main()
-# ---------------------------------------------------------------------------
 
-fn main() raises:
-    var args = argv()
-    # argv()[0] is the script path; skip it
-    var cmd_args = List[String]()
-    for i in range(1, len(args)):
-        cmd_args.append(str(args[i]))
+def run_vg_check(args: List[String]) raises:
+    """Verify the `vg` binary is installed and reachable.
 
-    # Defaults
-    var vg_path  = String("vg")
-    var thread   = 1
+    Native Mojo port of `utility.vg_binary_check()` in
+    python_reference/utility.py. Unlike the Python original, this does not
+    consult `config.ini` for a default `vg_path` — pass `-vg_path` explicitly
+    if `vg` is not on `PATH`.
+    """
+    var vg_path = get_kv_value(args, "vg_path", "vg")
 
-    # Load config.ini if present
-    try:
-        var cfg = ConfigParser("config.ini")
-        cfg.parse()
-        var cfg_vg = cfg.get("default", "vg_path")
-        var cfg_t  = cfg.get("default", "thread")
-        if len(cfg_vg) > 0: vg_path = cfg_vg
-        if len(cfg_t)  > 0:
-            try: thread = int(cfg_t)
-            except: pass
-    except:
-        pass
+    var result = system_execute(vg_path + " version")
+    var combined = result.stdout + result.stderr
 
-    if len(cmd_args) == 0:
+    print("Checking vg binary @ " + vg_path)
+    print(combined)
+
+    if "vg version v" in combined:
+        print("Success: vg binary seems to be fine")
+    else:
+        print("Error: Cannot find vg version")
+
+
+def dispatch_to_engine(raw_args: List[String]) raises -> Int:
+    """Forward the CLI argv (unchanged) to the Python engine's
+    `engine.cli.main()` via Mojo-Python interop.
+
+    Adds the current working directory (the repo root — `bin/methylGrapher`
+    always `cd`s there first) to `sys.path` so `import engine.cli` resolves
+    regardless of how Mojo was invoked.
+    """
+    var os_mod = Python.import_module("os")
+    var sys_mod = Python.import_module("sys")
+
+    var repo_root = os_mod.getcwd()
+    sys_mod.path.insert(0, repo_root)
+
+    var cli = Python.import_module("engine.cli")
+
+    var py_args = Python.list()
+    for a in raw_args:
+        py_args.append(a)
+
+    var rc_obj = cli.main(py_args)
+
+    # The embedded CPython interpreter's stdout is buffered separately from
+    # Mojo's `print()`; flush explicitly so engine output is not lost/
+    # reordered relative to anything Mojo prints afterwards.
+    sys_mod.stdout.flush()
+    sys_mod.stderr.flush()
+
+    if rc_obj is None:
+        return 0
+    return Int(py=rc_obj)
+
+
+def main() raises:
+    var raw = sys_argv()
+    var args = List[String]()
+    for i in range(1, len(raw)):
+        args.append(String(raw[i]))
+
+    if len(args) == 0:
+        print("No command specified. Use 'help' for more information.")
         print(help_text())
         exit(0)
 
-    var command = cmd_args[0].lower()
-    var rest = List[String]()
-    for i in range(1, len(cmd_args)):
-        rest.append(cmd_args[i])
+    var command = args[0].lower()
 
-    var valid_commands = [
-        "preparegenome", "align", "methylcall", "conversionrate",
-        "mergecpg", "help", "-h", "--help", "main", "mergegaf", "vg_check"
-    ]
-    if command not in valid_commands:
+    var valid_commands = List[String]()
+    valid_commands.append("preparegenome")
+    valid_commands.append("align")
+    valid_commands.append("methylcall")
+    valid_commands.append("conversionrate")
+    valid_commands.append("mergecpg")
+    valid_commands.append("help")
+    valid_commands.append("-h")
+    valid_commands.append("--help")
+    valid_commands.append("main")
+    valid_commands.append("mergegaf")
+    valid_commands.append("vg_check")
+
+    var known = False
+    for c in valid_commands:
+        if c == command:
+            known = True
+
+    if not known:
         print("Unknown command: " + command)
         exit(1)
 
-    if command in ["help", "-h", "--help"]:
+    if command == "help" or command == "-h" or command == "--help":
         print(help_text())
         exit(0)
 
-    var kvargs = parse_args(rest)
-
-    # Override thread from CLI
-    if "thread" in kvargs:
-        try: thread = int(kvargs["thread"])
-        except: pass
-        _ = kvargs.pop("thread", "")
-    if "t" in kvargs:
-        try: thread = int(kvargs["t"])
-        except: pass
-        _ = kvargs.pop("t", "")
-    if "vg_path" in kvargs:
-        vg_path = kvargs["vg_path"]
-
-    # Common parameters with defaults
-    var work_dir             = kvargs.get("work_dir", "./")
-    var minimum_identity     = 20.0
-    var minimum_mapq         = 0
-    var batch_size           = 4096
-    var discard_multimapped  = True
-    var cg_only              = True
-    var compress             = False
-    var directional          = True
-    var index_prefix         = kvargs.get("index_prefix", "")
-    var fq1                  = kvargs.get("fq1", "")
-    var fq2                  = kvargs.get("fq2", "")
-
-    try:
-        if "minimum_identity" in kvargs: minimum_identity = Float64(int(kvargs["minimum_identity"]))
-        if "minimum_mapq"     in kvargs: minimum_mapq     = int(kvargs["minimum_mapq"])
-        if "batch_size"       in kvargs: batch_size       = int(kvargs["batch_size"])
-        if "discard_multimapped" in kvargs: discard_multimapped = bool_from_str(kvargs["discard_multimapped"])
-        if "cg_only"          in kvargs: cg_only          = bool_from_str(kvargs["cg_only"])
-        if "compress"         in kvargs: compress         = bool_from_str(kvargs["compress"])
-        if "directional"      in kvargs: directional      = bool_from_str(kvargs["directional"])
-    except:
-        pass
-
-    # ---- dispatch ----
-
-    if command == "preparegenome":
-        var gfa_file   = kvargs.get("gfa", "")
-        var prefix     = kvargs.get("prefix", "")
-        var lambda_ref = kvargs.get("lp", "")
-
-        var gfa_with_lambda = prefix + ".wl.gfa"
-        _ = add_lambda_genome_to_gfa(gfa_file, gfa_with_lambda, lambda_ref)
-        get_all_cpg_from_graph(gfa_file, prefix + ".cpg.tsv")
-        gfa_converter(gfa_with_lambda, prefix + ".wl", compress=compress)
-
-        # Build vg index for each converted GFA
-        for conv in ["C2T", "G2A"]:
-            var gfa_conv = prefix + ".wl." + conv + ".gfa"
-            var idx      = prefix + ".wl." + conv
-            var cmd = (
-                vg_path + " autoindex -g " + gfa_conv +
-                " -p " + idx + " -w giraffe -t " + str(thread)
-            )
-            _ = system_execute(cmd)
-        exit(0)
-
-    if command == "align":
-        alignment_main(
-            fq1, fq2, work_dir, index_prefix,
-            compress=compress, thread=thread,
-            directional=directional, vg_path=vg_path
-        )
-        exit(0)
-
-    if command == "methylcall":
-        var gfa_worker_num = 1
-        if thread > 20: gfa_worker_num = 2
-        mcall_main(
-            work_dir, index_prefix,
-            cg_only=cg_only,
-            minimum_identity=minimum_identity,
-            minimum_mapq=minimum_mapq,
-            discard_multimapped=discard_multimapped,
-            process_count=thread,
-            gfa_worker_num=gfa_worker_num,
-            batch_size=batch_size
-        )
-        exit(0)
-
-    if command == "main":
-        var gfa_worker_num = 1
-        if thread > 20: gfa_worker_num = 2
-        alignment_main(
-            fq1, fq2, work_dir, index_prefix,
-            compress=compress, thread=thread,
-            directional=directional, vg_path=vg_path
-        )
-        mcall_main(
-            work_dir, index_prefix,
-            cg_only=cg_only,
-            minimum_identity=minimum_identity,
-            minimum_mapq=minimum_mapq,
-            discard_multimapped=discard_multimapped,
-            process_count=thread,
-            gfa_worker_num=gfa_worker_num,
-            batch_size=batch_size
-        )
-        exit(0)
-
-    if command == "conversionrate":
-        # TODO: port estimate_conversion_rate_print from utility.py
-        print("conversionrate: not yet implemented in Mojo port")
-        exit(1)
-
-    if command == "mergecpg":
-        # TODO: port merge_graph_cytosines from utility.py
-        print("mergecpg: not yet implemented in Mojo port")
-        exit(1)
-
-    if command == "mergegaf":
-        alignment_merge_main(work_dir, worker_num=thread)
-        alignment_cleanup(work_dir)
-        exit(0)
-
     if command == "vg_check":
-        var out_err = system_execute(vg_path + " version")
-        print(out_err[0])
+        run_vg_check(args)
         exit(0)
+
+    # Everything else (PrepareGenome / Align / MethylCall / ConversionRate /
+    # MergeCpG / Main / MergeGAF) is handled by the Python engine, with the
+    # exact same argv shape as methylGrapher / `python -m engine.cli`.
+    var rc = dispatch_to_engine(args)
+    exit(rc)

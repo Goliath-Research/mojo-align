@@ -1,0 +1,22 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Runtime outputs
+tests/data/work_dir/*.methyl
+tests/data/work_dir/*.cpg.tsv
+tests/data/work_dir/tmp/

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# bin/methylGrapher — methylGrapher-mojo launcher.
+#
+# By default runs the Python engine (engine/cli.py), the faithful 0.2.0 port
+# with the methylGrapher-mojo cutover patches (see MIGRATION_LOG.md).
+# Set METHYLGRAPHER_ENGINE=mojo to run the Mojo CLI (src/main.mojo) instead,
+# which implements `help`/`vg_check` natively and dispatches every other
+# command to the same Python engine via Mojo-Python interop.
+#
+#   methylGrapher help
+#   methylGrapher MethylCall -work_dir ... -index_prefix ...
+#   METHYLGRAPHER_ENGINE=mojo methylGrapher help
+#
+# Always runs from the repository root (regardless of the caller's cwd) and
+# through `pixi run`, so the pinned Mojo 1.0.0b2 / Python toolchain in
+# pixi.toml is used rather than any ambient system interpreter.
+
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+export PATH="$HOME/.pixi/bin:$PATH"
+
+cd "$REPO_ROOT"
+
+if [[ "${METHYLGRAPHER_ENGINE:-}" == "mojo" ]]; then
+    exec pixi run mojo src/main.mojo "$@"
+else
+    exec pixi run python -m engine.cli "$@"
+fi

@@ -1,0 +1,16 @@
+[workspace]
+name = "methylGrapher-mojo"
+version = "0.1.0"
+description = "Mojo port of methylGrapher"
+authors = ["David Izada Rodriguez <davidizadar@GoliathResearch.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+platforms = ["linux-aarch64"]
+
+[dependencies]
+modular = "*"
+python = ">=3.11,<3.14"
+
+[tasks]
+run = "mojo src/main.mojo"
+help = "mojo src/main.mojo help"
+test = "mojo test/"
