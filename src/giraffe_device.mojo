@@ -15,22 +15,33 @@ def select_device(requested: String) raises -> String:
     var req = requested.lower()
     if req == "" or req == "auto":
         var os_mod = Python.import_module("os")
-        var env = String(os_mod.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "auto"))
+        # align_device is the dual-Align contract alias; giraffe_device remains supported.
+        var env = String(os_mod.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", ""))
+        if env == "":
+            env = String(os_mod.environ.get("METHYLGRAPHER_ALIGN_DEVICE", "auto"))
         req = env.lower()
+        if req == "":
+            req = String("auto")
     if req == "auto":
         var sp = Python.import_module("subprocess")
+        var shutil = Python.import_module("shutil")
         var r = sp.run(["nvidia-smi", "-L"], capture_output=True, text=True)
         if String(r.returncode) == "0":
             return String(DEVICE_NVIDIA)
-        var r2 = sp.run(
-            ["rocm-smi", "--showproductname"], capture_output=True, text=True
-        )
-        if String(r2.returncode) == "0":
-            return String(DEVICE_AMD)
+        if shutil.which("rocm-smi") is not None:
+            var r2 = sp.run(
+                ["rocm-smi", "--showproductname"], capture_output=True, text=True
+            )
+            if String(r2.returncode) == "0":
+                return String(DEVICE_AMD)
+        if shutil.which("rocminfo") is not None:
+            var r3 = sp.run(["rocminfo"], capture_output=True, text=True)
+            if String(r3.returncode) == "0":
+                return String(DEVICE_AMD)
         return String(DEVICE_CPU)
     if req == "cuda":
         return String(DEVICE_NVIDIA)
-    if req == "hip":
+    if req == "hip" or req == "rocm":
         return String(DEVICE_AMD)
     if req == "cpu" or req == "nvidia" or req == "amd":
         return req

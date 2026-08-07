@@ -26,7 +26,8 @@ merge steps). Set `METHYLGRAPHER_MCALL_ENGINE=python` to force full
 | `src/mcall.mojo` | 🟢 Complete — native `alignment_to_methylation` + `parallelize` MethylCall |
 | `src/merge_cpg.mojo` / `conversion_rate.mojo` | 🟢 Complete — native MergeCpG + ConversionRate |
 | `src/align.mojo` | 🟢 Complete — Align orchestration; map kernel via `engine.align_backends` |
-| `src/giraffe_*.mojo` | 🟢 Complete — MojoGiraffe (GFA or GBZ→GAF); GPU seed `nvidia:sm_90` |
+| `src/giraffe_*.mojo` | 🟢 Complete — MojoGiraffe (GFA or GBZ→GAF); GPU seed `nvidia:sm_90` / `amdgpu:gfx942` |
+| `engine/fq2bam_meth.py` + `MojoFq2bamMeth` | 🟡 MVP — portable linear WGBS Align (Clara substitute); BWA-MEM + Parabricks-shaped QC JSON |
 | `src/main.mojo` | 🟢 Complete — native: `help`/`vg_check`/`Align`/`MojoGiraffe`/`MethylCall`/`MergeCpG`/`ConversionRate`; PrepareGenome/Main → `engine.cli` |
 | Align backends | 🟢 `cpu_vg` / `gpu_giraffe` / `mojo_giraffe` — `docs/GIRAFFE_SPEC.md`; Parabricks GAF **NO-GO** — `docs/PHASE0_GH200_ALIGN.md` |
 | `bin/methylGrapher` | 🟢 Complete — `METHYLGRAPHER_ENGINE=mojo\|python` (default: python) |

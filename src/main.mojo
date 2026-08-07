@@ -62,6 +62,7 @@ def help_text() -> String:
         "    Main\n"
         "    Align\n"
         "    MojoGiraffe\n"
+        "    MojoFq2bamMeth\n"
         "    MethylCall\n"
         "    ConversionRate\n"
         "    MergeCpG\n"
@@ -70,6 +71,7 @@ def help_text() -> String:
         "Native Mojo commands:\n"
         "    help / vg_check / Align / MethylCall / MergeCpG / ConversionRate\n"
         "    Align uses pluggable map backends (cpu_vg | gpu_giraffe | mojo_giraffe).\n"
+        "    MojoFq2bamMeth: portable linear WGBS Align (Clara substitute).\n"
         "\n"
         "PrepareGenome / Main / MergeGAF dispatch to the Python engine\n"
         "(engine/cli.py). Set METHYLGRAPHER_MCALL_ENGINE=python for full\n"
@@ -92,6 +94,11 @@ def help_text() -> String:
         "    methylGrapher MojoGiraffe -gbz <gbz> -dist <dist> -min <min>\n"
         "        [-zipcodes <zip>] -fq1 <fastq> [-fq2 <fastq>] -out_gaf <path>\n"
         "        [-device auto|cpu|nvidia|amd] [-k <kmer>]\n"
+        "\n"
+        "MojoFq2bamMeth (linear BS Align → BAM; portable device):\n"
+        "    methylGrapher MojoFq2bamMeth -fq1 <fastq> -fq2 <fastq> -ref <fa>\n"
+        "        -out_bam <bam> -out_qc_dir <dir> -sample_id <id>\n"
+        "        [-t <threads>] [-device auto|cpu|nvidia|amd] [-work_dir <dir>]\n"
         "\n"
         "MethylCall:\n"
         "    methylGrapher MethylCall -work_dir <dir> -index_prefix <prefix>\n"
@@ -205,6 +212,7 @@ def main() raises:
     valid_commands.append("preparegenome")
     valid_commands.append("align")
     valid_commands.append("mojogiraffe")
+    valid_commands.append("mojofq2bammeth")
     valid_commands.append("methylcall")
     valid_commands.append("conversionrate")
     valid_commands.append("mergecpg")
@@ -260,6 +268,19 @@ def main() raises:
 
     if command == "mojogiraffe":
         exit(run_mojo_giraffe_cli(args))
+
+    if command == "mojofq2bammeth":
+        # Python engine orchestrates BWA-MEM + Parabricks-shaped QC metrics.
+        var os2 = Python.import_module("os")
+        var sys2 = Python.import_module("sys")
+        sys2.path.insert(0, os2.getcwd())
+        var fq = Python.import_module("engine.fq2bam_meth")
+        var py_args = Python.list()
+        var i = 1
+        while i < len(args):
+            py_args.append(args[i])
+            i += 1
+        exit(Int(py=fq.main(py_args)))
 
     # PrepareGenome / Main / MergeGAF stay on the Python engine.
     var rc = dispatch_to_engine(args)

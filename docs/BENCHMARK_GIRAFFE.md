@@ -48,7 +48,7 @@ export METHYLGRAPHER_MOJO_GIRAFFE_READY=1   # only after Buffy ≤2h + MethylCal
 | Vendor | Device API | Toy GBZ | Notes |
 |--------|------------|---------|-------|
 | NVIDIA GH200 | `nvidia:sm_90` seed helper | PASS | CuPy optional |
-| AMD | `amdgpu` / host fallback | ready | fill on ROCm node |
+| AMD Instinct | `amdgpu:gfx942` (MI300X) / HIP host kernels | bakeoff | See `docs/ROCM_GIRAFFE_GATES.md`; set `METHYLGRAPHER_AMDGPU_ARCH` if needed |
 
 ## Rollback
 

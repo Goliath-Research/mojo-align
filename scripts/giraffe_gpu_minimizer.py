@@ -34,7 +34,7 @@ def _sync_device(device: str) -> str:
             return "cupy-cuda"
         except Exception:
             return "host-nvidia-fallback"
-    if dev in {"amd", "hip"}:
+    if dev in {"amd", "hip", "rocm"}:
         try:
             import cupy as cp  # type: ignore
 
@@ -43,6 +43,14 @@ def _sync_device(device: str) -> str:
             buf = buf * buf
             cp.cuda.Stream.null.synchronize()
             return "cupy-rocm"
+        except Exception:
+            pass
+        # HIP runtime present without CuPy: acknowledge device, stay on host kernels.
+        try:
+            import ctypes
+
+            ctypes.CDLL("libamdhip64.so")
+            return "hip-host-kernels"
         except Exception:
             return "host-amd-fallback"
     return "cpu"
@@ -71,7 +79,7 @@ def device_probe() -> dict:
         "amd": False,
         "cupy": False,
         "target_nvidia": "nvidia:sm_90",
-        "target_amd": "amdgpu",
+        "target_amd": "amdgpu:gfx942",
     }
     try:
         import cupy  # noqa: F401

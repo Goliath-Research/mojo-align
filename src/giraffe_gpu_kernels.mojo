@@ -20,14 +20,22 @@ from giraffe_seed import extract_kmers
 
 comptime KERNEL_TARGET_NVIDIA_SM90 = "nvidia:sm_90"
 comptime KERNEL_TARGET_AMDGPU = "amdgpu"
+# Prefer MI300X/CDNA3 when operator sets METHYLGRAPHER_AMDGPU_ARCH (e.g. gfx942).
+comptime KERNEL_TARGET_AMDGPU_GFX942 = "amdgpu:gfx942"
 
 
 def kernel_target_label(device: String) raises -> String:
     var d = device.lower()
     if d == "nvidia" or d == "cuda":
         return String(KERNEL_TARGET_NVIDIA_SM90)
-    if d == "amd" or d == "hip":
-        return String(KERNEL_TARGET_AMDGPU)
+    if d == "amd" or d == "hip" or d == "rocm":
+        from std.python import Python
+
+        var os_mod = Python.import_module("os")
+        var arch = String(os_mod.environ.get("METHYLGRAPHER_AMDGPU_ARCH", ""))
+        if arch != "":
+            return String("amdgpu:" + arch)
+        return String(KERNEL_TARGET_AMDGPU_GFX942)
     return String("cpu")
 
 
