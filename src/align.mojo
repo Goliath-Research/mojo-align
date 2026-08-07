@@ -1,8 +1,9 @@
 # src/align.mojo
 # Mojo Align orchestration: parse CLI, select map backend
 # (cpu_vg | gpu_giraffe | mojo_giraffe), then run engine.alignments.alignment_main.
-# gpu_giraffe prefers MojoGiraffe when usable GFA is present; auto-vg for
-# oversized/GBZ-only indexes. Parabricks remains Phase 0 NO-GO for science GAF.
+# gpu_giraffe prefers MojoGiraffe on a ready GBZ quartet (or usable GFA);
+# auto-vg / FALLBACK=vg for emergency rollback. Parabricks remains Phase 0
+# NO-GO for science GAF.
 
 from std.collections import List
 from std.python import Python

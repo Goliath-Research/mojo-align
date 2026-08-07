@@ -2,6 +2,10 @@
 
 Tracking decisions and progress for the Python -> Mojo port.
 
+**Current status** (implementation source of truth): see `README.md`.
+Historical entries below are chronological; later dated sections supersede
+earlier TODOs when they conflict.
+
 ---
 
 ## 2026-08-07 — GBZ-native Mojo Giraffe
@@ -173,19 +177,22 @@ reference only).
   the `python_reference/mcall.py` algorithm for tag strings with leading
   insertions, trailing deletions, and internal indels.
 
-**Known TODOs (in priority order):**
+**Known TODOs (at time of entry; superseded by later 2026-08-06/07 work):**
 1. Port `mcall.alignment_to_methylation()` (the actual per-base methylation
    call logic) to Mojo, building on `mcall_core.alignment_path_parse()` /
-   `cs_tag_parse()`.
+   `cs_tag_parse()`. → Done 2026-08-06 (`src/mcall.mojo`).
 2. Port GFA segment-sequence lookup (`gfa.GraphicalFragmentAssemblyMemory`)
-   to native Mojo `Dict[String, String]`.
+   to native Mojo `Dict[String, String]`. → Done 2026-08-06 (`src/gfa.mojo`).
 3. Replace the Python `multiprocessing` pipeline in `engine/mcall.py` with
-   Mojo `parallelize()` once the hot loop above is native.
+   Mojo `parallelize()` once the hot loop above is native. → Done for
+   MethylCall hot path 2026-08-06; GAF filter still in `engine.mcall`.
 4. `utility.gzip` read/write support (currently only in the Python engine).
+   → Done 2026-08-06 (`src/utility.mojo` open_text_*).
 5. Benchmark real (non-toy) datasets with `scripts/benchmark_mcall.sh` once
    a `PrepareGenome`-indexed graph + real `alignment.gaf` are available.
+   → DS20M subset measured; see `docs/BENCHMARK_MCALL.md`.
 6. Add `tests/*.mojo` unit tests for `mcall_core.mojo` (currently verified
-   ad hoc; see "Verification performed" above).
+   ad hoc; see "Verification performed" above). → Done (`tests/test_mcall_core.mojo`).
 
 ---
 

@@ -48,6 +48,6 @@ tags, matching real `vg giraffe`+methylGrapher output):
 Together the two reads cover **both sides of all 5 CpG pairs**, so after
 `MethylCall` + `MergeCpG` every CpG in `graph.cpg.tsv` reports `met=2, cov=2`.
 Because the toy path is only 20 bp long, `run_toy_mcall.sh` passes
-`-minimum_identity 10 -minimum_mapq 0` to stay under the engine's default
-`minimum_identity=50` alignment-quality filter (that default assumes real,
-longer read alignments).
+`-minimum_identity 10 -minimum_mapq 0` so the short matches clear the
+alignment-identity filter (CLI defaults are `minimum_identity=20`,
+`minimum_mapq=0`, matching stock methylGrapher 0.2.0).

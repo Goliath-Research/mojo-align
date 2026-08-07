@@ -1,14 +1,11 @@
 # src/main.mojo
 # methylGrapher-mojo CLI dispatcher — Mojo 1.0 entry point.
 #
-# `help` and `vg_check` are implemented natively in Mojo (no Python engine
-# needed for either). Every other command (`PrepareGenome`, `Align`,
-# `MethylCall`, `MergeCpG`, `Main`, `ConversionRate`) is forwarded, argv
-# unchanged, to the faithful-ported Python engine at `engine/cli.py` via
-# Mojo-Python interop — this is the "cutover" step: business logic still
-# lives in the well-tested Python engine while the CLI surface, process
-# entry point, and hot per-record parsers (`src/mcall_core.mojo`) move to
-# Mojo. See MIGRATION_LOG.md for the full rationale and phased plan.
+# Native: help, vg_check, Align, MojoGiraffe, MethylCall, MergeCpG,
+# ConversionRate. PrepareGenome / Main / MergeGAF forward to engine.cli via
+# Python interop. Set METHYLGRAPHER_MCALL_ENGINE=python to force Align /
+# MethylCall / MergeCpG / ConversionRate onto engine.cli as well.
+# See MIGRATION_LOG.md / README.md.
 #
 # Usage (same argv shape as upstream methylGrapher / `engine.cli`):
 #   mojo src/main.mojo help

@@ -751,20 +751,23 @@ class HelpDocument(object):
 
     def help_text_raw(self):
         return """
-Usage: python main.py <command> <arguments>
+Usage: python -m engine.cli <command> <arguments>
+Or (via bin/methylGrapher): methylGrapher <command> <arguments>
 Commands:
-    Help
+    help
     PrepareGenome
     Main
     Align
     MethylCall
     ConversionRate
     MergeCpG
+    vg_check
 
 Help:
     methylGrapher help
     Or
     Read the detailed documentation: https://twlab.github.io/methylGrapher/build/html/
+    Mojo CLI extras (MojoGiraffe, -align_engine): METHYLGRAPHER_ENGINE=mojo bin/methylGrapher help
 
 PrepareGenome:
     It adds lambda phage genome to your genome graph, converts a GFA file into fully G->A and C->T converted GFA file, and indexes it for vg giraffe alignment.
@@ -787,7 +790,7 @@ Main:
     # MethylCall options: refer to MethylCall section
 
 Align:
-    VG Giraffe alignment, please provide work directory and index prefix.
+    Dual-graph alignment to C2T/G2A indexes; emits GAF for MethylCall.
     methylGrapher Align 
     # Required parameters
     -index_prefix <prefix> 
@@ -799,16 +802,18 @@ Align:
     -t <number_of_thread(s)> (default: 1)
     -directional <Y/N> (default: Y)
     -compress <Y/N> (default: N)
+    -align_engine <cpu_vg|gpu_giraffe|mojo_giraffe> (or METHYLGRAPHER_ALIGN_ENGINE; default: cpu_vg)
 
 MethylCall:
-    Methylation call from vg giraffe alignment result.
+    Methylation call from vg giraffe / MojoGiraffe alignment result.
     methylGrapher MethylCall 
     -work_dir <work_directory>
+    -index_prefix <prefix>
     
     # Alignment filtering options
     -discard_multimapped <Y/N> (default: Y)
-    -minimum_identity <minimum_identity> (default: 50)
-    -minimum_mapq <minimum_mapq> (default: 20)
+    -minimum_identity <minimum_identity> (default: 20)
+    -minimum_mapq <minimum_mapq> (default: 0)
     
     # Methylation calling options
     -cg_only <Y/N> (default: Y), only output methylation call in CG context
@@ -827,11 +832,13 @@ ConversionRate:
     -work_dir <work_directory>
 
 MergeCpG:
-    Merge cytosine methylation call (graph.methyl) into CpG methylation call. During graph indexing, all CpG locations are identified and stored in a separate TSV file. The graph CpG locations are stored under {index_prefix}cpg.tsv, with CpG id and both cytosine location on graph coordinate. MergeCpG function will merge the cytosine methylation call (graph.methyl) into CpG methylation call using graph CpG id.
+    Merge cytosine methylation call (graph.methyl) into CpG methylation call. During graph indexing, all CpG locations are identified and stored in a separate TSV file. The graph CpG locations are stored under {index_prefix}.cpg.tsv, with CpG id and both cytosine location on graph coordinate. MergeCpG function will merge the cytosine methylation call (graph.methyl) into CpG methylation call using graph CpG id.
     methylGrapher MergeCpG 
     -index_prefix <prefix> 
     -work_dir <work_directory>
 
+vg_check:
+    methylGrapher vg_check [-vg_path <path>]
 
 """.strip()
 

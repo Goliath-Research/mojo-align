@@ -9,10 +9,9 @@
 #   2. `gfa_worker_num` is always 1 (the `if thread > 20: gfa_worker_num = 2`
 #      dual-GFA-worker branch from 0.2.0 is removed; mcall.mcall_main() also
 #      forces this defensively).
-#   3. MethylCall/Main CLI defaults match stock 0.2.0 main.py: identity=20, mapq=0
-#      (mcall_main() still accepts explicit kwargs; pipeline does not pass these flags)
-#      (matches mcall.py's own function defaults) instead of the original
-#      CLI defaults of 20/0.
+#   3. MethylCall/Main CLI defaults match stock 0.2.0 main.py: identity=20,
+#      mapq=0 (mcall.py internal kwargs still default to 50/20 when callers
+#      omit them; the CLI always passes explicit values).
 
 __author__ = "Wenjin Zhang"
 __copyright__ = "Copyright 2023-2025, Ting Wang Lab"
@@ -207,8 +206,7 @@ def main(argv=None):
     if command == "methylcall":
         work_dir = kvargs.get("work_dir", "./")
 
-        # Patch (methylGrapher-mojo): defaults raised to identity=50, mapq=20
-        # to match mcall.py's own function defaults (was 20/0 in 0.2.0).
+        # Stock 0.2.0 CLI defaults (identity=20, mapq=0).
         minimum_identity = 20
         minimum_mapq = 0
         discard_multimapped = True
@@ -289,7 +287,7 @@ def main(argv=None):
         directional = kvargs.get("directional", "Y")
         directional = directional.lower() == "y"
 
-        # Patch (methylGrapher-mojo): defaults raised to identity=50, mapq=20.
+        # Stock 0.2.0 CLI defaults (identity=20, mapq=0).
         minimum_identity = 20
         minimum_mapq = 0
         discard_multimapped = True

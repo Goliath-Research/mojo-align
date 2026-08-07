@@ -6,13 +6,11 @@
 #   scripts/run_toy_mcall.sh [python|mojo]
 #
 # Defaults to the Python engine (`engine/cli.py`). Pass `mojo` to instead
-# route through `src/main.mojo` (Mojo dispatches to the same Python engine
-# via interop, so the outputs should be identical — see
-# scripts/parity_compare.py to diff two runs).
+# route through `src/main.mojo` (native MethylCall / MergeCpG; outputs should
+# match the Python engine — see scripts/parity_compare.py).
 #
-# The toy graph's path is only 20 bp long, so `-minimum_identity`/
-# `-minimum_mapq` are lowered well below the engine's real-data defaults
-# (50/20) — see tests/data/README.md.
+# The toy graph's path is only 20 bp long, so `-minimum_identity` is set to
+# 10 (below the CLI default of 20) — see tests/data/README.md.
 
 set -euo pipefail
 
