@@ -1,12 +1,8 @@
-"""GBZ-native index access for Mojo Giraffe (staged helper).
+"""GBZ-native index access for Mojo Giraffe.
 
-Loads PrepareGenome Giraffe artifacts (GBZ + dist + min + zipcodes) without
-requiring the huge companion ``.wl.gfa``. Segments are obtained by streaming
-``vg convert -f gfa`` from the GBZ (small fixtures) or from a durable Mojo
-segment pack cache (``{gbz}.mojo_segments/``) for production-scale graphs.
-
-Mojo owns extend + GAF emit; this module supplies segment dictionaries, seed
-hit batches, and optional end-to-end map for interop tests.
+Production map path: dense segment pack + MinimizerIndex (``.min``) + zip/dist
+via ``engine.quartet_map``. Fixture-scale ``extend_exact`` is quarantined for
+tiny packs / empty minimizer indexes only.
 """
 
 from __future__ import annotations
@@ -17,21 +13,22 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from engine.quartet_map import map_fastq_to_gaf as quartet_map_fastq_to_gaf
+from engine.quartet_map import mojo_giraffe_ready
+from engine.segment_pack import (
+    SegmentPack,
+    pack_ready,
+    resolve_pack,
+    segment_cache_ready,
+)
 
 
 def resolve_gbz_quartet(index_prefix: str) -> Optional[Dict[str, str]]:
     """Return paths for gbz/dist/min/zipcodes when all four exist."""
     p = Path(index_prefix)
-    # Accept prefix that already includes .giraffe or strand suffix.
-    candidates = [
-        (
-            p.parent / f"{p.name}.giraffe.gbz"
-            if not str(p).endswith(".giraffe.gbz")
-            else p
-        ),
-    ]
-    # Standard methylGrapher: prefix.wl.C2T → prefix.wl.C2T.giraffe.gbz
+    _ = p
     gbz = Path(f"{index_prefix}.giraffe.gbz")
     dist = Path(f"{index_prefix}.dist")
     min1 = Path(f"{index_prefix}.min")
@@ -62,7 +59,6 @@ def _vg_bin() -> str:
 def stream_gbz_to_segments(gbz_path: str, vg_path: Optional[str] = None) -> Dict[str, str]:
     """Stream ``vg convert -f gfa`` and collect S-line segments only."""
     vg = vg_path or _vg_bin()
-    # `-f` = GFA out; positional input is the GBZ/graph (not a "gfa" token).
     cmd = [vg, "convert", "-f", gbz_path]
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -101,11 +97,9 @@ def _default_cache_roots() -> List[Path]:
 
 
 def segment_cache_dir(gbz_path: str) -> Path:
-    """Preferred cache directory for a GBZ (sibling, else shared cache root)."""
     sibling = Path(gbz_path + ".mojo_segments")
-    if sibling.is_dir() and (sibling / "segments.jsonl").is_file():
+    if sibling.is_dir() and pack_ready(sibling):
         return sibling
-    # Prefer sibling when the genome tree is writable (operator prebuild path).
     try:
         parent = Path(gbz_path).resolve().parent
         if os.access(parent, os.W_OK):
@@ -118,28 +112,8 @@ def segment_cache_dir(gbz_path: str) -> Path:
     return sibling
 
 
-def segment_cache_ready(gbz_path: str) -> bool:
-    """True when a durable segment pack exists (sibling or shared cache root)."""
-    candidates = [Path(gbz_path + ".mojo_segments")]
-    name = Path(gbz_path).name + ".mojo_segments"
-    for root in _default_cache_roots():
-        candidates.append(root / name)
-    for cache in candidates:
-        if (cache / "segments.jsonl").is_file() and (cache / "meta.json").is_file():
-            return True
-    return False
-
-
-def resolve_segment_cache(gbz_path: str) -> Optional[Path]:
-    """Return an existing ready cache path, or None."""
-    candidates = [Path(gbz_path + ".mojo_segments")]
-    name = Path(gbz_path).name + ".mojo_segments"
-    for root in _default_cache_roots():
-        candidates.append(root / name)
-    for cache in candidates:
-        if (cache / "segments.jsonl").is_file() and (cache / "meta.json").is_file():
-            return cache
-    return None
+# Re-export readiness helpers used by align_backends
+resolve_segment_cache = resolve_pack
 
 
 def ensure_segment_cache(
@@ -148,8 +122,8 @@ def ensure_segment_cache(
     force: bool = False,
     vg_path: Optional[str] = None,
 ) -> Path:
-    """Build or reuse on-disk segment pack (sibling GBZ or shared cache root)."""
-    existing = None if force else resolve_segment_cache(gbz_path)
+    """Build or reuse on-disk segment pack (legacy jsonl via vg convert)."""
+    existing = None if force else resolve_pack(gbz_path)
     if existing is not None:
         return existing
     cache = segment_cache_dir(gbz_path)
@@ -158,7 +132,6 @@ def ensure_segment_cache(
     try:
         cache.mkdir(parents=True, exist_ok=True)
     except OSError:
-        # Genome mount may be read-only inside the container; use shared cache.
         name = Path(gbz_path).name + ".mojo_segments"
         last_err: Optional[BaseException] = None
         cache = None  # type: ignore[assignment]
@@ -196,26 +169,22 @@ def ensure_segment_cache(
 
 
 def load_segments(gbz_path: str, *, vg_path: Optional[str] = None) -> Dict[str, str]:
-    """Load segments from cache (building if needed) or direct convert for tiny GBZ."""
+    """Load segments from dense/jsonl pack or direct convert for tiny GBZ."""
     gbz = Path(gbz_path)
-    # Tiny GBZ: convert in-memory; larger: prefer durable cache.
-    max_direct = int(os.environ.get("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024)))
+    max_direct = int(
+        os.environ.get("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
+    )
     if gbz.is_file() and gbz.stat().st_size <= max_direct:
         try:
             return stream_gbz_to_segments(str(gbz), vg_path=vg_path)
         except Exception:
             pass
-    ready = resolve_segment_cache(str(gbz))
+    ready = resolve_pack(str(gbz))
     if ready is None:
         cache = ensure_segment_cache(str(gbz), vg_path=vg_path)
     else:
         cache = ready
-    out: Dict[str, str] = {}
-    with (cache / "segments.jsonl").open(encoding="utf-8") as fh:
-        for line in fh:
-            row = json.loads(line)
-            out[str(row["id"])] = str(row["seq"])
-    return out
+    return SegmentPack(cache).as_dict()
 
 
 def extract_kmers(seq: str, k: int) -> List[str]:
@@ -240,7 +209,7 @@ def seed_hits(kmer_index: Dict[str, List[str]], seq: str, k: int) -> List[str]:
 
 
 def extend_exact(segments: Dict[str, str], qname: str, seq: str, k: int = 5) -> List[dict]:
-    """Fixture-scale exact / majority-seed extend (Mojo-compatible fields)."""
+    """QUARANTINED fixture-scale exact / majority-seed extend — not production."""
     out: List[dict] = []
     qlen = len(seq)
     for seg_id, s in segments.items():
@@ -256,6 +225,8 @@ def extend_exact(segments: Dict[str, str], qname: str, seq: str, k: int = 5) -> 
                 }
             )
     if out:
+        return out
+    if len(segments) > 50_000:
         return out
     counts: Dict[str, int] = {}
     kidx = build_kmer_index(segments, k)
@@ -291,22 +262,6 @@ def format_gaf_line(hit: dict) -> str:
     return line
 
 
-def _parse_fastq(path: str) -> List[Tuple[str, str]]:
-    rows: List[Tuple[str, str]] = []
-    with open(path, encoding="utf-8") as fh:
-        while True:
-            n = fh.readline()
-            if not n:
-                break
-            s = fh.readline().rstrip("\n\r")
-            fh.readline()
-            fh.readline()
-            name = n[1:].strip() if n.startswith("@") else n.strip()
-            bare = name.split("_")[0]
-            rows.append((bare, s))
-    return rows
-
-
 def map_gbz_fastq_to_gaf(
     *,
     gbz: str,
@@ -319,50 +274,31 @@ def map_gbz_fastq_to_gaf(
     k: int = 5,
     device: str = "cpu",
 ) -> int:
-    """Map FASTQ against GBZ-derived segments; write GAF (stdout-compatible file)."""
-    _ = (dist, min_path, zipcodes, device)  # reserved for min/zip/dist GPU stages
-    segments = load_segments(gbz)
-    reads = _parse_fastq(fq1)
-    hits: List[dict] = []
-    if not fq2:
-        for name, seq in reads:
-            hits.extend(extend_exact(segments, name, seq, k=k))
-    else:
-        mates = _parse_fastq(fq2)
-        for (n1, s1), (n2, s2) in zip(reads, mates):
-            h1s = extend_exact(segments, n1, s1, k=k)
-            h2s = extend_exact(segments, n2, s2, k=k)
-            h1 = h1s[0] if h1s else {
-                "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
-                "cs_tag": "cs:Z:*", "extra_tags": "",
-            }
-            h2 = h2s[0] if h2s else {
-                "query_name": n2, "path": "*", "qlen": len(s2), "mapq": 0,
-                "cs_tag": "cs:Z:*", "extra_tags": "",
-            }
-            h1["extra_tags"] = f"ri:i:1\tos:Z:{s1}\trc:Z:CT"
-            h2["extra_tags"] = f"ri:i:2\tos:Z:{s2}\trc:Z:GA"
-            hits.append(h1)
-            hits.append(h2)
-    Path(out_gaf).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_gaf, "w", encoding="utf-8") as fh:
-        for h in hits:
-            if h["path"] == "*":
-                continue
-            fh.write(format_gaf_line(h) + "\n")
-    return len(hits)
+    """Deprecated name — delegates to quartet mapper (min/zip/dist + dense pack)."""
+    return quartet_map_fastq_to_gaf(
+        gbz=gbz,
+        fq1=fq1,
+        out_gaf=out_gaf,
+        fq2=fq2,
+        dist=dist,
+        min_path=min_path,
+        zipcodes=zipcodes,
+        k=k,
+        device=device,
+    )
 
 
 def probe_gbz(gbz_path: str) -> dict:
     p = Path(gbz_path)
-    out = {
+    cache = segment_cache_dir(gbz_path)
+    return {
         "exists": p.is_file(),
         "bytes": p.stat().st_size if p.is_file() else 0,
-        "cache": str(segment_cache_dir(gbz_path)),
-        "cache_ready": (segment_cache_dir(gbz_path) / "segments.jsonl").is_file(),
+        "cache": str(cache),
+        "cache_ready": pack_ready(cache) if cache.exists() else False,
         "vg": _vg_bin(),
+        "mojo_ready_env": mojo_giraffe_ready(),
     }
-    return out
 
 
 if __name__ == "__main__":
@@ -373,7 +309,7 @@ if __name__ == "__main__":
     p_cache = sub.add_parser("cache", help="Build segment cache from GBZ")
     p_cache.add_argument("--gbz", required=True)
     p_cache.add_argument("--force", action="store_true")
-    p_map = sub.add_parser("map", help="Map FASTQ → GAF via GBZ segments")
+    p_map = sub.add_parser("map", help="Map FASTQ → GAF via quartet")
     p_map.add_argument("--gbz", required=True)
     p_map.add_argument("--dist", default="")
     p_map.add_argument("--min", dest="min_path", default="")

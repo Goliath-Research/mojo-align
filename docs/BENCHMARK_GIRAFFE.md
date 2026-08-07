@@ -27,17 +27,20 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 |-----------|------|--------|
 | Toy GBZ PE vs golden | path / cs / ri / os / rc | **PASS** |
 | DS-scale (500 PE) on toy GBZ | GAF lines land | **PASS** (protocol smoke) |
-| Buffy-subset / DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PENDING** operator (build C2T/G2A caches first) |
-| Full Buffy dual-map ≤ ~2 h | wall on NVMe | **PENDING** measurement |
-| Production `gpu_giraffe` → Mojo GBZ (no GFA size-cap) | quartet present | **SHIPPED** in `align_backends` |
+| Buffy-subset seed+extend (known `vg`-mapped C2T reads) | quartet_map | **PASS** 13/13 (~0.1 s) |
+| DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PENDING** operator |
+| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** measurement |
+| Production `gpu_giraffe` → Mojo GBZ | `READY=1` + dense pack + quartet | **WIRED** (default stays `vg_autoscale`) |
 
-Build production segment caches (one-time per strand GBZ):
+Build production dense segment packs (preferred — from companion GFA):
 
 ```bash
-python scripts/build_mojo_gbz_cache.py \
-  --gbz /work/genomes/pangenome/GRCh38/d9-bs/1.70/hprc-d9-bs.wl.C2T.giraffe.gbz
-python scripts/build_mojo_gbz_cache.py \
-  --gbz /work/genomes/pangenome/GRCh38/d9-bs/1.70/hprc-d9-bs.wl.G2A.giraffe.gbz
+python scripts/build_mojo_segment_pack.py \
+  --gfa /var/tmp/methylgrapher-index/hprc-d9-bs.wl.gfa \
+  --gbz /work/genomes/pangenome/GRCh38/d9-bs/1.70/hprc-d9-bs.wl.C2T.giraffe.gbz \
+  --out /work/cache/mojo_segments/hprc-d9-bs.wl.C2T.giraffe.gbz.mojo_segments \
+  --also-link-g2a
+export METHYLGRAPHER_MOJO_GIRAFFE_READY=1   # only after Buffy ≤2h + MethylCall parity
 ```
 
 ## NVIDIA vs AMD bakeoff

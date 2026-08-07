@@ -20,14 +20,24 @@ GOLDEN = ROOT / "tests/data/giraffe_fixture/golden.gaf"
 R1 = ROOT / "tests/data/giraffe_fixture/R1.fastq"
 R2 = ROOT / "tests/data/giraffe_fixture/R2.fastq"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("vg") is None and not Path("/usr/local/bin/vg").exists(),
-    reason="vg not on PATH",
-)
-
-
 def _vg() -> str:
-    return shutil.which("vg") or "/usr/local/bin/vg"
+    env = __import__("os").environ.get("VG_PATH", "").strip()
+    if env:
+        return env
+    which = shutil.which("vg")
+    if which:
+        return which
+    if Path("/usr/local/bin/vg").exists():
+        return "/usr/local/bin/vg"
+    return "vg"
+
+
+def _has_vg() -> bool:
+    p = _vg()
+    return Path(p).exists() or shutil.which("vg") is not None
+
+
+pytestmark = pytest.mark.skipif(not _has_vg(), reason="vg not on PATH")
 
 
 def test_resolve_quartet_toy():

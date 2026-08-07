@@ -130,18 +130,8 @@ def map_gbz_fastq_to_gaf(
     min_path: String = "",
     zip_path: String = "",
 ) raises -> Int:
-    """GBZ-native map: decode segments + Mojo seed/extend (helper-backed)."""
-    var dev = select_device(device)
-    print(
-        "Mojo Giraffe GBZ device=",
-        dev,
-        " target=",
-        kernel_target_label(dev),
-        " gbz=",
-        gbz_path,
-    )
-    # Helper: vg convert / segment cache → extend → GAF (Mojo CLI owns emit contract).
-    var n = map_gbz_via_helper(
+    """GBZ-native map: quartet min/zip/dist + dense pack (Mojo-orchestrated)."""
+    return map_gbz_via_helper(
         gbz_path,
         fq_path,
         out_gaf,
@@ -150,16 +140,8 @@ def map_gbz_fastq_to_gaf(
         min_path,
         zip_path,
         k,
-        dev,
+        device,
     )
-    # GPU/CPU seed path profiled on the FASTQ batch (same device helper as GFA mode).
-    var reads = _parse_fastq(fq_path)
-    var seqs = List[String]()
-    for r in reads:
-        seqs.append(r.seq)
-    var seeded = extract_kmers_batch(dev, seqs, k)
-    print("GBZ seeded_reads=", len(seeded), " wrote=", out_gaf, " hits=", n)
-    return n
 
 
 def run_mojo_giraffe_cli(args: List[String]) raises -> Int:

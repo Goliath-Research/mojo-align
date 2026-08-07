@@ -1,49 +1,53 @@
-# Minimizer + zipcode locate surface for GBZ-native Mojo Giraffe.
+# Minimizer + zipcode locate for GBZ-native Mojo Giraffe.
 #
-# Production vg indexes: `{prefix}.shortread.withzip.min` + `.shortread.zipcodes`.
-# Staged path: build an in-memory k-mer posting list from GBZ-decoded segments
-# (same science seed surface as giraffe_seed; GPU via giraffe_device).
+# Production: mmap vg ``.shortread.withzip.min`` via engine.minimizer_index
+# (Q1Q1 / v11). Fixture rebuild-from-segments path removed.
 
 from std.collections import Dict, List
+from std.python import Python
 
-from giraffe_seed import extract_kmers
+
+def probe_min_index(min_path: String) raises -> String:
+    var os_mod = Python.import_module("os")
+    var sys_mod = Python.import_module("sys")
+    sys_mod.path.insert(0, String(os_mod.getcwd()))
+    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    var mod = Python.import_module("engine.minimizer_index")
+    var info = mod.probe_minimizer(min_path)
+    return String(info)
+
+
+def locate_read_hits(min_path: String, seq: String, hit_cap: Int = 24) raises -> List[String]:
+    """Return ``node_id:orient:offset`` strings from minimizer locate."""
+    var os_mod = Python.import_module("os")
+    var sys_mod = Python.import_module("sys")
+    sys_mod.path.insert(0, String(os_mod.getcwd()))
+    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    var mod = Python.import_module("engine.minimizer_index")
+    var idx = mod.MinimizerIndex(min_path)
+    var hits = idx.locate_read(seq, hit_cap=hit_cap)
+    var out = List[String]()
+    var n = Int(py=hits.__len__())
+    var i = 0
+    while i < n:
+        var h = hits[i]
+        var orient = String("0")
+        if Bool(h.is_rev):
+            orient = "1"
+        out.append(
+            String(h.node_id) + ":" + orient + ":" + String(h.offset)
+        )
+        i = i + 1
+    idx.close()
+    return out^
 
 
 def build_min_index_from_segments(
     segments: Dict[String, String], k: Int
 ) raises -> List[String]:
-    """Flattened hit table rows: ``kmer\\tseg:offset``."""
-    var hit_table = List[String]()
-    var ids = List[String]()
-    for seg_id in segments:
-        ids.append(seg_id)
-    for seg_id in ids:
-        var seq = segments[seg_id].copy()
-        var n = seq.byte_length()
-        if n < k:
-            continue
-        var i = 0
-        while i <= n - k:
-            var mer = String(seq[byte = i : i + k])
-            hit_table.append(mer + "\t" + seg_id + ":" + String(i))
-            i += 1
-    return hit_table^
-
-
-def lookup_min_hits(hit_table: List[String], mer: String) raises -> List[String]:
-    var hits = List[String]()
-    for row in hit_table:
-        var parts = row.split("\t")
-        if len(parts) >= 2 and String(parts[0]) == mer:
-            hits.append(String(parts[1]))
-    return hits^
-
-
-def seed_seq(hit_table: List[String], seq: String, k: Int) raises -> List[String]:
-    var out = List[String]()
-    var mers = extract_kmers(seq, k)
-    for mer in mers:
-        var found = lookup_min_hits(hit_table, mer)
-        for h in found:
-            out.append(h.copy())
-    return out^
+    """Removed production path — kept stub raising to catch regressions."""
+    raise Error(
+        "build_min_index_from_segments removed; use .shortread.withzip.min via locate_read_hits"
+    )

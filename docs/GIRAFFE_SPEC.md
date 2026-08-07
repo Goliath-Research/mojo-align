@@ -15,8 +15,8 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 ### GBZ production contract
 
 - **No companion GFA required** for Align when the four-file quartet exists under `index_prefix`.
-- Mojo opens GBZ via staged helper ([`engine/giraffe_gbz_helper.py`](../engine/giraffe_gbz_helper.py)): stream `vg convert -f gfa` (S-lines only) or durable `{gbz}.mojo_segments/` cache (`scripts/build_mojo_gbz_cache.py`).
-- Minimizer/zip/dist files are accepted as inputs; seed locate currently builds postings from decoded segments (native `.min` decode is a follow-on).
+- Mojo opens GBZ via dense segment pack (`sequences.bin` + `offsets.bin` under `{gbz}.mojo_segments/`, built by [`scripts/build_mojo_segment_pack.py`](../scripts/build_mojo_segment_pack.py) from companion GFA) or legacy jsonl / `vg convert` for tiny fixtures.
+- Minimizer locate uses mmap of `.shortread.withzip.min` (Q1Q1 v11) via [`engine/minimizer_index.py`](../engine/minimizer_index.py); zip/dist cluster via [`engine/zipcodes_index.py`](../engine/zipcodes_index.py). Production selection requires `METHYLGRAPHER_MOJO_GIRAFFE_READY=1`.
 - PE / `-M 2` multimapping: emit up to two primary hits with `ri`/`os`/`rc` tags MethylCall understands.
 - Named coordinates: path column uses segment ids as emitted by GBZ→segment decode (same ids MethylCall resolves via PrepareGenome node maps).
 

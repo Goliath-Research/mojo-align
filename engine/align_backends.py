@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from engine.giraffe_gbz_helper import resolve_gbz_quartet, segment_cache_ready
+from engine.quartet_map import mojo_giraffe_ready
 
 AlignEngine = Literal["cpu_vg", "gpu_giraffe", "mojo_giraffe"]
 
@@ -253,6 +254,10 @@ def resolve_map_command(
         bin_path = resolve_mojo_giraffe_bin()
         if not bin_path or not quartet or not fq1:
             return None
+        # Production cutover gate: require explicit READY so Buffy stays on vg
+        # until min/zip/dist + dense pack parity + wall-clock gates pass.
+        if not mojo_giraffe_ready():
+            return None
         gbz_path = quartet["gbz"]
         # Production GBZ (~GB) must have a prebuilt segment pack; otherwise Align
         # would spend hours in `vg convert` / OOM building cache mid-map.
@@ -271,7 +276,7 @@ def resolve_map_command(
         note = (
             f"# {label} mojo_giraffe_gbz host={platform.machine()} "
             f"device={os.environ.get('METHYLGRAPHER_GIRAFFE_DEVICE', 'auto')} "
-            f"gbz={gbz_path}\n"
+            f"ready=1 gbz={gbz_path}\n"
         )
         cmd = build_mojo_giraffe_gbz_cmd(
             mojo_bin=bin_path,
