@@ -615,6 +615,32 @@ def alignment_to_methylation(best_alignments, sequence_dict, cg_only=True, perfo
 
 
 
+def _open_alignment_gaf(work_dir):
+    """Open work_dir/alignment.gaf, preferring a .gz sibling when present.
+
+    Patch (methylGrapher-mojo): production work dirs may store the GAF
+    gzip-compressed; accept ``alignment.gaf.gz`` / ``alignment.gaf.gzip``
+    transparently (same extensions as ``engine.utility`` GFA helpers).
+    """
+    import gzip
+
+    candidates = (
+        work_dir + "/alignment.gaf",
+        work_dir + "/alignment.gaf.gz",
+        work_dir + "/alignment.gaf.gzip",
+    )
+    for fp in candidates:
+        if not os.path.exists(fp):
+            continue
+        lower = fp.lower()
+        if lower.endswith(".gz") or lower.endswith(".gzip"):
+            return gzip.open(fp, "rt")
+        return open(fp, "r")
+    raise FileNotFoundError(
+        f"No alignment.gaf (.gz) under {work_dir}; tried: {candidates}"
+    )
+
+
 def alignment_parse(work_dir, node_replacement_dict, minimum_identity=50, minimum_mapq=20, discard_multimapped=True, pid="0_0"):
     # Alignment count, low confidence count, error count, multi-mapped alignment count
     counter1 = 0
@@ -625,11 +651,8 @@ def alignment_parse(work_dir, node_replacement_dict, minimum_identity=50, minimu
     ts = time.time()
 
 
-    alignment_fp = work_dir + "/alignment.gaf"
-
-
     lines_for_same_read = []
-    with open(alignment_fp) as alignment_fh:
+    with _open_alignment_gaf(work_dir) as alignment_fh:
         for l in alignment_fh:
             l = l.strip().split("\t")
 
@@ -696,6 +719,45 @@ Low confidence count (low quality alignment in terms of block length and MapQ): 
     log_fh.close()
 
 
+def iter_alignment_batches(
+    work_dir,
+    node_replacement_dict_fp,
+    minimum_identity=50,
+    minimum_mapq=20,
+    discard_multimapped=True,
+    genotyping_cytosine=False,
+    batch_size=4096,
+):
+    """Yield batches of best-alignment groups for the native Mojo MethylCall path.
+
+    Reuses ``alignment_parse`` / node-replacement loading from the Python
+    engine so Mojo owns GFA lookup + ``alignment_to_methylation`` +
+    ``parallelize`` without re-porting GAF filtering.
+    """
+    node_replacement_dict = {}
+    if genotyping_cytosine and os.path.exists(node_replacement_dict_fp):
+        with open(node_replacement_dict_fp) as node_replacement_dict_fh:
+            node_replacement_dict_raw = json.load(node_replacement_dict_fh)
+        for v in node_replacement_dict_raw.values():
+            node_replacement_dict.update(v)
+
+    batch = []
+    for r in alignment_parse(
+        work_dir,
+        node_replacement_dict,
+        minimum_identity=minimum_identity,
+        minimum_mapq=minimum_mapq,
+        discard_multimapped=discard_multimapped,
+        pid="native",
+    ):
+        if len(r) == 0:
+            continue
+        batch.append(r)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if len(batch) > 0:
+        yield batch
 
 
 

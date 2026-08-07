@@ -55,7 +55,18 @@ def alignment_clenup(work_dir):
     return
 
 
-def alignment(work_dir="./", index_prefix="", output_format="gaf", thread=1, directional=True, compress=True, vg_path="vg"):
+def alignment(
+    work_dir="./",
+    index_prefix="",
+    output_format="gaf",
+    thread=1,
+    directional=True,
+    compress=True,
+    vg_path="vg",
+    align_engine=None,
+):
+    from .align_backends import resolve_map_command
+
     index_prefix_ct = index_prefix + ".wl.C2T"
     index_prefix_ga = index_prefix + ".wl.G2A"
 
@@ -128,14 +139,32 @@ def alignment(work_dir="./", index_prefix="", output_format="gaf", thread=1, dir
                     index_params += f" -m {min2_fp} -z {zipcode_fp}"
 
 
-                cmd = f"{vg_path} giraffe -p -t {thread} -o {output_format} -M 2 --named-coordinates {index_params} {giraffe_input}"
-                # print(cmd)
+                engine_used, cmd = resolve_map_command(
+                    align_engine=align_engine,
+                    vg_path=vg_path,
+                    thread=thread,
+                    output_format=output_format,
+                    index_params=index_params,
+                    giraffe_input=giraffe_input,
+                    index_prefix=index_prefix,
+                )
+                print(f"Align map backend: {engine_used}")
                 with open(alignment_log, "w") as alignment_log_fh:
                     alignment_log_fh.write("Command used: \n")
                     alignment_log_fh.write(cmd + "\n\n")
+                    alignment_log_fh.write(f"Backend: {engine_used}\n")
 
+                # Strip comment lines if gpu_giraffe prepended a note.
+                cmd_run = "\n".join(
+                    ln for ln in cmd.splitlines() if ln.strip() and not ln.strip().startswith("#")
+                )
+                # MojoGiraffe shell fragment needs bash; vg one-liners work either way.
+                if "MojoGiraffe" in cmd_run or cmd_run.lstrip().startswith("set "):
+                    import shlex
+
+                    cmd_run = "bash -lc " + shlex.quote(cmd_run)
                 se = utility.SystemExecute()
-                fout, flog = se.execute(cmd, stdout=None, stderr=alignment_log)
+                fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
                 for line in fout:
                     line = line.decode("utf-8")
 
@@ -370,7 +399,17 @@ def alignment_merge_main(working_dir, worker_num=20):
     return
 
 
-def alignment_main(fq1, fq2, work_dir, index_prefix, compress=True, thread=1, directional=True, vg_path="vg"):
+def alignment_main(
+    fq1,
+    fq2,
+    work_dir,
+    index_prefix,
+    compress=True,
+    thread=1,
+    directional=True,
+    vg_path="vg",
+    align_engine=None,
+):
     utility.fastq_converter(fq1, fq2, work_dir,
                             compress=compress,
                             thread=thread,
@@ -383,7 +422,8 @@ def alignment_main(fq1, fq2, work_dir, index_prefix, compress=True, thread=1, di
               thread=thread,
               directional=directional,
               compress=compress,
-              vg_path=vg_path)
+              vg_path=vg_path,
+              align_engine=align_engine)
 
     alignment_merge_main(work_dir, worker_num=thread)
 

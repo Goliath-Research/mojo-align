@@ -20,6 +20,11 @@
 from std.python import Python
 from std.sys import argv as sys_argv, exit
 
+from align import run_align_native
+from conversion_rate import run_conversion_rate_native
+from giraffe_mapper import run_mojo_giraffe_cli
+from mcall import run_methylcall_native
+from merge_cpg import run_merge_cpg_native
 from utility import system_execute
 
 comptime VERSION = "0.1.0-mojo"
@@ -59,18 +64,19 @@ def help_text() -> String:
         "    PrepareGenome\n"
         "    Main\n"
         "    Align\n"
+        "    MojoGiraffe\n"
         "    MethylCall\n"
         "    ConversionRate\n"
         "    MergeCpG\n"
         "    vg_check\n"
         "\n"
         "Native Mojo commands:\n"
-        "    help       Print this message.\n"
-        "    vg_check   Verify the `vg` binary is installed and reachable.\n"
+        "    help / vg_check / Align / MethylCall / MergeCpG / ConversionRate\n"
+        "    Align uses pluggable map backends (cpu_vg | gpu_giraffe | mojo_giraffe).\n"
         "\n"
-        "Commands below are dispatched to the Python engine (engine/cli.py)\n"
-        "with the same arguments as upstream methylGrapher; run `methylGrapher\n"
-        "help` (which this text mirrors) or see README.md for full details.\n"
+        "PrepareGenome / Main / MergeGAF dispatch to the Python engine\n"
+        "(engine/cli.py). Set METHYLGRAPHER_MCALL_ENGINE=python for full\n"
+        "engine.cli rollback of native commands.\n"
         "\n"
         "PrepareGenome:\n"
         "    methylGrapher PrepareGenome -gfa <path> -prefix <prefix> [-lp <lambda_fa>] [-t <threads>]\n"
@@ -81,6 +87,14 @@ def help_text() -> String:
         "Align:\n"
         "    methylGrapher Align -index_prefix <prefix> -fq1 <fastq> [-fq2 <fastq>] -work_dir <dir>\n"
         "        [-t <threads>] [-directional <Y/N>] [-compress <Y/N>]\n"
+        "        [-align_engine <cpu_vg|gpu_giraffe|mojo_giraffe>]  (or METHYLGRAPHER_ALIGN_ENGINE)\n"
+        "\n"
+        "MojoGiraffe (GFA or GBZ→GAF; GPU seed via device helper):\n"
+        "    methylGrapher MojoGiraffe -gfa <gfa> -fq1 <fastq> -out_gaf <path>\n"
+        "        [-fq2 <fastq>] [-device auto|cpu|nvidia|amd] [-k <kmer>]\n"
+        "    methylGrapher MojoGiraffe -gbz <gbz> -dist <dist> -min <min>\n"
+        "        [-zipcodes <zip>] -fq1 <fastq> [-fq2 <fastq>] -out_gaf <path>\n"
+        "        [-device auto|cpu|nvidia|amd] [-k <kmer>]\n"
         "\n"
         "MethylCall:\n"
         "    methylGrapher MethylCall -work_dir <dir> -index_prefix <prefix>\n"
@@ -193,6 +207,7 @@ def main() raises:
     var valid_commands = List[String]()
     valid_commands.append("preparegenome")
     valid_commands.append("align")
+    valid_commands.append("mojogiraffe")
     valid_commands.append("methylcall")
     valid_commands.append("conversionrate")
     valid_commands.append("mergecpg")
@@ -220,8 +235,35 @@ def main() raises:
         run_vg_check(args)
         exit(0)
 
-    # Everything else (PrepareGenome / Align / MethylCall / ConversionRate /
-    # MergeCpG / Main / MergeGAF) is handled by the Python engine, with the
-    # exact same argv shape as methylGrapher / `python -m engine.cli`.
+    # Native Mojo commands. METHYLGRAPHER_MCALL_ENGINE=python (also honored by
+    # the Docker entrypoint before Mojo starts) forces full engine.cli rollback.
+    var os_mod = Python.import_module("os")
+    var mcall_engine = String(os_mod.environ.get("METHYLGRAPHER_MCALL_ENGINE", "native"))
+    var force_python = mcall_engine.lower() == "python"
+
+    if command == "methylcall":
+        if force_python:
+            exit(dispatch_to_engine(args))
+        exit(run_methylcall_native(args))
+
+    if command == "mergecpg":
+        if force_python:
+            exit(dispatch_to_engine(args))
+        exit(run_merge_cpg_native(args))
+
+    if command == "conversionrate":
+        if force_python:
+            exit(dispatch_to_engine(args))
+        exit(run_conversion_rate_native(args))
+
+    if command == "align":
+        if force_python:
+            exit(dispatch_to_engine(args))
+        exit(run_align_native(args))
+
+    if command == "mojogiraffe":
+        exit(run_mojo_giraffe_cli(args))
+
+    # PrepareGenome / Main / MergeGAF stay on the Python engine.
     var rc = dispatch_to_engine(args)
     exit(rc)

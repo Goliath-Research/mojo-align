@@ -13,7 +13,8 @@
 #   - Strings are UTF-8; byte-position slicing/indexing uses `s[byte=a:b]`.
 #   - Standard-library imports must be qualified with the `std.` prefix.
 
-from std.python import Python
+from std.collections import List
+from std.python import Python, PythonObject
 
 
 def phred_to_int(qual_char: String) -> Int:
@@ -93,3 +94,72 @@ def system_execute(cmd: String) raises -> ExecResult:
     var out = String(result.stdout)
     var err = String(result.stderr)
     return ExecResult(rc, out, err)
+
+
+def _looks_gzipped(path: String) -> Bool:
+    """True when `path` ends with a gzip extension (case-insensitive)."""
+    var low = path.lower()
+    return (
+        low.endswith(".gz")
+        or low.endswith(".gzip")
+        or low.endswith(".GZ")
+        or low.endswith(".GZIP")
+    )
+
+
+def open_text_read(path: String) raises -> PythonObject:
+    """Open a text file for reading, transparently supporting gzip.
+
+    Mirrors the gzip-aware open helpers in `engine/utility.py`. Returns a
+    Python file-like object (caller must `.close()`).
+    """
+    if _looks_gzipped(path):
+        var gzip = Python.import_module("gzip")
+        return gzip.open(path, "rt")
+    var builtins = Python.import_module("builtins")
+    return builtins.open(path, "r")
+
+
+def open_text_write(path: String, gzip_out: Bool = False) raises -> PythonObject:
+    """Open a text file for writing; optionally gzip-compress.
+
+    When `gzip_out` is true (or `path` looks gzipped), writes via
+    `gzip.open(..., "wt")`.
+    """
+    if gzip_out or _looks_gzipped(path):
+        var gzip = Python.import_module("gzip")
+        return gzip.open(path, "wt")
+    var builtins = Python.import_module("builtins")
+    return builtins.open(path, "w")
+
+
+def read_text_file(path: String) raises -> String:
+    """Read an entire (optionally gzipped) text file into a String."""
+    var fh = open_text_read(path)
+    var text = String(fh.read())
+    fh.close()
+    return text
+
+
+def write_text_file(path: String, content: String, gzip_out: Bool = False) raises:
+    """Write `content` to an (optionally gzipped) text file."""
+    var fh = open_text_write(path, gzip_out=gzip_out)
+    fh.write(content)
+    fh.close()
+
+
+def get_kv_value(args: List[String], key: String, default: String) -> String:
+    """Scan `args` for a `-<key> <value>` pair (methylGrapher argv convention)."""
+    var i = 0
+    while i < len(args):
+        var a = args[i]
+        if (
+            a.byte_length() > 1
+            and a.startswith("-")
+            and a[byte = 1 : a.byte_length()] == key
+        ):
+            if i + 1 < len(args):
+                return args[i + 1]
+            return default
+        i += 1
+    return default

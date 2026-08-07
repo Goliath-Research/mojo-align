@@ -1,0 +1,10 @@
+# GH200 Phase 0 spike log
+date: 2026-08-06T20:43:02Z
+host: 192-222-50-58
+NVIDIA GH200 480GB, 97871 MiB
+
+## Parabricks giraffe I/O options (GAF search)
+  --out-bam OUT_BAM      Path of a BAM file for output.
+  --out-duplicate-metrics OUT_DUPLICATE_METRICS
+                         to consider them optical duplicates. Ignored if --out-duplicate-metrics
+VERDICT: NO-GO — Parabricks giraffe is BAM-only (no GAF / named-coordinates).

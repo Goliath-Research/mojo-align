@@ -190,11 +190,16 @@ def main(argv=None):
         directional = kvargs.get("directional", "Y")
         directional = directional.lower() == "y"
 
+        align_engine = kvargs.get("align_engine") or os.environ.get(
+            "METHYLGRAPHER_ALIGN_ENGINE"
+        )
+
         alignments.alignment_main(fq1, fq2, work_dir, index_prefix,
                                    compress=compress,
                                    thread=thread,
                                    directional=directional,
-                                   vg_path=vg_path
+                                   vg_path=vg_path,
+                                   align_engine=align_engine,
                                    )
         return 0
 
@@ -312,7 +317,20 @@ def main(argv=None):
         # Patch (methylGrapher-mojo): always a single GFA worker (no dual GFA).
         gfa_worker_num = 1
 
-        alignments.alignment_main(fq1, fq2, work_dir, index_prefix, compress=compress, thread=thread, directional=directional, vg_path=vg_path)
+        align_engine = kvargs.get("align_engine") or os.environ.get(
+            "METHYLGRAPHER_ALIGN_ENGINE"
+        )
+        alignments.alignment_main(
+            fq1,
+            fq2,
+            work_dir,
+            index_prefix,
+            compress=compress,
+            thread=thread,
+            directional=directional,
+            vg_path=vg_path,
+            align_engine=align_engine,
+        )
 
         mcall.mcall_main(
             work_dir, index_prefix,

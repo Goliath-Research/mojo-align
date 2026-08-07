@@ -1,0 +1,6 @@
+readA	10	0	10	+	>1	10	0	10	10	10	60	cs:Z::10	ri:i:1	os:Z:ACGTACGTAC	rc:Z:CT
+readA	10	0	10	+	>2	10	0	10	10	10	60	cs:Z::10	ri:i:2	os:Z:GTACGTACGT	rc:Z:GA
+readB	10	0	10	+	>2	10	0	10	10	10	60	cs:Z::10	ri:i:1	os:Z:GTACGTACGT	rc:Z:CT
+readB	10	0	10	+	>1	10	0	10	10	10	60	cs:Z::10	ri:i:2	os:Z:ACGTACGTAC	rc:Z:GA
+readC	10	0	10	+	>1	10	0	10	10	10	60	cs:Z::10	ri:i:1	os:Z:ACGTACGTAC	rc:Z:CT
+readC	10	0	10	+	>3	10	0	10	10	10	60	cs:Z::10	ri:i:2	os:Z:TTTTAAAACC	rc:Z:GA

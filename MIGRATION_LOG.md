@@ -4,6 +4,77 @@ Tracking decisions and progress for the Python -> Mojo port.
 
 ---
 
+## 2026-08-07 — GBZ-native Mojo Giraffe
+
+**Completed:**
+- GBZ contract + toy PrepareGenome-shaped fixtures (`tests/data/giraffe_fixture/gbz_toy/`).
+- `engine/giraffe_gbz_helper.py` + `scripts/build_mojo_gbz_cache.py` (vg convert / segment cache).
+- Mojo modules `giraffe_gbz` / `giraffe_minzip` / `giraffe_dist`; CLI `-gbz/-dist/-min/-zipcodes`.
+- `align_backends`: prefer GBZ quartet for `gpu_giraffe`/`mojo_giraffe` (GFA size-cap no longer blocks production).
+- Toy GBZ PE golden parity PASS; GPU seed `nvidia:sm_90` on GH200.
+- Buffy ≤2h + DS20M MethylCall parity still operator gates after C2T/G2A caches.
+
+---
+
+## 2026-08-06 — Mojo GPU Giraffe GAF
+
+**Completed:**
+- Spec + golden fixture: `docs/GIRAFFE_SPEC.md`, `tests/data/giraffe_fixture/`.
+- Native modules `src/giraffe_*.mojo` + `MojoGiraffe` CLI (GFA→GAF, PE tags).
+- Portable GPU seed via `giraffe_device` + `scripts/giraffe_gpu_minimizer.py`
+  (targets `nvidia:sm_90` / `amdgpu`; CuPy optional on GH200).
+- `engine/align_backends.py` — `cpu_vg` | `gpu_giraffe` | `mojo_giraffe`;
+  `gpu_giraffe` defaults to prefer Mojo (`FALLBACK=mojo`) with auto-vg for
+  oversized/GBZ-only indexes.
+- Benchmarks: `docs/BENCHMARK_GIRAFFE.md`, `scripts/benchmark_giraffe.sh`.
+- Progressive: Buffy ≤2 h + GBZ-native + DS20M MethylCall parity still operator gates.
+
+---
+
+## 2026-08-06 — Mojo Align orchestration + GH200 Phase 0
+
+**Completed:**
+- Phase 0 spike: Parabricks 4.7 `pbrun giraffe` is **BAM-only** (no GAF /
+  named-coordinates) → **NO-GO** as MethylCall science mapper on GH200.
+  See `docs/PHASE0_GH200_ALIGN.md` + `scripts/spike_gh200_dual_graph_align.sh`.
+- `engine/align_backends.py` — `cpu_vg` | `gpu_giraffe` (default fallback `vg`
+  GAF until a true GPU→GAF tool exists; `FALLBACK=error` fails closed).
+- `src/align.mojo` + `main.mojo` Align native orchestration; `-align_engine`.
+- Tests: `tests/test_align_backends.py`.
+
+**Operator:** do not treat `align_engine=gpu_giraffe` as Parabricks GAF; it is
+GH200 dual-graph Align with vg GAF interim unless Phase 0 is re-opened green.
+
+---
+
+## 2026-08-06 — Native MethylCall hot path + parallelize
+
+**Completed:**
+- `src/gfa.mojo` — `GraphicalFragmentAssemblyMemory` loads `S` lines into
+  `Dict[String, String]` (gzip-aware via `utility.open_text_read`).
+- `src/mcall.mojo` — native `alignment_to_methylation()` on top of
+  `mcall_core` parsers; `run_methylcall_native()` drives MethylCall with
+  Mojo GFA lookup + `std.algorithm.parallelize` over fragments per batch.
+  GAF filtering still uses `engine.mcall.iter_alignment_batches` (parity).
+- `src/merge_cpg.mojo` / `src/conversion_rate.mojo` — native MergeCpG +
+  ConversionRate; wired from `src/main.mojo` (same python env rollback).
+- `src/utility.mojo` — `open_text_read` / `open_text_write` / gzip helpers.
+- `src/main.mojo` — `MethylCall` / `MergeCpG` / `ConversionRate` native;
+  set `METHYLGRAPHER_MCALL_ENGINE=python` for legacy `engine.cli`.
+- `engine/mcall.py` — `iter_alignment_batches`, gzip-aware `alignment.gaf`
+  open (`.gz` / `.gzip` siblings).
+- `tests/test_mcall_core.mojo` — parser / GFA / methylation / gzip unit tests
+  (`pixi run mojo -I src tests/test_mcall_core.mojo`).
+- Parity: toy + DS20M subset `graph.methyl` / `graph.cpg.tsv` identical vs
+  python engine; see `docs/BENCHMARK_MCALL.md` (native ~15 GiB RSS vs ~22 GiB).
+
+**Known TODOs:**
+1. Operator full-Buffy GAF (~679 GiB) wall/RSS after `:1.70-mojo` deploy.
+2. Port Align / remaining GAF filter into Mojo when Align becomes the bottleneck.
+3. Optional SIMD CpG scan (legacy scaffold Phase 4).
+
+---
+
 ## 2026-07-28 — Cutover: `engine/` Python port + Mojo 1.0 CLI/interop
 
 **Context:** the 2026-07-28 "Initial scaffold" entry below stubbed out 7

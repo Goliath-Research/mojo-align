@@ -21,11 +21,16 @@ deliberately.
 | Component | Status |
 |---|---|
 | `engine/` (Python 0.2.0 port + patches) | 🟢 Complete — `Align`/`MethylCall`/`MergeCpG`/`Main`/`PrepareGenome`/`ConversionRate`/`help`/`vg_check` all runnable via `python -m engine.cli` |
-| `src/utility.mojo` | 🟢 Complete — `phred_to_int`, `reverse_complement`, `bool_from_str`, `system_execute` |
+| `src/utility.mojo` | 🟢 Complete — Phred / RC / bool / subprocess + gzip text I/O |
 | `src/mcall_core.mojo` | 🟢 Complete — native `alignment_path_parse`, `cs_tag_parse` |
-| `src/main.mojo` | 🟢 Complete — `help`/`vg_check` native; everything else dispatched to `engine.cli` over Python interop |
+| `src/gfa.mojo` | 🟢 Complete — segment `Dict` for MethylCall |
+| `src/mcall.mojo` | 🟢 Complete — native `alignment_to_methylation` + `parallelize` MethylCall driver |
+| `src/merge_cpg.mojo` / `conversion_rate.mojo` | 🟢 Complete — native MergeCpG + ConversionRate |
+| `src/main.mojo` | 🟢 Complete — `help`/`vg_check`/`Align`/`MethylCall`/`MergeCpG`/`ConversionRate` native; PrepareGenome/Main → `engine.cli` |
+| Align backends | 🟢 `cpu_vg` / `gpu_giraffe` / `mojo_giraffe` (`engine/align_backends.py`); Mojo Giraffe GAF — `docs/GIRAFFE_SPEC.md`; Phase 0 Parabricks GAF **NO-GO** — `docs/PHASE0_GH200_ALIGN.md` |
+| Mojo Giraffe | 🟢 GFA + **GBZ-native** (`-gbz/-dist/-min`); GPU seed `nvidia:sm_90`; production prefers GBZ quartet |
 | `bin/methylGrapher` | 🟢 Complete — engine-switchable launcher (`METHYLGRAPHER_ENGINE=mojo`) |
-| Native Mojo methylation-calling pipeline (GFA parsing, multiprocessing workers, GAF merge) | 🟡 Not started — still delegated to `engine/` |
+| Native Mojo methylation-calling pipeline | 🟢 Complete for MethylCall hot path; Align / MergeCpG merge still `engine/` |
 
 🟡 Not started → 🔵 In progress → 🟢 Complete
 
@@ -100,7 +105,7 @@ scripts/benchmark_mcall.sh [WORK_DIR] [INDEX_PREFIX]
 | Business logic (Align/MethylCall/GFA/multiprocessing) | Ported faithfully into `engine/`, called via Python interop from `src/main.mojo` | De-risks the cutover: the CLI, process entry point, and hot parsers move to Mojo first, without a big-bang rewrite of the whole (multiprocessing-heavy) pipeline |
 | Per-alignment-line parsing (`alignment_path_parse`, `cs_tag_parse`) | Native Mojo (`src/mcall_core.mojo`) | Called once per GAF record — the highest-value functions to port first for future SIMD/parallel work |
 | `pysam` | `vg`/`samtools` subprocess via Python `subprocess` (from both `engine/` and `src/utility.mojo`'s `system_execute`) | Avoids a Python C-extension dependency; Mojo 1.0 has no native subprocess API yet, so interop with `subprocess` is used from Mojo too |
-| `multiprocessing.Pool` / `Process` | Still Python `multiprocessing` inside `engine/` | Not yet ported; candidate for Mojo `parallelize()` once the hot loop is native |
+| `multiprocessing.Pool` / `Process` | Mojo `parallelize()` in native MethylCall; Python path kept for `METHYLGRAPHER_MCALL_ENGINE=python` | Shared-memory workers; no GIL/pickle on the hot loop |
 | `argparse` | Manual `-key value` argv parsing (both `engine/cli.py` and `src/main.mojo`) | Matches upstream methylGrapher's own manual parsing; no stdlib argparse in Mojo |
 
 ### Patches applied on top of methylGrapher 0.2.0 (see `MIGRATION_LOG.md`)
