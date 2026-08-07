@@ -370,10 +370,13 @@ def map_fastq_to_gaf(
 
 
 def mojo_giraffe_ready() -> bool:
-    """Operator gate: require explicit READY before production Mojo selection."""
-    return os.environ.get("METHYLGRAPHER_MOJO_GIRAFFE_READY", "").strip() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    """Whether Mojo GBZ may be selected for ``gpu_giraffe`` / ``mojo_giraffe``.
+
+    Default **on** (production Mojo path). Opt out with
+    ``METHYLGRAPHER_MOJO_GIRAFFE_READY=0`` / ``false`` / ``off`` to force
+    ``vg_autoscale`` while keeping ``align_engine=gpu_giraffe``.
+    """
+    raw = os.environ.get("METHYLGRAPHER_MOJO_GIRAFFE_READY", "1").strip().lower()
+    if raw in {"0", "false", "no", "off", "vg"}:
+        return False
+    return True
