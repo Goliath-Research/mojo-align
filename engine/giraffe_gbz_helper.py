@@ -85,8 +85,61 @@ def stream_gbz_to_segments(gbz_path: str, vg_path: Optional[str] = None) -> Dict
     return segments
 
 
+def _default_cache_roots() -> List[Path]:
+    roots: List[Path] = []
+    env = os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
+    if env:
+        roots.append(Path(env))
+    for cand in (
+        Path("/work/cache/mojo_segments"),
+        Path("/lambda/nfs/Work/cache/mojo_segments"),
+        Path(tempfile.gettempdir()) / "mojo_segments",
+    ):
+        if cand not in roots:
+            roots.append(cand)
+    return roots
+
+
 def segment_cache_dir(gbz_path: str) -> Path:
-    return Path(gbz_path + ".mojo_segments")
+    """Preferred cache directory for a GBZ (sibling, else shared cache root)."""
+    sibling = Path(gbz_path + ".mojo_segments")
+    if sibling.is_dir() and (sibling / "segments.jsonl").is_file():
+        return sibling
+    # Prefer sibling when the genome tree is writable (operator prebuild path).
+    try:
+        parent = Path(gbz_path).resolve().parent
+        if os.access(parent, os.W_OK):
+            return sibling
+    except OSError:
+        pass
+    name = Path(gbz_path).name + ".mojo_segments"
+    for root in _default_cache_roots():
+        return root / name
+    return sibling
+
+
+def segment_cache_ready(gbz_path: str) -> bool:
+    """True when a durable segment pack exists (sibling or shared cache root)."""
+    candidates = [Path(gbz_path + ".mojo_segments")]
+    name = Path(gbz_path).name + ".mojo_segments"
+    for root in _default_cache_roots():
+        candidates.append(root / name)
+    for cache in candidates:
+        if (cache / "segments.jsonl").is_file() and (cache / "meta.json").is_file():
+            return True
+    return False
+
+
+def resolve_segment_cache(gbz_path: str) -> Optional[Path]:
+    """Return an existing ready cache path, or None."""
+    candidates = [Path(gbz_path + ".mojo_segments")]
+    name = Path(gbz_path).name + ".mojo_segments"
+    for root in _default_cache_roots():
+        candidates.append(root / name)
+    for cache in candidates:
+        if (cache / "segments.jsonl").is_file() and (cache / "meta.json").is_file():
+            return cache
+    return None
 
 
 def ensure_segment_cache(
@@ -95,13 +148,34 @@ def ensure_segment_cache(
     force: bool = False,
     vg_path: Optional[str] = None,
 ) -> Path:
-    """Build or reuse on-disk segment pack next to the GBZ."""
+    """Build or reuse on-disk segment pack (sibling GBZ or shared cache root)."""
+    existing = None if force else resolve_segment_cache(gbz_path)
+    if existing is not None:
+        return existing
     cache = segment_cache_dir(gbz_path)
     meta = cache / "meta.json"
     pack = cache / "segments.jsonl"
-    if cache.is_dir() and meta.is_file() and pack.is_file() and not force:
-        return cache
-    cache.mkdir(parents=True, exist_ok=True)
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Genome mount may be read-only inside the container; use shared cache.
+        name = Path(gbz_path).name + ".mojo_segments"
+        last_err: Optional[BaseException] = None
+        cache = None  # type: ignore[assignment]
+        for root in _default_cache_roots():
+            cand = root / name
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                cache = cand
+                break
+            except OSError as exc:
+                last_err = exc
+        if cache is None:
+            raise RuntimeError(
+                f"cannot create mojo segment cache for {gbz_path}: {last_err}"
+            ) from last_err
+        meta = cache / "meta.json"
+        pack = cache / "segments.jsonl"
     segments = stream_gbz_to_segments(gbz_path, vg_path=vg_path)
     with pack.open("w", encoding="utf-8") as fh:
         for seg_id, seq in segments.items():
@@ -131,7 +205,11 @@ def load_segments(gbz_path: str, *, vg_path: Optional[str] = None) -> Dict[str, 
             return stream_gbz_to_segments(str(gbz), vg_path=vg_path)
         except Exception:
             pass
-    cache = ensure_segment_cache(str(gbz), vg_path=vg_path)
+    ready = resolve_segment_cache(str(gbz))
+    if ready is None:
+        cache = ensure_segment_cache(str(gbz), vg_path=vg_path)
+    else:
+        cache = ready
     out: Dict[str, str] = {}
     with (cache / "segments.jsonl").open(encoding="utf-8") as fh:
         for line in fh:

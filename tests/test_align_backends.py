@@ -83,6 +83,34 @@ def test_gpu_giraffe_fallback_vg(monkeypatch):
     assert "--named-coordinates" in cmd
 
 
+def test_gpu_giraffe_large_gbz_without_cache_falls_to_vg(tmp_path, monkeypatch):
+    """Production GBZ without mojo_segments must not block Align on mid-run convert."""
+    pref = tmp_path / "prod.wl.C2T"
+    Path(str(pref) + ".giraffe.gbz").write_bytes(b"G" * (65 * 1024 * 1024))
+    Path(str(pref) + ".dist").write_bytes(b"D")
+    Path(str(pref) + ".shortread.withzip.min").write_bytes(b"M")
+    Path(str(pref) + ".shortread.zipcodes").write_bytes(b"Z")
+    bin_sh = tmp_path / "methylGrapher"
+    bin_sh.write_text("#!/bin/sh\n")
+    bin_sh.chmod(0o755)
+    monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "mojo")
+    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_BIN", str(bin_sh))
+    monkeypatch.setenv("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
+    eng, cmd = resolve_map_command(
+        align_engine="gpu_giraffe",
+        vg_path="/usr/bin/vg",
+        thread=64,
+        output_format="gaf",
+        index_params="-Z x.gbz -d x.dist -m x.min -z x.zip",
+        giraffe_input="-f a.fq -f b.fq",
+        index_prefix=str(pref),
+    )
+    assert eng == "gpu_giraffe+vg_autoscale"
+    assert "vg giraffe" in cmd
+    assert "MojoGiraffe" not in cmd
+    assert ">&2" not in cmd  # vg path is a plain one-liner
+
+
 def test_gpu_giraffe_fallback_error(monkeypatch):
     monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "error")
     with pytest.raises(RuntimeError, match="unavailable|error"):

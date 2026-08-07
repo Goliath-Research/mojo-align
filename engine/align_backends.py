@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 from typing import Literal, Optional
 
-from engine.giraffe_gbz_helper import resolve_gbz_quartet
+from engine.giraffe_gbz_helper import resolve_gbz_quartet, segment_cache_ready
 
 AlignEngine = Literal["cpu_vg", "gpu_giraffe", "mojo_giraffe"]
 
@@ -172,11 +172,12 @@ def build_mojo_giraffe_gfa_cmd(
     elif os.environ.get("METHYLGRAPHER_GIRAFFE_K", "").strip():
         k_arg = f" -k {os.environ['METHYLGRAPHER_GIRAFFE_K'].strip()}"
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
+    # Status prints from MojoGiraffe must not mix into GAF stdout (Align shards GAF).
     return (
         "set -euo pipefail; "
         'tmp="$(mktemp -t mojo_giraffe.XXXXXX.gaf)"; '
         f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
-        f'-out_gaf "$tmp" -device "{dev}"{k_arg}; '
+        f'-out_gaf "$tmp" -device "{dev}"{k_arg} >&2; '
         'cat "$tmp"; rm -f "$tmp"'
     )
 
@@ -212,7 +213,7 @@ def build_mojo_giraffe_gbz_cmd(
         'tmp="$(mktemp -t mojo_giraffe.XXXXXX.gaf)"; '
         f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
         f"{zip_arg} -fq1 \"{fq1}\"{fq2_arg} "
-        f'-out_gaf "$tmp" -device "{dev}"{k_arg}; '
+        f'-out_gaf "$tmp" -device "{dev}"{k_arg} >&2; '
         'cat "$tmp"; rm -f "$tmp"'
     )
 
@@ -252,14 +253,29 @@ def resolve_map_command(
         bin_path = resolve_mojo_giraffe_bin()
         if not bin_path or not quartet or not fq1:
             return None
+        gbz_path = quartet["gbz"]
+        # Production GBZ (~GB) must have a prebuilt segment pack; otherwise Align
+        # would spend hours in `vg convert` / OOM building cache mid-map.
+        max_direct = int(
+            os.environ.get(
+                "METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES",
+                str(64 * 1024 * 1024),
+            )
+        )
+        try:
+            gbz_bytes = Path(gbz_path).stat().st_size
+        except OSError:
+            return None
+        if gbz_bytes > max_direct and not segment_cache_ready(gbz_path):
+            return None
         note = (
             f"# {label} mojo_giraffe_gbz host={platform.machine()} "
             f"device={os.environ.get('METHYLGRAPHER_GIRAFFE_DEVICE', 'auto')} "
-            f"gbz={quartet['gbz']}\n"
+            f"gbz={gbz_path}\n"
         )
         cmd = build_mojo_giraffe_gbz_cmd(
             mojo_bin=bin_path,
-            gbz=quartet["gbz"],
+            gbz=gbz_path,
             dist=quartet["dist"],
             min_path=quartet["min"],
             zipcodes=quartet.get("zipcodes") or "",

@@ -252,9 +252,12 @@ class SystemExecute(object):
         return stdout, stderr
 
     def wait(self):
+        """Wait for all subprocesses; return their exit codes (empty if none)."""
+        codes = []
         for sp in self._pool:
-            sp.wait()
+            codes.append(sp.wait())
         self._pool = []
+        return codes
 
 
 class GFASimple:
@@ -589,6 +592,13 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
             if compress:
                 output_fastq += '.gz'
 
+            # Resume: keep prior converted FASTQs (Buffy-scale reconvert is multi-hour).
+            if os.path.isfile(output_fastq) and os.path.getsize(output_fastq) > 0:
+                report_file_handle.write(
+                    f"Reusing existing converted FASTQ: {output_fastq}\n"
+                )
+                continue
+
             p = multiprocessing.Process(
                 target=fastq_converter_worker_function,
                 args=(input_fastq, output_fastq, conversion_str, read_counts, split_num)
@@ -601,10 +611,13 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
         p.join()
 
     # print(read_counts)
-    assert len(set(read_counts)) == 1
-    report_file_handle.write(f"Total reads for R1: {read_counts[0]}\n")
-    if fq2 != None:
-        report_file_handle.write(f"Total reads for R2: {read_counts[0]}\n\n")
+    if pool:
+        assert len(set(read_counts)) == 1
+        report_file_handle.write(f"Total reads for R1: {read_counts[0]}\n")
+        if fq2 != None:
+            report_file_handle.write(f"Total reads for R2: {read_counts[0]}\n\n")
+    else:
+        report_file_handle.write("Total reads: reused existing converted FASTQs\n\n")
 
     report_file_handle.close()
 

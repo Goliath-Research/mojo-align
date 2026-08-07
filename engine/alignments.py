@@ -167,9 +167,16 @@ def alignment(
                 fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
                 for line in fout:
                     line = line.decode("utf-8")
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    # Skip mapper status / progress lines that are not GAF records.
+                    # GAF requires ≥12 tab-separated fields (see GAF spec).
+                    l = stripped.split("\t")
+                    if len(l) < 12:
+                        continue
 
                     # Skip unaligned
-                    l = line.strip().split("\t")
                     asterisk = False
                     for i in [2, 3, 6, 7, 8, 9, 10, 11]:
                         if l[i] == "*":
@@ -178,12 +185,25 @@ def alignment(
                     if asterisk:
                         continue
 
-                    # Just to split alignment to multiple files, reduce memory usage for sorting
-                    ind = int(l[0].split("_")[2])
+                    # Shard by methylGrapher-encoded read name: ..._{C2T|G2A}_{shard}_{seq}
+                    name_parts = l[0].split("_")
+                    if len(name_parts) < 3:
+                        continue
+                    try:
+                        ind = int(name_parts[2])
+                    except ValueError:
+                        continue
+                    if ind not in alignment_outs:
+                        continue
                     alignment_out_fh = alignment_outs[ind]
-                    alignment_out_fh.write(line)
+                    alignment_out_fh.write(line if line.endswith("\n") else line + "\n")
 
-                se.wait()
+                codes = se.wait()
+                if any(rc != 0 for rc in codes):
+                    raise RuntimeError(
+                        f"Align map command failed (exit {codes}) backend={engine_used}; "
+                        f"see {alignment_log}"
+                    )
 
     for fh in alignment_outs.values():
         fh.close()
