@@ -195,26 +195,33 @@ def run_mojo_fq2bam_meth(
     convert_fastq(fq1, c2t_r1, "C2T")
     convert_fastq(fq2, g2a_r2, "G2A")
 
-    sam_path = work / "aligned.sam"
     bam_unsorted = work / "aligned.bam"
+    # Stream BWA SAM → samtools view; never buffer the full SAM in Python
+    # (WGBS SAMs are multi‑GB and would OOM under capture_output=True).
+    bwa_cmd = [bwa, "mem", "-t", str(threads), str(c2t_ref), str(c2t_r1), str(g2a_r2)]
+    view_cmd = [samtools, "view", "-bS", "-o", str(bam_unsorted), "-"]
     with log.open("a", encoding="utf-8") as handle:
-        handle.write(
-            f"COMMAND: {bwa} mem -t {threads} {c2t_ref} {c2t_r1} {g2a_r2}\n"
+        handle.write("COMMAND: " + " ".join(bwa_cmd) + " | " + " ".join(view_cmd) + "\n")
+        bwa_proc = subprocess.Popen(
+            bwa_cmd,
+            stdout=subprocess.PIPE,
+            stderr=handle,
         )
-    proc = subprocess.run(
-        [bwa, "mem", "-t", str(threads), str(c2t_ref), str(c2t_r1), str(g2a_r2)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.stderr:
-        with log.open("a", encoding="utf-8") as handle:
-            handle.write(proc.stderr)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr or "bwa mem failed")
-    sam_path.write_text(proc.stdout, encoding="utf-8")
-
-    _run([samtools, "view", "-bS", str(sam_path), "-o", str(bam_unsorted)], log)
+        assert bwa_proc.stdout is not None
+        view_proc = subprocess.run(
+            view_cmd,
+            stdin=bwa_proc.stdout,
+            stderr=handle,
+            check=False,
+        )
+        bwa_proc.stdout.close()
+        bwa_rc = bwa_proc.wait()
+    if bwa_rc != 0:
+        raise RuntimeError(f"bwa mem failed (exit {bwa_rc}); see {log}")
+    if view_proc.returncode != 0:
+        raise RuntimeError(
+            f"samtools view failed (exit {view_proc.returncode}); see {log}"
+        )
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     _run([samtools, "sort", "-@", str(max(1, threads // 2)), "-o", str(out_bam), str(bam_unsorted)], log)
     _run([samtools, "index", str(out_bam)], log)
