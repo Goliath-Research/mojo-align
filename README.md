@@ -12,14 +12,15 @@ Mojo migration by David Izada Rodriguez / Goliath Research.
 methylGrapher-mojo is a **cutover**, not a big-bang rewrite: a faithful Python
 port of methylGrapher 0.2.0 lives in `engine/` for PrepareGenome / Main and
 shared helpers, while `src/main.mojo` owns the Mojo CLI and runs Align,
-MethylCall, MergeCpG, ConversionRate, and MojoGiraffe natively (with selective
-Python interop for GAF filtering, Align map backends, and parity-sensitive
-merge steps). Set `METHYLGRAPHER_MCALL_ENGINE=python` to force full
-`engine.cli` rollback of those native commands.
+MethylCall, MergeCpG, ConversionRate, MojoGiraffe, and MojoFq2bamMeth
+natively (with selective Python interop for GAF filtering, Align map backends,
+parity-sensitive merge, and linear WGBS prep/QC). Set
+`METHYLGRAPHER_MCALL_ENGINE=python` to force full `engine.cli` rollback of
+Align / MethylCall / MergeCpG / ConversionRate.
 
 | Component | Status |
 |---|---|
-| `engine/` (Python 0.2.0 port + patches) | 🟢 Complete — `python -m engine.cli`; Align backends, GBZ/minimizer helpers |
+| `engine/` (Python 0.2.0 port + patches) | 🟢 Complete — `python -m engine.cli`; Align backends, GBZ/minimizer helpers, MojoFq2bamMeth orchestration |
 | `src/utility.mojo` | 🟢 Complete — Phred / RC / bool / subprocess + gzip text I/O |
 | `src/mcall_core.mojo` | 🟢 Complete — native `alignment_path_parse`, `cs_tag_parse` |
 | `src/gfa.mojo` | 🟢 Complete — segment `Dict` for MethylCall |
@@ -27,10 +28,10 @@ merge steps). Set `METHYLGRAPHER_MCALL_ENGINE=python` to force full
 | `src/merge_cpg.mojo` / `conversion_rate.mojo` | 🟢 Complete — native MergeCpG + ConversionRate |
 | `src/align.mojo` | 🟢 Complete — Align orchestration; map kernel via `engine.align_backends` |
 | `src/giraffe_*.mojo` | 🟢 Complete — MojoGiraffe (GFA or GBZ→GAF); GPU seed `nvidia:sm_90` / `amdgpu:gfx942` |
-| `src/linear_*.mojo` + `engine/fq2bam_meth.py` / `MojoFq2bamMeth` | 🔵 In progress — portable linear WGBS Align (Clara substitute); Mojo GPU kernels `nvidia:sm_90` / `amdgpu:gfx942`; BWA CPU fallback; operator Clara/ROCm perf gates pending — `docs/LINEAR_FQ2BAM_SPEC.md` |
+| `src/linear_*.mojo` / `MojoFq2bamMeth` | 🔵 In progress — **native Mojo** linear WGBS mapper (index → seed → extend → SAM); one source for `nvidia:sm_90` + `amdgpu:gfx942`; Python does convert/QC/`samtools` only; BWA is emergency CPU fallback — `docs/LINEAR_FQ2BAM_SPEC.md` |
 | `src/main.mojo` | 🟢 Complete — native: `help`/`vg_check`/`Align`/`MojoGiraffe`/`MojoFq2bamMeth`/`MethylCall`/`MergeCpG`/`ConversionRate`; PrepareGenome/Main → `engine.cli` |
 | Align backends | 🟢 `cpu_vg` / `gpu_giraffe` / `mojo_giraffe` — `docs/GIRAFFE_SPEC.md`; Parabricks GAF **NO-GO** — `docs/PHASE0_GH200_ALIGN.md` |
-| `bin/methylGrapher` | 🟢 Complete — `METHYLGRAPHER_ENGINE=mojo\|python` (default: python) |
+| `bin/methylGrapher` | 🟢 Complete — `METHYLGRAPHER_ENGINE=mojo\|python` (default: python); `MojoFq2bamMeth` dual-ship |
 
 🟡 MVP → 🔵 In progress → 🟢 Complete
 
@@ -38,9 +39,9 @@ merge steps). Set `METHYLGRAPHER_MCALL_ENGINE=python` to force full
 
 ## Requirements
 
-- [Mojo via `pixi`](https://docs.modular.com/mojo/manual/get-started/) — this repo pins **Mojo 1.0.0b2** (`pixi.toml` / `pixi.lock`); `std.gpu.host.DeviceContext` is available (NVIDIA driver ≥580 or `MODULAR_NVPTX_COMPILER_PATH` for CUDA create)
+- [Mojo via `pixi`](https://docs.modular.com/mojo/manual/get-started/) — this repo pins **Mojo 1.0.0b2** (`pixi.toml` / `pixi.lock`); native linear/Giraffe GPU paths use `std.gpu.host.DeviceContext` (NVIDIA driver ≥580 or `MODULAR_NVPTX_COMPILER_PATH` for CUDA create; AMD via HIP/`amdgpu`)
 - `vg` (graph genome toolkit) — required for `PrepareGenome` and `cpu_vg` Align; not needed for `MethylCall`/`MergeCpG` against an existing `alignment.gaf`, or for fixture-scale `MojoGiraffe`
-- `samtools` — required for `MojoFq2bamMeth`; `bwa` only for `METHYLGRAPHER_LINEAR_MAPPER=bwa` fallback
+- `samtools` — required for `MojoFq2bamMeth` BAM sort/index; `bwa` only if forcing `METHYLGRAPHER_LINEAR_MAPPER=bwa`
 
 ## Install
 
@@ -59,8 +60,8 @@ export PATH="$HOME/.pixi/bin:$PATH"
 pixi run python -m engine.cli help
 bin/methylGrapher help
 
-# Mojo CLI (native Align / MethylCall / MergeCpG / ConversionRate / MojoGiraffe;
-# PrepareGenome / Main still dispatch to engine.cli)
+# Mojo CLI (native Align / MethylCall / MergeCpG / ConversionRate /
+# MojoGiraffe / MojoFq2bamMeth; PrepareGenome / Main → engine.cli)
 pixi run mojo src/main.mojo help
 METHYLGRAPHER_ENGINE=mojo bin/methylGrapher help
 ```
@@ -79,11 +80,12 @@ METHYLGRAPHER_ENGINE=mojo bin/methylGrapher Align \
     -index_prefix ... -fq1 ... -fq2 ... -work_dir ... \
     -align_engine cpu_vg   # or gpu_giraffe | mojo_giraffe
 
-# Portable linear WGBS Align (Clara fq2bam_meth substitute; dual-ship)
+# Native Mojo linear WGBS Align (Clara fq2bam_meth substitute on NVIDIA + AMD)
+# Map kernel is src/linear_*.mojo — not a BWA/Clara wrap. Dual-ship CLI.
 bin/methylGrapher MojoFq2bamMeth \
     -fq1 R1.fastq.gz -fq2 R2.fastq.gz -ref GRCh38.fa \
     -out_bam sample.bam -out_qc_dir sample_qc -sample_id SAMPLE \
-    -device auto   # cpu | nvidia | amd
+    -device auto   # cpu | nvidia | amd  → DeviceContext cuda|hip|cpu
 ```
 
 Rollback native Mojo commands to the Python engine without changing the launcher:
@@ -116,10 +118,12 @@ scripts/benchmark_mcall.sh [WORK_DIR] [INDEX_PREFIX]
 Mojo Giraffe toy (GFA or GBZ) — see `docs/GIRAFFE_SPEC.md` /
 `docs/BENCHMARK_GIRAFFE.md`.
 
-Linear WGBS Align toy + benchmark — see `docs/LINEAR_FQ2BAM_SPEC.md` /
+Native Mojo linear WGBS Align (toy + bakeoff harness) — see
+`docs/LINEAR_FQ2BAM_SPEC.md` / `docs/BENCHMARK_FQ2BAM_METH.md`:
 
 ```bash
 scripts/run_toy_fq2bam_meth.sh python cpu
+scripts/run_toy_fq2bam_meth.sh mojo nvidia   # or amd
 scripts/benchmark_fq2bam_meth.sh
 ```
 
@@ -131,7 +135,7 @@ scripts/benchmark_fq2bam_meth.sh
 | MethylCall hot path | Native Mojo (`mcall` + `mcall_core` + `gfa` + `parallelize`); GAF filter via `engine.mcall.iter_alignment_batches` | Highest-value per-record work in Mojo; complex GAF bookkeeping stays in Python for parity |
 | Align | Mojo control plane (`align.mojo`) + `engine.align_backends` (`cpu_vg` / `gpu_giraffe` / `mojo_giraffe`) | Pluggable science GAF mappers; Parabricks is BAM-only (Phase 0 NO-GO) |
 | MojoGiraffe | Native `src/giraffe_*.mojo` (GFA fixtures or GBZ quartet) | Production prefers GBZ + dense segment pack; `METHYLGRAPHER_MOJO_GIRAFFE_READY=1` gates site flip |
-| MojoFq2bamMeth | Native `src/linear_*.mojo` + `engine/fq2bam_meth.py` orchestrator | Portable linear WGBS on NVIDIA+AMD; BWA is CPU fallback only; Clara/ROCm wall-clock gates before Complete |
+| MojoFq2bamMeth | **Native Mojo linear mapper** (`linear_index` / `linear_seed` / `linear_gpu_kernels` / `linear_extend` / `linear_mapper`) | Full map path in Mojo (not BWA acceleration). One source → `DeviceContext` `cuda`/`hip`/`cpu`. Python (`fq2bam_meth.py`) only converts reads/ref, shells the Mojo mapper, runs `samtools`, emits QC JSON. BWA is emergency fallback (`METHYLGRAPHER_LINEAR_MAPPER=bwa`). Clara/ROCm wall-clock gates before Complete |
 | `pysam` | `vg`/`samtools` via `subprocess` | Avoids a Python C-extension; Mojo uses interop for subprocess |
 | `multiprocessing.Pool` | Mojo `parallelize()` on native MethylCall; Python path via `METHYLGRAPHER_MCALL_ENGINE=python` | Shared-memory workers on the hot loop |
 | `argparse` | Manual `-key value` argv parsing | Matches upstream; no stdlib argparse in Mojo |
@@ -163,7 +167,7 @@ engine/                 # Python engine — methylGrapher 0.2.0 port + patches
   minimizer_index.py    # mmap .shortread.withzip.min
   zipcodes_index.py     # zipcode clustering
   quartet_map.py        # MojoGiraffe ready / map entry
-  fq2bam_meth.py        # Linear WGBS orchestrator (Mojo mapper + BWA fallback + QC)
+  fq2bam_meth.py        # MojoFq2bamMeth: BS convert, invoke Mojo mapper, samtools, QC
 
 src/
   main.mojo             # Mojo CLI dispatcher
@@ -172,7 +176,11 @@ src/
   mcall_core.mojo       # alignment_path_parse / cs_tag_parse
   gfa.mojo / merge_cpg.mojo / conversion_rate.mojo / utility.mojo
   giraffe_*.mojo        # MojoGiraffe (GFA or GBZ → GAF)
-  linear_*.mojo         # MojoFq2bamMeth linear GPU mapper → SAM
+  linear_index.mojo     # Native linear C2T FASTA + k-mer index
+  linear_seed.mojo      # Native k-mer extract / seed postings
+  linear_gpu_kernels.mojo  # Portable DeviceContext seed (cuda|hip|cpu)
+  linear_extend.mojo    # Native seed-and-extend + PE SAM flags
+  linear_mapper.mojo    # End-to-end native map → SAM
   legacy_scaffold/      # Pre-cutover stubs (reference only)
 
 bin/
@@ -206,11 +214,11 @@ python_reference/       # Read-only original methylGrapher 0.2.0 sources
 | `METHYLGRAPHER_ALIGN_ENGINE` | `cpu_vg` (default) \| `gpu_giraffe` \| `mojo_giraffe` |
 | `METHYLGRAPHER_GPU_GIRAFFE_FALLBACK` | `mojo` (default) \| `vg` \| `error` |
 | `METHYLGRAPHER_MOJO_GIRAFFE_READY` | `1` required for production GBZ MojoGiraffe selection |
-| `METHYLGRAPHER_LINEAR_MAPPER` | `mojo` (default) \| `bwa` \| `auto` — linear WGBS map kernel |
+| `METHYLGRAPHER_LINEAR_MAPPER` | `mojo` (default: native Mojo linear mapper) \| `bwa` (CPU fallback only) \| `auto` |
 | `METHYLGRAPHER_ALIGN_DEVICE` | `auto` \| `cpu` \| `nvidia` \| `amd` (Giraffe + MojoFq2bamMeth) |
-| `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` for MI300X kernel target label |
-| `METHYLGRAPHER_BWA_THREADS` | threads for BWA fallback / sort |
-| `METHYLGRAPHER_LINEAR_K` | k-mer size for Mojo linear index (default 15) |
+| `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` for MI300X target label |
+| `METHYLGRAPHER_BWA_THREADS` | threads for BWA fallback / `samtools sort` |
+| `METHYLGRAPHER_LINEAR_K` | k-mer size for native Mojo linear index (default 15) |
 
 ## License
 
