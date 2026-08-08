@@ -297,11 +297,13 @@ class MinimizerIndex:
         results.sort(key=lambda m: m.offset)
         return results
 
-    def locate_read(self, seq: str, *, hit_cap: int = 32) -> List[MinHit]:
-        """Minimizers → graph hits (capped per minimizer)."""
+    def locate_from_minimizers(
+        self, occs: Sequence[MinimizerOcc], *, hit_cap: int = 32
+    ) -> List[MinHit]:
+        """Graph hits from precomputed minimizers (CPU or GPU seed stage)."""
         hits: List[MinHit] = []
         seen: set[Tuple[int, int, int]] = set()
-        for occ in self.minimizers(seq):
+        for occ in occs:
             found = self.find(occ.key)
             if len(found) > hit_cap:
                 found = found[:hit_cap]
@@ -312,6 +314,10 @@ class MinimizerIndex:
                 seen.add(key)
                 hits.append(h)
         return hits
+
+    def locate_read(self, seq: str, *, hit_cap: int = 32) -> List[MinHit]:
+        """Minimizers → graph hits (capped per minimizer)."""
+        return self.locate_from_minimizers(self.minimizers(seq), hit_cap=hit_cap)
 
 
 def probe_minimizer(path: str | Path) -> dict:

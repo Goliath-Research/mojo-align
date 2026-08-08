@@ -3,6 +3,11 @@
 from std.collections import List
 from std.python import Python
 
+from giraffe_gpu_kernels import (
+    kernel_target_label,
+    probe_device_context,
+    seed_kmers_on_device,
+)
 from giraffe_seed import extract_kmers
 
 
@@ -51,6 +56,44 @@ def select_device(requested: String) raises -> String:
     raise Error("unknown giraffe device: " + requested)
 
 
+def require_device_or_raise(device: String) raises -> String:
+    """Resolve device and optionally fail closed when GPU context is required."""
+    var resolved = select_device(device)
+    var os_mod = Python.import_module("os")
+    var require = String(os_mod.environ.get("METHYLGRAPHER_GPU_REQUIRE", "")).lower()
+    var backend = probe_device_context(resolved)
+    print(
+        "MojoGiraffe device=",
+        resolved,
+        " target=",
+        kernel_target_label(resolved),
+        " backend=",
+        backend,
+    )
+    if resolved == DEVICE_CPU:
+        return resolved
+    if backend.startswith("devicecontext-cuda") or backend.startswith(
+        "devicecontext-hip"
+    ):
+        return resolved
+    # Driver <580 without ptxas → host-fallback. Fail closed when required or
+    # when operator pins nvidia/amd explicitly with REQUIRE=1 (default on for
+    # non-cpu pins so silent CPU map cannot masquerade as GPU Giraffe).
+    if require == "" or require == "1" or require == "true" or require == "yes":
+        if resolved == DEVICE_NVIDIA or resolved == DEVICE_AMD:
+            raise Error(
+                "align device="
+                + resolved
+                + " but DeviceContext backend="
+                + backend
+                + ". Set MODULAR_NVPTX_COMPILER_PATH to system ptxas "
+                + "(NVIDIA driver <580) or upgrade driver ≥580; "
+                + "or set METHYLGRAPHER_GPU_REQUIRE=0 to allow host fallback."
+            )
+    print("WARNING: GPU DeviceContext unavailable; continuing on host kernels")
+    return resolved
+
+
 def extract_kmers_batch_cpu(seqs: List[String], k: Int) raises -> List[List[String]]:
     var out = List[List[String]]()
     for s in seqs:
@@ -61,8 +104,16 @@ def extract_kmers_batch_cpu(seqs: List[String], k: Int) raises -> List[List[Stri
 def extract_kmers_batch(
     device: String, seqs: List[String], k: Int
 ) raises -> List[List[String]]:
-    if device == DEVICE_CPU:
+    """Seed k-mers: DeviceContext GPU path first, then CuPy helper, then CPU."""
+    var resolved = select_device(device)
+    if resolved == DEVICE_CPU:
         return extract_kmers_batch_cpu(seqs, k)
+
+    # Preferred: native Mojo DeviceContext kernels (nvidia:sm_90 / amdgpu).
+    try:
+        return seed_kmers_on_device(resolved, seqs, k)
+    except e:
+        print("DeviceContext seed failed; trying Python GPU helper: ", e)
 
     var os_mod = Python.import_module("os")
     var sys_mod = Python.import_module("sys")
@@ -77,7 +128,7 @@ def extract_kmers_batch(
         var py_seqs = Python.list()
         for s in seqs:
             py_seqs.append(s)
-        var py_out = helper.extract_kmers_batch(py_seqs, k, device)
+        var py_out = helper.extract_kmers_batch(py_seqs, k, resolved)
         var out = List[List[String]]()
         var n = Int(py=py_out.__len__())
         var i = 0
@@ -92,6 +143,6 @@ def extract_kmers_batch(
             out.append(mers^)
             i += 1
         return out^
-    except e:
-        print("GPU minimizer helper unavailable; falling back to CPU")
+    except e2:
+        print("GPU minimizer helper unavailable; falling back to CPU: ", e2)
         return extract_kmers_batch_cpu(seqs, k)

@@ -216,17 +216,19 @@ def map_one_read(
     qname: str,
     seq: str,
     k_fallback: int = 5,
+    seeds: Optional[List[MinHit]] = None,
 ) -> List[dict]:
     hits_out: List[dict] = []
-    seeds: List[MinHit] = []
-    if min_index is not None and min_index.n_keys > 0:
-        seeds = min_index.locate_read(seq, hit_cap=24)
-        seeds = _cluster_hits(seeds, zipcodes, dist)
-        # Majority node vote as additional signal
-        if seeds:
-            counts = Counter(h.node_id for h in seeds)
-            top_nodes = {n for n, _ in counts.most_common(4)}
-            seeds = [h for h in seeds if h.node_id in top_nodes] or seeds
+    if seeds is None:
+        seeds = []
+        if min_index is not None and min_index.n_keys > 0:
+            seeds = min_index.locate_read(seq, hit_cap=24)
+    seeds = _cluster_hits(seeds, zipcodes, dist)
+    # Majority node vote as additional signal
+    if seeds:
+        counts = Counter(h.node_id for h in seeds)
+        top_nodes = {n for n, _ in counts.most_common(4)}
+        seeds = [h for h in seeds if h.node_id in top_nodes] or seeds
 
     if seeds:
         scored: List[Tuple[float, dict]] = []
@@ -254,13 +256,101 @@ def map_one_read(
         if hits_out:
             return hits_out
 
-    # Fixture / empty-min fallback: exact segment match then short k-mer majority
+    # Fixture / empty-min fallback (toy packs only). Production packs are
+    # 100M+ nodes — never scan them for exact/k-mer fallback (was ~80s/read).
     return _fixture_extend(pack, qname, seq, k_fallback)
+
+
+def _seed_batch_hits(
+    *,
+    min_index: Optional[MinimizerIndex],
+    seqs: List[str],
+    device: str,
+) -> Tuple[List[List[MinHit]], str]:
+    """GPU (CuPy) or CPU minimizer seed → per-read MinHit lists.
+
+    Prefer the system-Python ``gpu_seed_worker.py`` subprocess so CuPy from the
+    image (``pip3 install cupy-cuda12x``) is used even when Mojo sets
+    ``PYTHONHOME`` to the trimmed pixi env.
+    """
+    if min_index is None or min_index.n_keys == 0 or not seqs:
+        return [[] for _ in seqs], "no-index"
+    dev = (device or "cpu").strip().lower() or "cpu"
+    backend = "cpu"
+    if dev in {"nvidia", "cuda", "amd", "hip", "rocm"}:
+        try:
+            import json
+            import subprocess
+            from engine.minimizer_index import MinimizerOcc
+
+            worker = Path(__file__).resolve().parents[1] / "scripts" / "gpu_seed_worker.py"
+            if not worker.is_file():
+                worker = Path("/opt/methylgrapher-mojo/scripts/gpu_seed_worker.py")
+            payload = {
+                "seqs": seqs,
+                "k": int(min_index.k),
+                "w": int(min_index.w),
+                "device": dev,
+            }
+            # Clear Mojo PYTHONHOME so system python3 can import cupy/encodings.
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k
+                not in {
+                    "PYTHONHOME",
+                    "PYTHONPATH",
+                    "LD_PRELOAD",
+                }
+            }
+            env["PYTHONPATH"] = "/opt/methylgrapher-mojo/scripts:/opt/methylgrapher-mojo"
+            proc = subprocess.run(
+                ["/usr/bin/python3", str(worker)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"gpu_seed_worker exit {proc.returncode}: {proc.stderr[-500:]}"
+                )
+            data = json.loads(proc.stdout)
+            backend = str(data.get("backend") or "cupy")
+            hits: List[List[MinHit]] = []
+            for occs_raw in data.get("occs", []):
+                occs = [
+                    MinimizerOcc(
+                        int(o["key"]),
+                        int(o["hash"]),
+                        int(o["offset"]),
+                        bool(o["is_reverse"]),
+                    )
+                    for o in occs_raw
+                ]
+                hits.append(
+                    min_index.locate_from_minimizers(occs, hit_cap=24)
+                )
+            if len(hits) != len(seqs):
+                raise RuntimeError(
+                    f"gpu_seed_worker returned {len(hits)} rows for {len(seqs)} seqs"
+                )
+            print(f"quartet_map seed_backend={backend}", flush=True)
+            return hits, backend
+        except Exception as exc:
+            print(f"GPU minimizer seed unavailable ({exc}); CPU locate", flush=True)
+            backend = "host-locate-fallback"
+    hits = [min_index.locate_read(s, hit_cap=24) for s in seqs]
+    return hits, backend
 
 
 def _fixture_extend(
     pack: SegmentPack, qname: str, seq: str, k: int
 ) -> List[dict]:
+    # Guard FIRST: production dense packs must not enter pack.ids()/items().
+    if len(pack) > 50_000:
+        return []
     qlen = len(seq)
     for sid in pack.ids():
         if pack.get(sid) == seq:
@@ -275,8 +365,6 @@ def _fixture_extend(
                 }
             ]
     # short k-mer majority over pack (toy only — small packs)
-    if len(pack) > 50_000:
-        return []
     counts: Dict[str, int] = {}
     for sid, s in pack.items():
         if len(s) < k:
@@ -348,8 +436,13 @@ def map_fastq_to_gaf(
 
     Streams reads in batches (``METHYLGRAPHER_MOJO_READ_BATCH``, default 8192)
     and writes GAF incrementally so Buffy-scale FASTQs do not OOM.
+
+    ``device`` selects the seed backend: ``nvidia``/``amd`` use CuPy GPU
+    minimizer extraction (plus Mojo DeviceContext warmup from the caller);
+    ``cpu`` keeps the host Python locate path.
     """
-    _ = device
+    dev = (device or os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE") or "cpu")
+    dev = str(dev).strip().lower() or "cpu"
     pack = ensure_pack_for_gbz(gbz)
     min_index: Optional[MinimizerIndex] = None
     zip_index: Optional[ZipcodesIndex] = None
@@ -368,9 +461,28 @@ def map_fastq_to_gaf(
     n_records = 0
     n_written = 0
     batch_size = _read_batch_size()
+    seed_backend = "unset"
+    print(
+        f"quartet_map device={dev} batch={batch_size} "
+        f"mojo_backend={os.environ.get('METHYLGRAPHER_LAST_GPU_BACKEND', '')}",
+        flush=True,
+    )
     try:
         with open(out_gaf, "w", encoding="utf-8") as fh:
             for batch in _iter_fastq_batches(fq1, fq2, batch_size=batch_size):
+                # Flatten batch for GPU seed, then map with precomputed hits.
+                flat_seqs: List[str] = []
+                for r1, r2 in batch:
+                    _n1, s1 = r1
+                    flat_seqs.append(s1)
+                    if r2 is not None:
+                        _n2, s2 = r2
+                        flat_seqs.append(s2)
+                seed_hits, seed_backend = _seed_batch_hits(
+                    min_index=min_index, seqs=flat_seqs, device=dev
+                )
+                os.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = seed_backend
+                si = 0
                 for r1, r2 in batch:
                     n1, s1 = r1
                     if r2 is None:
@@ -382,12 +494,14 @@ def map_fastq_to_gaf(
                             qname=n1,
                             seq=s1,
                             k_fallback=k,
+                            seeds=seed_hits[si],
                         ):
                             n_records += 1
                             if h["path"] == "*":
                                 continue
                             fh.write(format_gaf_line(h) + "\n")
                             n_written += 1
+                        si += 1
                         continue
 
                     n2, s2 = r2
@@ -399,6 +513,7 @@ def map_fastq_to_gaf(
                         qname=n1,
                         seq=s1,
                         k_fallback=k,
+                        seeds=seed_hits[si],
                     )
                     h2s = map_one_read(
                         pack=pack,
@@ -408,7 +523,9 @@ def map_fastq_to_gaf(
                         qname=n2,
                         seq=s2,
                         k_fallback=k,
+                        seeds=seed_hits[si + 1],
                     )
+                    si += 2
                     h1 = h1s[0] if h1s else {
                         "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
                         "cs_tag": "cs:Z:*", "extra_tags": "",

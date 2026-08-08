@@ -23,9 +23,13 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 ## Pipeline stages
 
 1. **Index load** — GBZ segment decode (cache/mmap) or GFA fixture load.
-2. **Minimizer seed** — k-mer / minimizer locate (GPU-portable via `giraffe_device`).
+2. **Minimizer seed** — Mojo `DeviceContext` pack/hash kernels (`nvidia:sm_90` /
+   `amdgpu:gfx942`) plus CuPy batch minimizers in `quartet_map` when
+   `device=nvidia|amd`. Driver &lt;580 needs `MODULAR_NVPTX_COMPILER_PATH=ptxas`.
+   Set `METHYLGRAPHER_GPU_REQUIRE=1` (default in workers) to fail closed if
+   DeviceContext cannot be created — never silently map on CPU under a GPU label.
 3. **Hit collect / cluster** — distance/zipcode heuristics (`giraffe_dist` staged).
-4. **Extend** — seed-and-extend (`giraffe_extend`).
+4. **Extend** — seed-and-extend (`giraffe_extend` / Python gapless for GBZ stream).
 5. **Pair** — PE tags / fragment filter.
 6. **GAF emit** — path, MAPQ, `cs:Z:`.
 

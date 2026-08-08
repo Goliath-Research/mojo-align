@@ -3,7 +3,7 @@
 from std.collections import List
 from std.python import Python
 
-from giraffe_device import extract_kmers_batch, select_device
+from giraffe_device import extract_kmers_batch, require_device_or_raise
 from giraffe_extend import AlignmentHit, extend_exact
 from giraffe_gaf_emit import write_gaf
 from giraffe_gbz import map_gbz_via_helper
@@ -74,7 +74,7 @@ def map_fastq_to_gaf(
     var index = GraphIndex(k, k)
     index.load_gfa(gfa_path)
     index.build_minimizer_index()
-    var dev = select_device(device)
+    var dev = require_device_or_raise(device)
     print(
         "Mojo Giraffe device=",
         dev,

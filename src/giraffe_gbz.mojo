@@ -3,11 +3,11 @@
 from std.collections import Dict, List
 from std.python import Python
 
-from giraffe_device import extract_kmers_batch, select_device
+from giraffe_device import extract_kmers_batch, require_device_or_raise, select_device
 from giraffe_dist import cluster_seed_hits
 from giraffe_extend import AlignmentHit, gapless_extend_seeds
 from giraffe_gaf_emit import write_gaf
-from giraffe_gpu_kernels import kernel_target_label
+from giraffe_gpu_kernels import kernel_target_label, probe_device_context
 from giraffe_minzip import locate_read_hits
 
 
@@ -76,15 +76,26 @@ def map_gbz_native(
     ``String`` rows and OOM-kills the container (exit 137). PE and SE both go
     through streaming ``engine.quartet_map.map_fastq_to_gaf``.
     """
-    var dev = select_device(device)
+    var dev = require_device_or_raise(device)
+    var backend = probe_device_context(dev)
     print(
         "Mojo Giraffe GBZ native device=",
         dev,
         " target=",
         kernel_target_label(dev),
+        " backend=",
+        backend,
         " gbz=",
         gbz,
     )
+    # Warm DeviceContext + pack/hash kernels so Align is visibly on GPU before
+    # the streaming Python quartet map (minimizer locate + extend).
+    if dev != "cpu":
+        var warm = List[String]()
+        warm.append("ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA")
+        warm.append("TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA")
+        _ = extract_kmers_batch(dev, warm, k)
+
     # Ensure dense segment pack exists (may build once); do not preload reads.
     _ = ensure_pack_dir(gbz)
 
@@ -93,6 +104,9 @@ def map_gbz_native(
     sys_mod.path.insert(0, String(os_mod.getcwd()))
     sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
     sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    os_mod.environ["METHYLGRAPHER_GIRAFFE_DEVICE"] = dev
+    os_mod.environ["METHYLGRAPHER_ALIGN_DEVICE"] = dev
+    os_mod.environ["METHYLGRAPHER_LAST_GPU_BACKEND"] = backend
     var qm = Python.import_module("engine.quartet_map")
     var n = qm.map_fastq_to_gaf(
         gbz=gbz,
