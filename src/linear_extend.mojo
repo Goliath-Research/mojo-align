@@ -166,10 +166,11 @@ def pair_hits(h1: LinearHit, h2: LinearHit) raises -> PairedHits:
         a.tlen = tlen
         b.tlen = -tlen
     else:
+        # SAM 0x8 = next segment in the template unmapped (set on the mate).
         if a.contig == "*":
-            a.flag = a.flag | 8  # mate unmapped
-        if b.contig == "*":
             b.flag = b.flag | 8
+        if b.contig == "*":
+            a.flag = a.flag | 8
         if a.contig != "*":
             b.rnext = a.contig
             b.pnext = a.pos
