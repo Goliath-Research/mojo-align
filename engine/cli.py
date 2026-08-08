@@ -74,9 +74,28 @@ def main(argv=None):
 
     command = args.pop(0)
     command = command.lower()
-    if command not in ["preparegenome", "align", "methylcall", "conversionrate", "mergecpg", "help", "-h", "--help", "main", "mergegaf", "vg_check"]:
+    if command not in [
+        "preparegenome",
+        "align",
+        "methylcall",
+        "conversionrate",
+        "mergecpg",
+        "help",
+        "-h",
+        "--help",
+        "main",
+        "mergegaf",
+        "vg_check",
+        "mojofq2bammeth",
+    ]:
         print(f"Unknown command: {command}")
         return 1
+
+    # MojoFq2bamMeth uses argparse (-fq1 …); forward remaining argv unchanged.
+    if command == "mojofq2bammeth":
+        from . import fq2bam_meth
+
+        return int(fq2bam_meth.main(args) or 0)
 
     kvargs = {}
     while len(args) > 0:

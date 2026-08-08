@@ -11,11 +11,12 @@ tests/
   test_align_backends_ready.py  # METHYLGRAPHER_MOJO_GIRAFFE_READY gating
   test_giraffe_gbz_helper.py    # GBZ quartet resolve / segment cache
   test_giraffe_gaf_parity.py    # Mojo GAF vs golden fixture
+  test_fq2bam_meth.py           # Linear WGBS convert / QC / end-to-end map
   test_minimizer_index.py       # .min mmap helper
   test_segment_pack.py          # dense sequences.bin / offsets.bin
   test_quartet_map.py           # quartet_map / MojoGiraffe ready
   probe_gpu.mojo                # Device probe smoke
-  data/                         # Toy GFA/GAF + giraffe_fixture (see data/README.md)
+  data/                         # Toy fixtures (see data/README.md, fq2bam_fixture/)
 ```
 
 ## Run
@@ -30,6 +31,10 @@ pixi run python -m pytest tests/ -q
 # End-to-end MethylCall / MergeCpG on the toy fixture
 scripts/run_toy_mcall.sh python
 scripts/run_toy_mcall.sh mojo
+
+# Linear WGBS Align (MojoFq2bamMeth)
+scripts/run_toy_fq2bam_meth.sh python cpu
+pixi run python -m pytest tests/test_fq2bam_meth.py -q
 ```
 
 Giraffe GAF parity against the golden PE fixture:

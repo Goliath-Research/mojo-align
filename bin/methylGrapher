@@ -4,13 +4,15 @@
 # By default runs the Python engine (engine/cli.py), the faithful 0.2.0 port
 # with the methylGrapher-mojo cutover patches (see MIGRATION_LOG.md).
 # Set METHYLGRAPHER_ENGINE=mojo to run the Mojo CLI (src/main.mojo): native
-# help / vg_check / Align / MojoGiraffe / MethylCall / MergeCpG /
-# ConversionRate; PrepareGenome / Main still dispatch to engine.cli.
-# Set METHYLGRAPHER_MCALL_ENGINE=python to force those native commands onto
-# engine.cli as well.
+# help / vg_check / Align / MojoGiraffe / MojoFq2bamMeth / MethylCall /
+# MergeCpG / ConversionRate; PrepareGenome / Main still dispatch to
+# engine.cli. MojoFq2bamMeth is also available on the default Python engine.
+# Set METHYLGRAPHER_MCALL_ENGINE=python to force Align/MethylCall/MergeCpG/
+# ConversionRate onto engine.cli as well.
 #
 #   methylGrapher help
 #   methylGrapher MethylCall -work_dir ... -index_prefix ...
+#   methylGrapher MojoFq2bamMeth -fq1 ... -fq2 ... -ref ... -out_bam ...
 #   METHYLGRAPHER_ENGINE=mojo methylGrapher help
 #
 # Always runs from the repository root (regardless of the caller's cwd) and

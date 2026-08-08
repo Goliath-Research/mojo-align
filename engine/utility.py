@@ -758,6 +758,7 @@ Commands:
     PrepareGenome
     Main
     Align
+    MojoFq2bamMeth
     MethylCall
     ConversionRate
     MergeCpG
@@ -836,6 +837,15 @@ MergeCpG:
     methylGrapher MergeCpG 
     -index_prefix <prefix> 
     -work_dir <work_directory>
+
+MojoFq2bamMeth:
+    Portable linear WGBS Align (Clara fq2bam_meth substitute). Mojo linear
+    GPU kernels (nvidia:sm_90 / amdgpu:gfx942); BWA-MEM is CPU fallback only.
+    Requires samtools; bwa only for METHYLGRAPHER_LINEAR_MAPPER=bwa.
+    methylGrapher MojoFq2bamMeth
+    -fq1 <fastq> -fq2 <fastq> -ref <fasta>
+    -out_bam <bam> -out_qc_dir <dir> -sample_id <id>
+    [-t <threads>] [-device auto|cpu|nvidia|amd] [-work_dir <dir>] [-k <kmer>]
 
 vg_check:
     methylGrapher vg_check [-vg_path <path>]

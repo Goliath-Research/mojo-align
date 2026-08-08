@@ -270,7 +270,7 @@ def main() raises:
         exit(run_mojo_giraffe_cli(args))
 
     if command == "mojofq2bammeth":
-        # Python engine orchestrates BWA-MEM + Parabricks-shaped QC metrics.
+        # Orchestrator in engine.fq2bam_meth (Mojo linear mapper + QC; BWA fallback).
         var os2 = Python.import_module("os")
         var sys2 = Python.import_module("sys")
         sys2.path.insert(0, os2.getcwd())

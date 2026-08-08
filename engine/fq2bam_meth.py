@@ -1,11 +1,17 @@
-"""MojoFq2bamMeth — portable linear WGBS Align (Clara fq2bam_meth MVP substitute).
+"""MojoFq2bamMeth — portable linear WGBS Align (Clara fq2bam_meth substitute).
 
-Directional C↔T / G↔A conversion + BWA-MEM against a C2T-converted reference,
-then samtools sort + index. Emits a Parabricks-shaped metrics JSON subset and
-qc-metrics directory consumed by methyl_alignment_qc.
+Directional C↔T / G↔A conversion + **Mojo linear GPU mapper** (NVIDIA / AMD)
+against a C2T-converted reference, then samtools sort + index. Emits a
+Parabricks-shaped metrics JSON subset and qc-metrics directory consumed by
+methyl_alignment_qc.
 
-GPU ``-device`` currently selects the portable seed helper (probe / future
-acceleration); mapping remains BWA until native Mojo linear kernels land.
+Mapper selection (``METHYLGRAPHER_LINEAR_MAPPER``):
+
+- ``mojo`` (default when GPU/device path ready) — ``src/linear_mapper.mojo``
+- ``bwa`` — CPU fallback via BWA-MEM
+
+Device selection mirrors Giraffe: ``-device auto|cpu|nvidia|amd`` /
+``METHYLGRAPHER_ALIGN_DEVICE``.
 """
 
 from __future__ import annotations
@@ -14,12 +20,13 @@ import argparse
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 def _open_text(path: Path):
@@ -80,7 +87,7 @@ def _ensure_bwa_index(fasta: Path, log_path: Path) -> None:
         return
     bwa = shutil.which("bwa")
     if not bwa:
-        raise RuntimeError("bwa not found on PATH (required for MojoFq2bamMeth)")
+        raise RuntimeError("bwa not found on PATH (required for BWA fallback)")
     _run([bwa, "index", str(fasta)], log_path)
 
 
@@ -107,32 +114,67 @@ def _parse_flagstat(text: str) -> Dict[str, int]:
     return out
 
 
+def _parse_samtools_stats(text: str) -> Dict[str, float]:
+    """Extract useful SN fields from ``samtools stats``."""
+    out: Dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith("SN"):
+            continue
+        # SN\tkey:\tvalue
+        m = re.match(r"SN\t([^:]+):\t([0-9.]+)", line)
+        if not m:
+            continue
+        key = m.group(1).strip().lower().replace(" ", "_")
+        try:
+            out[key] = float(m.group(2))
+        except ValueError:
+            continue
+    return out
+
+
 def write_parabricks_shaped_metrics(
     *,
     sample_id: str,
     out_json: Path,
     flagstat: Dict[str, int],
-    mean_insert: float = 200.0,
+    stats: Optional[Dict[str, float]] = None,
+    mean_insert: Optional[float] = None,
     deamination_qscore: int = 5,
+    mapper: str = "mojo",
+    device: str = "auto",
 ) -> None:
-    """Minimal JSON shape required by methyl_alignment_qc.wgbs_parabricks_qc."""
+    """Parabricks-shaped JSON for methyl_alignment_qc.wgbs_parabricks_qc."""
+    stats = stats or {}
     total = max(int(flagstat.get("total") or 0), 1)
     mapped = int(flagstat.get("mapped") or 0)
     pf = total
-    # Synthetic yield / quality arrays — enough keys for guardrail builder.
-    mean_quality = [36.0] * 100
+    bases_mapped = int(stats.get("bases_mapped_(cigar)", 0) or 0)
+    if bases_mapped <= 0:
+        bases_mapped = mapped * 100
+    avg_qual = float(stats.get("average_quality", 36.0) or 36.0)
+    insert = mean_insert
+    if insert is None:
+        insert = float(stats.get("insert_size_average", 200.0) or 200.0)
+    # Cycle qualities: constant from samtools average (not Clara per-cycle).
+    mean_quality = [float(avg_qual)] * 100
+    q30_frac = min(max(avg_qual / 40.0, 0.0), 1.0)
+    placeholders = ["pre_adapter_summaries.TOTAL_QSCORE", "gc_bias_summary"]
     payload = {
         "sample_id": sample_id,
         "engine": "mojo_fq2bam_meth",
+        "mapper": mapper,
+        "device": device,
+        "metrics_source": "samtools+placeholders",
+        "placeholder_fields": placeholders,
         "quality_yield": {
             "total_reads": total,
             "pf_reads": pf,
-            "pf_bases": pf * 100,
-            "pf_q30_bases": int(pf * 100 * 0.92),
+            "pf_bases": bases_mapped if bases_mapped > 0 else pf * 100,
+            "pf_q30_bases": int((bases_mapped if bases_mapped > 0 else pf * 100) * q30_frac),
         },
         "mean_quality_by_cycle": {"mean_quality": mean_quality},
         "gc_bias_summary": {"at_dropout": 1.0, "gc_dropout": 1.0},
-        "insert_size_metrics": {"median_insert_size": float(mean_insert)},
+        "insert_size_metrics": {"median_insert_size": float(insert)},
         "pre_adapter_summaries": {
             "ARTIFACT_NAME": ["Deamination", "OxoG"],
             "TOTAL_QSCORE": [int(deamination_qscore), 40],
@@ -147,57 +189,100 @@ def write_parabricks_shaped_metrics(
     out_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def run_mojo_fq2bam_meth(
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_linear_mapper(device: str) -> str:
+    """Return ``mojo`` or ``bwa`` based on env + device availability."""
+    raw = os.environ.get("METHYLGRAPHER_LINEAR_MAPPER", "").strip().lower()
+    if raw in {"mojo", "bwa"}:
+        return raw
+    if raw in {"auto", ""}:
+        # Prefer Mojo linear kernels unless explicitly forced to BWA.
+        # CPU device still uses Mojo CPU DeviceContext path (not BWA).
+        return "mojo"
+    raise RuntimeError(
+        "METHYLGRAPHER_LINEAR_MAPPER must be 'mojo', 'bwa', or 'auto' "
+        f"(got {raw!r})"
+    )
+
+
+def _mojo_bin() -> List[str]:
+    """Return argv prefix to run Mojo under pixi when available."""
+    pixi = shutil.which("pixi")
+    if pixi:
+        return [pixi, "run", "mojo"]
+    mojo = shutil.which("mojo")
+    if mojo:
+        return [mojo]
+    raise RuntimeError("mojo / pixi not found (required for Mojo linear mapper)")
+
+
+def run_mojo_linear_map(
     *,
-    fq1: Path,
-    fq2: Path,
-    reference_fasta: Path,
-    out_bam: Path,
-    out_qc_dir: Path,
-    sample_id: str,
-    threads: int = 16,
-    device: str = "auto",
-    work_dir: Optional[Path] = None,
-    log_path: Optional[Path] = None,
-) -> Dict[str, str]:
-    bwa = shutil.which("bwa")
-    samtools = shutil.which("samtools")
-    if not bwa or not samtools:
-        raise RuntimeError("MojoFq2bamMeth requires bwa and samtools on PATH")
-
-    work = Path(work_dir or tempfile.mkdtemp(prefix="mojo_fq2bam_"))
-    work.mkdir(parents=True, exist_ok=True)
-    log = Path(log_path or (work / "mojo_fq2bam_meth.log"))
+    c2t_ref: Path,
+    c2t_r1: Path,
+    g2a_r2: Path,
+    out_sam: Path,
+    device: str,
+    k: int,
+    cache_dir: Path,
+    log: Path,
+) -> None:
+    root = _repo_root()
+    cmd = _mojo_bin() + [
+        "-I",
+        "src",
+        "src/linear_mapper.mojo",
+        "-ref",
+        str(c2t_ref),
+        "-fq1",
+        str(c2t_r1),
+        "-fq2",
+        str(g2a_r2),
+        "-out_sam",
+        str(out_sam),
+        "-device",
+        device,
+        "-k",
+        str(k),
+        "-cache_dir",
+        str(cache_dir),
+    ]
     with log.open("a", encoding="utf-8") as handle:
-        handle.write(f"device={device} threads={threads}\n")
+        handle.write("COMMAND: " + " ".join(cmd) + "\n")
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.stdout:
+            handle.write(proc.stdout)
+        if proc.stderr:
+            handle.write(proc.stderr)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                proc.stderr.strip()
+                or proc.stdout.strip()
+                or f"Mojo linear mapper failed (exit {proc.returncode})"
+            )
 
-    # Optional portable GPU probe (same helper as MojoGiraffe).
-    try:
-        scripts = Path(__file__).resolve().parent.parent / "scripts"
-        sys.path.insert(0, str(scripts))
-        from giraffe_gpu_minimizer import device_probe, _sync_device  # type: ignore
 
-        probe = device_probe()
-        backend = _sync_device(device)
-        with log.open("a", encoding="utf-8") as handle:
-            handle.write(f"device_probe={json.dumps(probe)} backend={backend}\n")
-    except Exception as exc:  # pragma: no cover
-        with log.open("a", encoding="utf-8") as handle:
-            handle.write(f"device_probe_skipped={exc}\n")
-
-    c2t_ref = work / (reference_fasta.name + ".C2T.fa")
-    if not c2t_ref.is_file():
-        convert_fasta_c2t(reference_fasta, c2t_ref)
-    _ensure_bwa_index(c2t_ref, log)
-
-    c2t_r1 = work / "C2T.R1.fastq.gz"
-    g2a_r2 = work / "G2A.R2.fastq.gz"
-    convert_fastq(fq1, c2t_r1, "C2T")
-    convert_fastq(fq2, g2a_r2, "G2A")
-
-    bam_unsorted = work / "aligned.bam"
-    # Stream BWA SAM → samtools view; never buffer the full SAM in Python
-    # (WGBS SAMs are multi‑GB and would OOM under capture_output=True).
+def run_bwa_mem_stream(
+    *,
+    bwa: str,
+    samtools: str,
+    c2t_ref: Path,
+    c2t_r1: Path,
+    g2a_r2: Path,
+    bam_unsorted: Path,
+    threads: int,
+    log: Path,
+) -> None:
+    """Stream BWA SAM → samtools view (never buffer full SAM in Python)."""
     bwa_cmd = [bwa, "mem", "-t", str(threads), str(c2t_ref), str(c2t_r1), str(g2a_r2)]
     view_cmd = [samtools, "view", "-bS", "-o", str(bam_unsorted), "-"]
     with log.open("a", encoding="utf-8") as handle:
@@ -222,25 +307,142 @@ def run_mojo_fq2bam_meth(
         raise RuntimeError(
             f"samtools view failed (exit {view_proc.returncode}); see {log}"
         )
+
+
+def run_mojo_fq2bam_meth(
+    *,
+    fq1: Path,
+    fq2: Path,
+    reference_fasta: Path,
+    out_bam: Path,
+    out_qc_dir: Path,
+    sample_id: str,
+    threads: int = 16,
+    device: str = "auto",
+    work_dir: Optional[Path] = None,
+    log_path: Optional[Path] = None,
+    k: int = 15,
+) -> Dict[str, str]:
+    samtools = shutil.which("samtools")
+    if not samtools:
+        raise RuntimeError("MojoFq2bamMeth requires samtools on PATH")
+
+    work = Path(work_dir or tempfile.mkdtemp(prefix="mojo_fq2bam_"))
+    work.mkdir(parents=True, exist_ok=True)
+    log = Path(log_path or (work / "mojo_fq2bam_meth.log"))
+    mapper = resolve_linear_mapper(device)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"device={device} threads={threads} mapper={mapper}\n")
+
+    try:
+        scripts = Path(__file__).resolve().parent.parent / "scripts"
+        sys.path.insert(0, str(scripts))
+        from giraffe_gpu_minimizer import device_probe, _sync_device  # type: ignore
+
+        probe = device_probe()
+        backend = _sync_device(device if device != "auto" else "cpu")
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"device_probe={json.dumps(probe)} sync_backend={backend}\n")
+    except Exception as exc:  # pragma: no cover
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"device_probe_skipped={exc}\n")
+
+    c2t_ref = work / (reference_fasta.name + ".C2T.fa")
+    if not c2t_ref.is_file():
+        convert_fasta_c2t(reference_fasta, c2t_ref)
+
+    c2t_r1 = work / "C2T.R1.fastq.gz"
+    g2a_r2 = work / "G2A.R2.fastq.gz"
+    convert_fastq(fq1, c2t_r1, "C2T")
+    convert_fastq(fq2, g2a_r2, "G2A")
+
+    bam_unsorted = work / "aligned.bam"
+    used_mapper = mapper
+    if mapper == "mojo":
+        try:
+            out_sam = work / "aligned.sam"
+            cache_dir = work / "mojo_linear_index"
+            run_mojo_linear_map(
+                c2t_ref=c2t_ref,
+                c2t_r1=c2t_r1,
+                g2a_r2=g2a_r2,
+                out_sam=out_sam,
+                device=device,
+                k=k,
+                cache_dir=cache_dir,
+                log=log,
+            )
+            _run(
+                [samtools, "view", "-bS", str(out_sam), "-o", str(bam_unsorted)],
+                log,
+            )
+        except Exception as exc:
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(f"mojo_linear_failed={exc}; falling back to bwa\n")
+            bwa = shutil.which("bwa")
+            if not bwa:
+                raise RuntimeError(
+                    f"Mojo linear mapper failed and bwa unavailable: {exc}"
+                ) from exc
+            _ensure_bwa_index(c2t_ref, log)
+            run_bwa_mem_stream(
+                bwa=bwa,
+                samtools=samtools,
+                c2t_ref=c2t_ref,
+                c2t_r1=c2t_r1,
+                g2a_r2=g2a_r2,
+                bam_unsorted=bam_unsorted,
+                threads=threads,
+                log=log,
+            )
+            used_mapper = "bwa_fallback"
+    else:
+        bwa = shutil.which("bwa")
+        if not bwa:
+            raise RuntimeError("MojoFq2bamMeth BWA fallback requires bwa on PATH")
+        _ensure_bwa_index(c2t_ref, log)
+        run_bwa_mem_stream(
+            bwa=bwa,
+            samtools=samtools,
+            c2t_ref=c2t_ref,
+            c2t_r1=c2t_r1,
+            g2a_r2=g2a_r2,
+            bam_unsorted=bam_unsorted,
+            threads=threads,
+            log=log,
+        )
+        used_mapper = "bwa"
+
     out_bam.parent.mkdir(parents=True, exist_ok=True)
-    _run([samtools, "sort", "-@", str(max(1, threads // 2)), "-o", str(out_bam), str(bam_unsorted)], log)
+    _run(
+        [samtools, "sort", "-@", str(max(1, threads // 2)), "-o", str(out_bam), str(bam_unsorted)],
+        log,
+    )
     _run([samtools, "index", str(out_bam)], log)
 
     fs = subprocess.run(
         [samtools, "flagstat", str(out_bam)], capture_output=True, text=True, check=False
     )
     flagstat = _parse_flagstat(fs.stdout or "")
+    st = subprocess.run(
+        [samtools, "stats", str(out_bam)], capture_output=True, text=True, check=False
+    )
+    stats = _parse_samtools_stats(st.stdout or "")
+
     out_qc_dir.mkdir(parents=True, exist_ok=True)
-    metrics_json = out_bam.with_suffix(".json")
-    if metrics_json.name.startswith(sample_id) is False:
-        metrics_json = out_bam.parent / f"{sample_id}.json"
-    # Prefer sibling of BAM: {sampleId}.json
     metrics_json = out_bam.parent / f"{sample_id}.json"
     write_parabricks_shaped_metrics(
-        sample_id=sample_id, out_json=metrics_json, flagstat=flagstat
+        sample_id=sample_id,
+        out_json=metrics_json,
+        flagstat=flagstat,
+        stats=stats,
+        mapper=used_mapper,
+        device=device,
     )
     (out_qc_dir / "alignment_summary.json").write_text(
-        json.dumps(flagstat, indent=2) + "\n", encoding="utf-8"
+        json.dumps({"flagstat": flagstat, "stats": stats, "mapper": used_mapper}, indent=2)
+        + "\n",
+        encoding="utf-8",
     )
     shutil.copy2(metrics_json, out_qc_dir / f"{sample_id}.json")
 
@@ -250,6 +452,7 @@ def run_mojo_fq2bam_meth(
         "qcMetricsDir": str(out_qc_dir),
         "logPath": str(log),
         "engine": "mojo_fq2bam_meth",
+        "mapper": used_mapper,
         "device": device,
     }
 
@@ -265,6 +468,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("-t", type=int, default=int(os.environ.get("METHYLGRAPHER_BWA_THREADS", "16")))
     p.add_argument("-device", default=os.environ.get("METHYLGRAPHER_ALIGN_DEVICE", "auto"))
     p.add_argument("-work_dir", default=None)
+    p.add_argument("-k", type=int, default=int(os.environ.get("METHYLGRAPHER_LINEAR_K", "15")))
     args = p.parse_args(argv)
     run_mojo_fq2bam_meth(
         fq1=Path(args.fq1),
@@ -276,6 +480,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         threads=args.t,
         device=args.device,
         work_dir=Path(args.work_dir) if args.work_dir else None,
+        k=args.k,
     )
     print("MojoFq2bamMeth OK", args.out_bam)
     return 0

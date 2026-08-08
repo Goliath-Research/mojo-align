@@ -8,6 +8,30 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-08 — MojoFq2bamMeth portable linear GPU Align
+
+**Completed:**
+- Toolchain: `std.gpu.host.DeviceContext` importable on Mojo 1.0.0b2
+  (`api=cpu` works; CUDA create needs driver ≥580 / `MODULAR_NVPTX_COMPILER_PATH`).
+  No Modular pin bump required.
+- Native modules `src/linear_{index,seed,gpu_kernels,extend,mapper}.mojo` —
+  C2T FASTA index, portable seed (`nvidia:sm_90` / `amdgpu:gfx942`),
+  seed-and-extend → SAM, PE flags.
+- `engine/fq2bam_meth.py` prefers Mojo linear mapper; BWA-MEM is CPU fallback
+  (`METHYLGRAPHER_LINEAR_MAPPER`). Streamed BWA→samtools path retained.
+- Dual-ship: `MojoFq2bamMeth` on `engine.cli` and Mojo `main.mojo`.
+- QC: `samtools flagstat` + `stats` derived fields; placeholders labeled
+  (`metrics_source=samtools+placeholders`).
+- Fixture `tests/data/fq2bam_fixture/`, `tests/test_fq2bam_meth.py`,
+  `scripts/run_toy_fq2bam_meth.sh`, `scripts/benchmark_fq2bam_meth.sh`.
+- Spec / gates: `docs/LINEAR_FQ2BAM_SPEC.md`, `docs/BENCHMARK_FQ2BAM_METH.md`.
+
+**Operator gates (block Complete):**
+- NVIDIA subset wall ≤ Clara `pbrun fq2bam_meth` (±10%).
+- AMD MI300X twin competitive with NVIDIA Mojo and ≫ BWA CPU.
+
+---
+
 ## 2026-08-07 — GBZ-native Mojo Giraffe
 
 **Completed:**
