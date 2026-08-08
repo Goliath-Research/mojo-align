@@ -14,6 +14,7 @@
 #   --target-accelerator=amdgpu:<arch>  # MI300 / ROCm bakeoff
 
 from std.collections import List
+from std.python import Python
 
 from giraffe_seed import extract_kmers
 
@@ -29,8 +30,7 @@ def kernel_target_label(device: String) raises -> String:
     if d == "nvidia" or d == "cuda":
         return String(KERNEL_TARGET_NVIDIA_SM90)
     if d == "amd" or d == "hip" or d == "rocm":
-        from std.python import Python
-
+        # Import is module-scope only in Mojo; environ read stays here.
         var os_mod = Python.import_module("os")
         var arch = String(os_mod.environ.get("METHYLGRAPHER_AMDGPU_ARCH", ""))
         if arch != "":
