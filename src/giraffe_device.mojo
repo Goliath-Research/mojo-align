@@ -23,11 +23,14 @@ def select_device(requested: String) raises -> String:
         if req == "":
             req = String("auto")
     if req == "auto":
+        # Probe with shutil.which first — subprocess.run raises FileNotFoundError
+        # when the binary is missing (common inside Docker without --gpus).
         var sp = Python.import_module("subprocess")
         var shutil = Python.import_module("shutil")
-        var r = sp.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-        if String(r.returncode) == "0":
-            return String(DEVICE_NVIDIA)
+        if shutil.which("nvidia-smi") is not None:
+            var r = sp.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+            if String(r.returncode) == "0":
+                return String(DEVICE_NVIDIA)
         if shutil.which("rocm-smi") is not None:
             var r2 = sp.run(
                 ["rocm-smi", "--showproductname"], capture_output=True, text=True
