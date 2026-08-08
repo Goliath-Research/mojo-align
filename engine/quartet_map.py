@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from engine.minimizer_index import MinimizerIndex, MinHit
 from engine.segment_pack import (
@@ -20,9 +20,24 @@ from engine.segment_pack import (
 )
 from engine.zipcodes_index import DistIndex, ZipcodesIndex
 
+# Bound peak RAM on Buffy-scale FASTQs (hundreds of GB uncompressed).
+# Operator override: METHYLGRAPHER_MOJO_READ_BATCH (pairs / SE reads per chunk).
+_DEFAULT_READ_BATCH = 8192
 
-def _parse_fastq(path: str) -> List[Tuple[str, str]]:
-    rows: List[Tuple[str, str]] = []
+
+def _read_batch_size() -> int:
+    raw = os.environ.get("METHYLGRAPHER_MOJO_READ_BATCH", "").strip()
+    if not raw:
+        return _DEFAULT_READ_BATCH
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_READ_BATCH
+    return max(1, n)
+
+
+def _iter_fastq(path: str) -> Iterator[Tuple[str, str]]:
+    """Stream FASTQ records without loading the file into memory."""
     with open(path, encoding="utf-8") as fh:
         while True:
             n = fh.readline()
@@ -33,8 +48,50 @@ def _parse_fastq(path: str) -> List[Tuple[str, str]]:
             fh.readline()
             name = n[1:].strip() if n.startswith("@") else n.strip()
             bare = name.split("_")[0]
-            rows.append((bare, s))
-    return rows
+            yield bare, s
+
+
+def _parse_fastq(path: str) -> List[Tuple[str, str]]:
+    """Load entire FASTQ (tests / tiny fixtures only — do not use on Buffy)."""
+    return list(_iter_fastq(path))
+
+
+def _iter_fastq_batches(
+    fq1: str, fq2: str = "", *, batch_size: Optional[int] = None
+) -> Iterator[List[Tuple[Tuple[str, str], Optional[Tuple[str, str]]]]]:
+    """Yield batches of ((name1, seq1), optional (name2, seq2))."""
+    bs = batch_size if batch_size is not None else _read_batch_size()
+    it1 = _iter_fastq(fq1)
+    it2 = _iter_fastq(fq2) if fq2 else None
+    batch: List[Tuple[Tuple[str, str], Optional[Tuple[str, str]]]] = []
+    while True:
+        try:
+            r1 = next(it1)
+        except StopIteration:
+            break
+        r2: Optional[Tuple[str, str]] = None
+        if it2 is not None:
+            try:
+                r2 = next(it2)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    f"paired FASTQ length mismatch: {fq2} ended before {fq1}"
+                ) from exc
+        batch.append((r1, r2))
+        if len(batch) >= bs:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+    if it2 is not None:
+        try:
+            next(it2)
+        except StopIteration:
+            pass
+        else:
+            raise RuntimeError(
+                f"paired FASTQ length mismatch: {fq1} ended before {fq2}"
+            )
 
 
 def format_gaf_line(hit: dict) -> str:
@@ -287,7 +344,11 @@ def map_fastq_to_gaf(
     k: int = 5,
     device: str = "cpu",
 ) -> int:
-    """Map FASTQ using quartet indexes + dense pack; write GAF."""
+    """Map FASTQ using quartet indexes + dense pack; write GAF.
+
+    Streams reads in batches (``METHYLGRAPHER_MOJO_READ_BATCH``, default 8192)
+    and writes GAF incrementally so Buffy-scale FASTQs do not OOM.
+    """
     _ = device
     pack = ensure_pack_for_gbz(gbz)
     min_index: Optional[MinimizerIndex] = None
@@ -303,70 +364,77 @@ def map_fastq_to_gaf(
     if dist and Path(dist).is_file():
         dist_index = DistIndex(dist)
 
-    reads = _parse_fastq(fq1)
-    hits: List[dict] = []
+    Path(out_gaf).parent.mkdir(parents=True, exist_ok=True)
+    n_records = 0
+    n_written = 0
+    batch_size = _read_batch_size()
     try:
-        if not fq2:
-            for name, seq in reads:
-                hits.extend(
-                    map_one_read(
+        with open(out_gaf, "w", encoding="utf-8") as fh:
+            for batch in _iter_fastq_batches(fq1, fq2, batch_size=batch_size):
+                for r1, r2 in batch:
+                    n1, s1 = r1
+                    if r2 is None:
+                        for h in map_one_read(
+                            pack=pack,
+                            min_index=min_index,
+                            zipcodes=zip_index,
+                            dist=dist_index,
+                            qname=n1,
+                            seq=s1,
+                            k_fallback=k,
+                        ):
+                            n_records += 1
+                            if h["path"] == "*":
+                                continue
+                            fh.write(format_gaf_line(h) + "\n")
+                            n_written += 1
+                        continue
+
+                    n2, s2 = r2
+                    h1s = map_one_read(
                         pack=pack,
                         min_index=min_index,
                         zipcodes=zip_index,
                         dist=dist_index,
-                        qname=name,
-                        seq=seq,
+                        qname=n1,
+                        seq=s1,
                         k_fallback=k,
                     )
-                )
-        else:
-            mates = _parse_fastq(fq2)
-            for (n1, s1), (n2, s2) in zip(reads, mates):
-                h1s = map_one_read(
-                    pack=pack,
-                    min_index=min_index,
-                    zipcodes=zip_index,
-                    dist=dist_index,
-                    qname=n1,
-                    seq=s1,
-                    k_fallback=k,
-                )
-                h2s = map_one_read(
-                    pack=pack,
-                    min_index=min_index,
-                    zipcodes=zip_index,
-                    dist=dist_index,
-                    qname=n2,
-                    seq=s2,
-                    k_fallback=k,
-                )
-                h1 = h1s[0] if h1s else {
-                    "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
-                    "cs_tag": "cs:Z:*", "extra_tags": "",
-                }
-                h2 = h2s[0] if h2s else {
-                    "query_name": n2, "path": "*", "qlen": len(s2), "mapq": 0,
-                    "cs_tag": "cs:Z:*", "extra_tags": "",
-                }
-                h1["extra_tags"] = f"ri:i:1\tos:Z:{s1}\trc:Z:CT"
-                h2["extra_tags"] = f"ri:i:2\tos:Z:{s2}\trc:Z:GA"
-                hits.append(h1)
-                hits.append(h2)
+                    h2s = map_one_read(
+                        pack=pack,
+                        min_index=min_index,
+                        zipcodes=zip_index,
+                        dist=dist_index,
+                        qname=n2,
+                        seq=s2,
+                        k_fallback=k,
+                    )
+                    h1 = h1s[0] if h1s else {
+                        "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
+                        "cs_tag": "cs:Z:*", "extra_tags": "",
+                    }
+                    h2 = h2s[0] if h2s else {
+                        "query_name": n2, "path": "*", "qlen": len(s2), "mapq": 0,
+                        "cs_tag": "cs:Z:*", "extra_tags": "",
+                    }
+                    h1["extra_tags"] = f"ri:i:1\tos:Z:{s1}\trc:Z:CT"
+                    h2["extra_tags"] = f"ri:i:2\tos:Z:{s2}\trc:Z:GA"
+                    n_records += 2
+                    for h in (h1, h2):
+                        if h["path"] == "*":
+                            continue
+                        fh.write(format_gaf_line(h) + "\n")
+                        n_written += 1
+                fh.flush()
     finally:
         if min_index is not None:
             min_index.close()
         if zip_index is not None:
             zip_index.close()
 
-    Path(out_gaf).parent.mkdir(parents=True, exist_ok=True)
-    n_written = 0
-    with open(out_gaf, "w", encoding="utf-8") as fh:
-        for h in hits:
-            if h["path"] == "*":
-                continue
-            fh.write(format_gaf_line(h) + "\n")
-            n_written += 1
-    return len(hits)
+    # Return mapped+unmapped record count (PE = 2 per pair) for CLI parity.
+    _ = n_written
+    return n_records
 
 
 def mojo_giraffe_ready() -> bool:
