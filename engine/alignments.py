@@ -5,6 +5,7 @@
 import os
 import sys
 import gzip
+import hashlib
 import resource
 import multiprocessing
 import time
@@ -35,6 +36,63 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (tmp_alignment_file_count+500, hard_l
 
 
 conversion_types = ["C2T", "G2A"]
+
+
+def _shard_marker_path(shard_path):
+    return shard_path + ".done"
+
+
+def shard_fingerprint(parts):
+    """Identity of the map that produced a shard.
+
+    Converted FASTQs are rewritten on every run, so mtime would never match;
+    size distinguishes one sample's reads from another's and survives
+    regeneration of the same sample.
+    """
+    fields = []
+    for part in parts:
+        if part and os.path.exists(part):
+            fields.append(f"{part}:{os.path.getsize(part)}")
+        else:
+            fields.append(f"{part}:-")
+    return hashlib.sha256("|".join(fields).encode()).hexdigest()
+
+
+def mark_shard_complete(shard_path, fingerprint):
+    """Record that ``shard_path`` holds the full output of a finished map."""
+    with open(_shard_marker_path(shard_path), "w") as fh:
+        fh.write(f"{os.path.getsize(shard_path)}\n{fingerprint}\n")
+
+
+def clear_shard_marker(shard_path):
+    try:
+        os.remove(_shard_marker_path(shard_path))
+    except OSError:
+        pass
+
+
+def shard_is_complete(shard_path, fingerprint):
+    """True only for a shard a prior map finished writing for these inputs.
+
+    A killed map leaves a non-empty but truncated GAF, which is
+    indistinguishable from a finished one by size alone. The marker records the
+    byte count at completion, so a shard that grew or shrank since is remapped,
+    and the fingerprint keeps a shard left in a reused work directory from
+    standing in for a different sample or index.
+    """
+    try:
+        with open(_shard_marker_path(shard_path)) as fh:
+            recorded_size, recorded_fp = fh.read().split()[:2]
+        recorded = int(recorded_size)
+    except (OSError, ValueError, IndexError):
+        return False
+    if recorded_fp != fingerprint:
+        return False
+    try:
+        size = os.path.getsize(shard_path)
+    except OSError:
+        return False
+    return size > 0 and size == recorded
 
 
 def alignment_clenup(work_dir):
@@ -179,11 +237,12 @@ def alignment(
         se = utility.SystemExecute()
 
         if mojo_direct or "MojoGiraffe" in cmd_run:
+            shard_id = shard_fingerprint([fq1, fq2, gbz_fp, dist_fp, engine_used])
+
             # Resume: keep a completed Mojo shard (e.g. C2T done, G2A aborted on
             # orchestration bug) instead of remapping for another ~hour.
             if (
-                os.path.isfile(mojo_out_gaf)
-                and os.path.getsize(mojo_out_gaf) > 0
+                shard_is_complete(mojo_out_gaf, shard_id)
                 and os.environ.get("METHYLGRAPHER_ALIGN_FORCE_REMAP", "").strip()
                 not in {"1", "true", "yes"}
             ):
@@ -205,6 +264,17 @@ def alignment(
                 )
                 return ref_type, engine_used
 
+            if os.path.isfile(mojo_out_gaf) and os.path.getsize(mojo_out_gaf) > 0:
+                print(
+                    f"Mojo GAF shard {mojo_out_gaf} is not a reusable completed "
+                    f"map for these inputs; remapping ref={ref_type}",
+                    flush=True,
+                )
+
+            # A marker from an earlier attempt must not outlive the shard it
+            # describes, in case this map is killed partway through.
+            clear_shard_marker(mojo_out_gaf)
+
             # File-backed GAF; Mojo logs on stderr. Do not use underscore shard router.
             fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
             # Drain stdout (usually empty when out_gaf is a file).
@@ -221,6 +291,7 @@ def alignment(
                 raise RuntimeError(
                     f"MojoGiraffe produced empty GAF {mojo_out_gaf}; see {alignment_log}"
                 )
+            mark_shard_complete(mojo_out_gaf, shard_id)
             with shard_lock:
                 with open(mojo_out_gaf, "r", encoding="utf-8") as src, open(
                     final_gaf, "a", encoding="utf-8"
@@ -287,12 +358,10 @@ def alignment(
     parallel_raw = os.environ.get("METHYLGRAPHER_DUAL_GRAPH_PARALLEL", "").strip().lower()
     if parallel_raw == "":
         device = os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "").strip().lower()
-        engine = os.environ.get("METHYLGRAPHER_ALIGN_ENGINE", "").strip().lower()
-        gpuish = device in {"nvidia", "amd", "cuda", "hip", "rocm"} or engine in {
-            "gpu_giraffe",
-            "mojo_giraffe",
-            "mojo",
-        }
+        # mojo_direct covers the engine passed as an argument as well as
+        # METHYLGRAPHER_ALIGN_ENGINE; reading the env alone would let a
+        # CLI-selected GPU engine run both graphs at once.
+        gpuish = device in {"nvidia", "amd", "cuda", "hip", "rocm"} or mojo_direct
         parallel = not gpuish
     else:
         parallel = parallel_raw not in {"0", "false", "no", "off"}
@@ -307,6 +376,9 @@ def alignment(
         """
         if workers != 1:
             return
+        # Deliberately env-only: inferring a GPU from the engine argument would
+        # make every serialized run poll wait_for_hbm_free for its full timeout
+        # on hosts whose HBM is busy or absent.
         device = os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "").strip().lower()
         engine = os.environ.get("METHYLGRAPHER_ALIGN_ENGINE", "").strip().lower()
         if device in {"cuda", ""}:
