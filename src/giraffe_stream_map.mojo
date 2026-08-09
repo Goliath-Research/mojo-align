@@ -1,8 +1,9 @@
-# Production GBZ stream map — Mojo hot path (no Python quartet_map loop).
+# Production GBZ stream map — Mojo hot path (no Python quartet_map / CuPy loop).
 #
 # Stages per batch:
-#   1) DeviceContext GPU seed (k-mers feed extend)
-#   2) Science minimizer locate (.min mmap; GPU CuPy when available)
+#   1) Mojo Giraffe (k,w) minimizers via DeviceContext pack+hash (NVIDIA/AMD)
+#      or Mojo host — never CuPy / giraffe_gpu_minimizer
+#   2) Science HT locate (.min mmap; thin Python locate_key_batches once/batch)
 #   3) Mojo zip/dist cluster
 #   4) Mojo gapless_extend_with_pack
 #   5) Streaming GAF emit
@@ -19,10 +20,9 @@ from giraffe_gapless import gapless_extend_with_pack
 from giraffe_gpu_kernels import (
     kernel_target_label,
     probe_device_context,
-    seed_kmers_on_device,
 )
 from giraffe_hit import AlignmentHit
-from giraffe_minzip import locate_batch_hits
+from giraffe_minzip import locate_batch_hits_native
 from giraffe_pack import DensePack
 
 
@@ -95,67 +95,9 @@ def _stage_enabled() raises -> Bool:
 def _science_locate_batch(
     min_path: String, seqs: List[String], device: String, k: Int
 ) raises -> List[List[String]]:
-    """Minimizer locate for science GAF; prefer GPU CuPy batch then mmap locate."""
-    if min_path.byte_length() == 0 or len(seqs) == 0:
-        var empty = List[List[String]]()
-        for _s in seqs:
-            empty.append(List[String]())
-        return empty^
-
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
-    sys_mod.path.insert(0, String(os_mod.getcwd()) + "/scripts")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/scripts")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo/scripts")
-
-    var dev = device.lower()
-    if dev == "nvidia" or dev == "cuda" or dev == "amd" or dev == "hip" or dev == "rocm":
-        try:
-            var minmod = Python.import_module("engine.minimizer_index")
-            var helper = Python.import_module("giraffe_gpu_minimizer")
-            var idx = minmod.MinimizerIndex(min_path)
-            var py_seqs = Python.list()
-            for s in seqs:
-                py_seqs.append(s)
-            var batch_out = helper.minimizers_batch_gpu(
-                py_seqs, k=Int(py=idx.k), w=Int(py=idx.w), device=dev
-            )
-            var occs_batch = batch_out[0]
-            var backend = String(batch_out[1])
-            var out = List[List[String]]()
-            var n = Int(py=occs_batch.__len__())
-            var i = 0
-            while i < n:
-                var hits = idx.locate_from_minimizers(occs_batch[i], hit_cap=24)
-                var row = List[String]()
-                var m = Int(py=hits.__len__())
-                var j = 0
-                while j < m:
-                    var h = hits[j]
-                    var orient = String("0")
-                    if Bool(h.is_rev):
-                        orient = "1"
-                    row.append(
-                        String(h.node_id) + ":" + orient + ":" + String(h.offset)
-                    )
-                    j += 1
-                out.append(row^)
-                i += 1
-            idx.close()
-            os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = backend + "+mojo_stream"
-            print("mojo_stream seed_backend=", backend, "+mojo_stream")
-            return out^
-        except e:
-            print("mojo_stream GPU minimizer locate unavailable: ", e)
-
-    # Host mmap locate (Mojo wrapper, one open).
-    var located = locate_batch_hits(min_path, seqs, 24)
-    os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = "min_mmap+mojo_stream"
-    print("mojo_stream seed_backend=min_mmap+mojo_stream")
-    return located^
+    """Mojo-native minimizer locate (DeviceContext / host). ``k`` unused — index k/w."""
+    _ = k
+    return locate_batch_hits_native(device, min_path, seqs, 24)
 
 
 def _fixture_extend_small(
@@ -250,6 +192,25 @@ def map_fastq_stream_to_gaf(
     os_mod.environ["METHYLGRAPHER_ALIGN_DEVICE"] = dev
     os_mod.environ["METHYLGRAPHER_LAST_GPU_BACKEND"] = backend
 
+    # Fail closed: never claim GPU Align while falling back to CuPy/host-nvidia.
+    if (
+        backend.find("host-fallback") >= 0
+        or backend.find("host-nvidia") >= 0
+        or backend.find("cupy") >= 0
+    ):
+        var require = String(os_mod.environ.get("METHYLGRAPHER_GPU_REQUIRE", "")).lower()
+        if (
+            (require == "" or require == "1" or require == "true" or require == "yes")
+            and (dev == "nvidia" or dev == "amd")
+        ):
+            raise Error(
+                "mojo_stream_map refusing non-DeviceContext backend="
+                + backend
+                + " for device="
+                + dev
+                + " (CuPy/host-nvidia-fallback is not the production path)"
+            )
+
     var batch_size = _batch_size()
     var profile = _stage_enabled()
     print(
@@ -305,12 +266,8 @@ def map_fastq_stream_to_gaf(
             for r in batch2:
                 seqs.append(r.seq)
 
-        # GPU DeviceContext seeds — k-mers retained (not discarded); science
-        # locate uses vg minimizer index for GAF coordinates.
-        if dev != "cpu":
-            _ = seed_kmers_on_device(dev, seqs, k)
+        # Science locate owns DeviceContext minimizer hashing (no discarded seed pass).
         var t_gpu = time.perf_counter()
-
         var seed_hits = _science_locate_batch(min_path, seqs, dev, k)
         var t_locate = time.perf_counter()
 

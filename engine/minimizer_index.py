@@ -319,6 +319,30 @@ class MinimizerIndex:
         """Minimizers → graph hits (capped per minimizer)."""
         return self.locate_from_minimizers(self.minimizers(seq), hit_cap=hit_cap)
 
+    def locate_key_batches(
+        self, keys_batch: Sequence[Sequence[int]], *, hit_cap: int = 24
+    ) -> List[List[str]]:
+        """Batch HT lookup for Mojo-native minimizer keys → ``node:orient:offset``.
+
+        One Python call per FASTQ batch (avoids per-key Mojo↔Python round-trips).
+        """
+        out: List[List[str]] = []
+        for keys in keys_batch:
+            hits: List[str] = []
+            seen: set[Tuple[int, int, int]] = set()
+            for key in keys:
+                found = self.find(int(key))
+                if len(found) > hit_cap:
+                    found = found[:hit_cap]
+                for h in found:
+                    sk = (h.node_id, int(h.is_rev), h.offset)
+                    if sk in seen:
+                        continue
+                    seen.add(sk)
+                    hits.append(f"{h.node_id}:{int(h.is_rev)}:{h.offset}")
+            out.append(hits)
+        return out
+
 
 def probe_minimizer(path: str | Path) -> dict:
     with MinimizerIndex(path) as idx:

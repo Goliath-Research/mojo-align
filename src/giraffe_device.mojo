@@ -104,45 +104,22 @@ def extract_kmers_batch_cpu(seqs: List[String], k: Int) raises -> List[List[Stri
 def extract_kmers_batch(
     device: String, seqs: List[String], k: Int
 ) raises -> List[List[String]]:
-    """Seed k-mers: DeviceContext GPU path first, then CuPy helper, then CPU."""
+    """Seed k-mers via Mojo DeviceContext only (no CuPy / giraffe_gpu_minimizer)."""
     var resolved = select_device(device)
     if resolved == DEVICE_CPU:
         return extract_kmers_batch_cpu(seqs, k)
-
-    # Preferred: native Mojo DeviceContext kernels (nvidia:sm_90 / amdgpu).
     try:
         return seed_kmers_on_device(resolved, seqs, k)
     except e:
-        print("DeviceContext seed failed; trying Python GPU helper: ", e)
-
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    var candidates = List[String]()
-    candidates.append(String(os_mod.getcwd()) + "/scripts")
-    candidates.append("/opt/methylgrapher-mojo/scripts")
-    candidates.append("/home/ubuntu/methylGrapher-mojo/scripts")
-    for c in candidates:
-        sys_mod.path.insert(0, c)
-    try:
-        var helper = Python.import_module("giraffe_gpu_minimizer")
-        var py_seqs = Python.list()
-        for s in seqs:
-            py_seqs.append(s)
-        var py_out = helper.extract_kmers_batch(py_seqs, k, resolved)
-        var out = List[List[String]]()
-        var n = Int(py=py_out.__len__())
-        var i = 0
-        while i < n:
-            var row = py_out[i]
-            var mers = List[String]()
-            var m = Int(py=row.__len__())
-            var j = 0
-            while j < m:
-                mers.append(String(row[j]))
-                j += 1
-            out.append(mers^)
-            i += 1
-        return out^
-    except e2:
-        print("GPU minimizer helper unavailable; falling back to CPU: ", e2)
+        var os_mod = Python.import_module("os")
+        var require = String(os_mod.environ.get("METHYLGRAPHER_GPU_REQUIRE", "")).lower()
+        if require == "" or require == "1" or require == "true" or require == "yes":
+            raise Error(
+                "DeviceContext seed failed for device="
+                + resolved
+                + ": "
+                + String(e)
+                + " (CuPy fallback disabled on production path)"
+            )
+        print("DeviceContext seed failed; host k-mers (GPU_REQUIRE off): ", e)
         return extract_kmers_batch_cpu(seqs, k)

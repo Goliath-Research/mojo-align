@@ -11,11 +11,13 @@ earlier TODOs when they conflict.
 ## 2026-08-09 — Native Mojo GBZ stream map (hot path)
 
 **Completed:**
-- `src/giraffe_stream_map.mojo` — batched FASTQ → DeviceContext GPU seed (k-mers
-  retained from packed codes) → science minimizer locate → Mojo cluster →
+- `src/giraffe_stream_map.mojo` — batched FASTQ → Mojo Giraffe `(k,w)` minimizers
+  (`giraffe_minimizer.mojo`: DeviceContext pack+fwd/RC hash, Mojo window reduce;
+  **no CuPy / host-nvidia-fallback**) → HT `locate_key_batches` → Mojo cluster →
   `gapless_extend_with_pack` → streaming GAF; PE `ri`/`os`/`rc`.
 - `giraffe_gbz.map_gbz_native` no longer calls Python `map_fastq_to_gaf` for the
   hot loop; `engine/quartet_map.py` demoted to oracle + `ensure_pack_for_gbz`.
+- Production locate no longer imports `scripts/giraffe_gpu_minimizer.py` (CuPy).
 - GPU seed kernels decode k-mers from DeviceContext codes (hashes feed extend).
 - Smoke: `scripts/smoke_mojo_stream_map.mojo`; tests: `tests/test_mojo_stream_map.py`.
 - Docs: `GIRAFFE_SPEC.md` / README updated.
