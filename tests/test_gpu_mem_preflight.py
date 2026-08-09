@@ -58,3 +58,21 @@ def test_require_index_capacity_ok(
     assert out["skipped"] is False
     assert out["source"] == "nvidia-smi"
     assert out["free_bytes"] == 95 << 30
+
+
+def test_wait_for_hbm_free_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_info(device: str = "nvidia") -> gpu_mem.GpuHbmInfo:
+        return gpu_mem.GpuHbmInfo(95 << 30, 96 << 30, "nvidia-smi")
+
+    monkeypatch.setattr(gpu_mem, "hbm_info", fake_info)
+    out = gpu_mem.wait_for_hbm_free(90.0, device="nvidia", timeout_s=1.0, poll_s=0.1)
+    assert out["free_gib"] > 90.0
+
+
+def test_wait_for_hbm_free_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_info(device: str = "nvidia") -> gpu_mem.GpuHbmInfo:
+        return gpu_mem.GpuHbmInfo(8 << 30, 96 << 30, "nvidia-smi")
+
+    monkeypatch.setattr(gpu_mem, "hbm_info", fake_info)
+    with pytest.raises(RuntimeError, match="did not reclaim"):
+        gpu_mem.wait_for_hbm_free(90.0, device="nvidia", timeout_s=0.3, poll_s=0.1)

@@ -194,3 +194,51 @@ def require_index_capacity(
             "ensure no other process holds HBM."
         )
     return report
+
+
+def wait_for_hbm_free(
+    min_free_gib: float,
+    *,
+    device: str = "nvidia",
+    timeout_s: float = 180.0,
+    poll_s: float = 2.0,
+) -> dict:
+    """Block until free HBM ≥ ``min_free_gib`` or raise after ``timeout_s``.
+
+    Used between dual-graph C2T/G2A Mojo processes and by the host worker before
+    starting Align docker — CUDA can reclaim HBM a few seconds after process exit.
+    """
+    import time
+
+    if min_free_gib <= 0:
+        raise RuntimeError("wait_for_hbm_free: min_free_gib must be > 0")
+    need = int(float(min_free_gib) * float(1024**3))
+    deadline = time.monotonic() + float(timeout_s)
+    last: Optional[GpuHbmInfo] = None
+    while True:
+        last = hbm_info(device)
+        if last.free_bytes >= need:
+            report = {
+                "free_gib": _gib(last.free_bytes),
+                "total_gib": _gib(last.total_bytes),
+                "min_free_gib": float(min_free_gib),
+                "source": last.source,
+            }
+            print(
+                "gpu_hbm_wait ok free_gib=",
+                round(report["free_gib"], 3),
+                " min_free_gib=",
+                min_free_gib,
+                " source=",
+                last.source,
+                flush=True,
+            )
+            return report
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "GPU HBM did not reclaim in time: need "
+                f"{min_free_gib:.1f} GiB free, have {_gib(last.free_bytes):.2f} GiB free / "
+                f"{_gib(last.total_bytes):.2f} GiB total after {timeout_s:.0f}s "
+                f"(via {last.source}). Kill leftover Mojo/Align containers on this GPU."
+            )
+        time.sleep(max(0.2, float(poll_s)))

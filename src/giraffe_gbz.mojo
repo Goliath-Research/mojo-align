@@ -1,10 +1,10 @@
 # GBZ index open for Mojo Giraffe — native stream map (not Python quartet_map).
 
-from std.collections import Dict, List
+from std.collections import Dict
 from std.python import Python
 
-from giraffe_device import extract_kmers_batch, require_device_or_raise
-from giraffe_gpu_kernels import kernel_target_label, probe_device_context
+from giraffe_device import require_device_or_raise
+from giraffe_gpu_kernels import kernel_target_label
 from giraffe_stream_map import map_fastq_stream_to_gaf
 
 
@@ -37,23 +37,17 @@ def map_gbz_native(
     batches never materialize the whole FASTQ as Mojo ``String`` rows.
     """
     var dev = require_device_or_raise(device)
-    var backend = probe_device_context(dev)
+    # Do NOT probe/warm DeviceContext here: each throwaway context can retain
+    # HBM until process exit and races the resident-index preflight below.
+    # map_fastq_stream_to_gaf owns the single production DeviceContext session.
     print(
         "Mojo Giraffe GBZ native device=",
         dev,
         " target=",
         kernel_target_label(dev),
-        " backend=",
-        backend,
         " gbz=",
         gbz,
     )
-    # Warm DeviceContext + pack/hash kernels before streaming map.
-    if dev != "cpu":
-        var warm = List[String]()
-        warm.append("ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA")
-        warm.append("TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA")
-        _ = extract_kmers_batch(dev, warm, k)
 
     var pack_dir = ensure_pack_dir(gbz)
     var n = map_fastq_stream_to_gaf(

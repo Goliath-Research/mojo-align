@@ -266,8 +266,43 @@ def alignment(
     workers = 2 if parallel and len(jobs) > 1 else 1
     print(f"Align dual-graph jobs={len(jobs)} parallel_workers={workers}")
 
+    def _reclaim_hbm_between_graphs() -> None:
+        """Wait for CUDA to free HBM after one MojoGiraffe process exits.
+
+        Without this, the second dual-graph job (G2A) often sees only a few GiB
+        free and trips the capacity preflight / DeviceContext OOM.
+        """
+        if workers != 1:
+            return
+        device = os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "").strip().lower()
+        engine = os.environ.get("METHYLGRAPHER_ALIGN_ENGINE", "").strip().lower()
+        if device in {"cuda", ""}:
+            device = "nvidia" if device == "cuda" or engine in {
+                "gpu_giraffe",
+                "mojo_giraffe",
+                "mojo",
+            } else device
+        if device in {"hip", "rocm"}:
+            device = "amd"
+        if device not in {"nvidia", "amd"}:
+            return
+        try:
+            from engine import gpu_mem
+        except ImportError:
+            return
+        min_free = float(os.environ.get("METHYLGRAPHER_GRAPH_HANDOFF_FREE_GIB", "90"))
+        timeout = float(os.environ.get("METHYLGRAPHER_GRAPH_HANDOFF_TIMEOUT_S", "180"))
+        print(
+            f"Align dual-graph HBM handoff: waiting for ≥{min_free:.0f} GiB free "
+            f"(device={device})",
+            flush=True,
+        )
+        gpu_mem.wait_for_hbm_free(min_free, device=device, timeout_s=timeout)
+
     if workers == 1:
-        for job in jobs:
+        for i, job in enumerate(jobs):
+            if i > 0:
+                _reclaim_hbm_between_graphs()
             _run_one_map(*job)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
