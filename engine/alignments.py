@@ -158,6 +158,12 @@ def alignment(
             out_gaf=mojo_out_gaf if mojo_direct else None,
         )
         print(f"Align map backend: {engine_used} ref={ref_type}")
+        # Drop leftover log (often root-owned from prior --user 0:0 runs) before rewrite.
+        try:
+            if os.path.exists(alignment_log):
+                os.remove(alignment_log)
+        except OSError as exc:
+            print(f"WARNING: could not remove stale align log {alignment_log}: {exc}")
         with open(alignment_log, "w") as alignment_log_fh:
             alignment_log_fh.write("Command used: \n")
             alignment_log_fh.write(cmd + "\n\n")
