@@ -215,7 +215,9 @@ def seed_kmers_on_device(
                 block_dim=BLOCK,
             )
             var host_hash = ctx.enqueue_create_host_buffer[DType.uint64](n_bases)
+            var host_codes = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
             ctx.enqueue_copy(src_buf=dev_hash, dst_buf=host_hash)
+            ctx.enqueue_copy(src_buf=dev_codes, dst_buf=host_codes)
             ctx.synchronize()
             var nonzero = 0
             var t = 0
@@ -224,6 +226,41 @@ def seed_kmers_on_device(
                     nonzero += 1
                 t += 1
             print("MojoGiraffe GPU hashed_positions=", nonzero)
-            return seed_kmers_portable(seqs, k)
+            # Decode k-mers from GPU-packed codes (hashes feed extend, not discarded).
+            var bases = List[String]()
+            bases.append("A")
+            bases.append("C")
+            bases.append("G")
+            bases.append("T")
+            var out = List[List[String]]()
+            var ri = 0
+            while ri < n_reads:
+                var L = seqs[ri].byte_length()
+                var mers = List[String]()
+                if L >= k:
+                    var pos = 0
+                    var base = ri * max_len
+                    while pos + k <= L:
+                        var hidx = base + pos
+                        if host_hash[hidx] != 0:
+                            var mer = String("")
+                            var j = 0
+                            var ok = True
+                            while j < k:
+                                var code = Int(host_codes[base + pos + j])
+                                if code < 0 or code > 3:
+                                    ok = False
+                                    break
+                                mer = mer + bases[code]
+                                j += 1
+                            if ok:
+                                mers.append(mer^)
+                        pos += 1
+                if len(mers) == 0:
+                    # Fallback host extract for this read if GPU produced nothing.
+                    mers = extract_kmers(seqs[ri], k)
+                out.append(mers^)
+                ri += 1
+            return out^
 
     return seed_kmers_portable(seqs, k)

@@ -1,50 +1,11 @@
-# GBZ index open for Mojo Giraffe — native quartet map (not Python extend_exact).
+# GBZ index open for Mojo Giraffe — native stream map (not Python quartet_map).
 
 from std.collections import Dict, List
 from std.python import Python
 
-from giraffe_device import extract_kmers_batch, require_device_or_raise, select_device
-from giraffe_dist import cluster_seed_hits
-from giraffe_extend import gapless_extend_seeds
-from giraffe_gaf_emit import write_gaf
+from giraffe_device import extract_kmers_batch, require_device_or_raise
 from giraffe_gpu_kernels import kernel_target_label, probe_device_context
-from giraffe_minzip import locate_read_hits
-
-
-def _parse_fastq(path: String) raises -> List[String]:
-    """Return flat list name0,seq0,name1,seq1,..."""
-    var builtins = Python.import_module("builtins")
-    var fh = builtins.open(path, "r")
-    var rows = List[String]()
-    while True:
-        var n = String(fh.readline())
-        if n.byte_length() == 0:
-            break
-        var s = String(fh.readline())
-        _ = String(fh.readline())
-        _ = String(fh.readline())
-        while n.byte_length() > 0:
-            var last = String(n[byte = n.byte_length() - 1 : n.byte_length()])
-            if last == "\n" or last == "\r":
-                n = String(n[byte = 0 : n.byte_length() - 1])
-            else:
-                break
-        while s.byte_length() > 0:
-            var last2 = String(s[byte = s.byte_length() - 1 : s.byte_length()])
-            if last2 == "\n" or last2 == "\r":
-                s = String(s[byte = 0 : s.byte_length() - 1])
-            else:
-                break
-        if n.startswith("@"):
-            n = String(n[byte = 1 : n.byte_length()])
-        var bare = n
-        var parts = n.split("_")
-        if len(parts) > 0:
-            bare = String(parts[0])
-        rows.append(bare)
-        rows.append(s)
-    fh.close()
-    return rows^
+from giraffe_stream_map import map_fastq_stream_to_gaf
 
 
 def ensure_pack_dir(gbz: String) raises -> String:
@@ -53,6 +14,7 @@ def ensure_pack_dir(gbz: String) raises -> String:
     sys_mod.path.insert(0, String(os_mod.getcwd()))
     sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
     sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    # Pack ensure stays in Python (one-time build / resolve); map loop is Mojo.
     var qm = Python.import_module("engine.quartet_map")
     var pack = qm.ensure_pack_for_gbz(gbz)
     return String(pack.root)
@@ -69,12 +31,10 @@ def map_gbz_native(
     k: Int,
     device: String,
 ) raises -> Int:
-    """Mojo-orchestrated seed→cluster→extend→GAF using quartet indexes.
+    """Mojo stream map: GPU seed → locate → cluster → gapless → GAF.
 
-    Production WGBS is paired-end and Buffy-scale (~100s GB FASTQ). Never call
-    ``_parse_fastq`` on those inputs — it materializes the whole file as Mojo
-    ``String`` rows and OOM-kills the container (exit 137). PE and SE both go
-    through streaming ``engine.quartet_map.map_fastq_to_gaf``.
+    Production WGBS is paired-end and Buffy-scale (~100s GB FASTQ). Streaming
+    batches never materialize the whole FASTQ as Mojo ``String`` rows.
     """
     var dev = require_device_or_raise(device)
     var backend = probe_device_context(dev)
@@ -88,42 +48,30 @@ def map_gbz_native(
         " gbz=",
         gbz,
     )
-    # Warm DeviceContext + pack/hash kernels so Align is visibly on GPU before
-    # the streaming Python quartet map (minimizer locate + extend).
+    # Warm DeviceContext + pack/hash kernels before streaming map.
     if dev != "cpu":
         var warm = List[String]()
         warm.append("ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA")
         warm.append("TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA")
         _ = extract_kmers_batch(dev, warm, k)
 
-    # Ensure dense segment pack exists (may build once); do not preload reads.
-    _ = ensure_pack_dir(gbz)
-
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
-    os_mod.environ["METHYLGRAPHER_GIRAFFE_DEVICE"] = dev
-    os_mod.environ["METHYLGRAPHER_ALIGN_DEVICE"] = dev
-    os_mod.environ["METHYLGRAPHER_LAST_GPU_BACKEND"] = backend
-    var qm = Python.import_module("engine.quartet_map")
-    var n = qm.map_fastq_to_gaf(
-        gbz=gbz,
-        fq1=fq1,
-        out_gaf=out_gaf,
-        fq2=fq2,
-        dist=dist,
-        min_path=min_path,
-        zipcodes=zipcodes,
-        k=k,
-        device=dev,
+    var pack_dir = ensure_pack_dir(gbz)
+    var n = map_fastq_stream_to_gaf(
+        pack_dir,
+        fq1,
+        out_gaf,
+        fq2,
+        dist,
+        min_path,
+        zipcodes,
+        k,
+        dev,
     )
     if fq2.byte_length() == 0:
-        print("GBZ SE quartet_map hits=", n, " → ", out_gaf)
+        print("GBZ SE mojo_stream_map hits=", n, " → ", out_gaf)
     else:
-        print("GBZ PE quartet_map hits=", n, " → ", out_gaf)
-    return Int(py=n)
+        print("GBZ PE mojo_stream_map hits=", n, " → ", out_gaf)
+    return n
 
 
 def map_gbz_via_helper(
@@ -137,7 +85,7 @@ def map_gbz_via_helper(
     k: Int,
     device: String,
 ) raises -> Int:
-    """Back-compat name → native quartet map (no Python extend_exact)."""
+    """Back-compat name → native Mojo stream map."""
     return map_gbz_native(
         gbz, fq1, out_gaf, fq2, dist, min_path, zipcodes, k, device
     )

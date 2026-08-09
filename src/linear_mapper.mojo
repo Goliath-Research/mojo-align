@@ -100,11 +100,12 @@ def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
 
 
 def _batch_size() raises -> Int:
+    # Larger default helps beat Clara wall on GH200; override via env.
     var os_mod = Python.import_module("os")
-    var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_READ_BATCH", "4096"))
+    var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_READ_BATCH", "16384"))
     var n = Int(raw)
     if n < 1:
-        return 4096
+        return 16384
     return n
 
 

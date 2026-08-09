@@ -32,7 +32,7 @@ Harness: [`scripts/benchmark_clara_fq2bam_meth.sh`](../scripts/benchmark_clara_f
 | Gate | Criterion | Status |
 |------|-----------|--------|
 | Toy PE BAM + QC schema | mapped > 0, JSON keys, `mapper=mojo` | **PASS** (CI/local) |
-| NVIDIA subset vs Clara `pbrun fq2bam_meth` | Mojo wall ≤ Clara (±10%) | **PENDING** operator on GH200 |
+| NVIDIA subset vs Clara `pbrun fq2bam_meth` | Mojo wall **&lt; Clara** (strict) | **PENDING** operator on GH200 |
 | AMD MI300X twin | Mojo AMD wall ≈ NVIDIA Mojo twin; ≫ BWA CPU | **PENDING** ROCm bakeoff |
 | Complete status | both wall-clock gates green | **PENDING** (default mapper is already `mojo`) |
 

@@ -17,14 +17,14 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 - **No companion GFA required** for Align when the four-file quartet exists under `index_prefix`.
 - Dense segment pack (`sequences.bin` + `offsets.bin` under `{gbz}.mojo_segments/`) from [`scripts/build_mojo_segment_pack.py`](../scripts/build_mojo_segment_pack.py) (or legacy jsonl / `vg convert` for tiny fixtures).
 - Production GBZ map path (Buffy-scale FASTQ):
-  1. Mojo `giraffe_gbz.map_gbz_native` — device select / `require_device_or_raise`, DeviceContext warmup, ensure pack
-  2. Streaming [`engine/quartet_map.py`](../engine/quartet_map.py) `map_fastq_to_gaf` — **in-process** GPU/host minimizer seed (no CuPy JSON IPC), mmap `.min` locate, zip/dist cluster, gapless (+ multi-node) extend, GAF emit  
-  Mojo must **not** `_parse_fastq` whole production FASTQs (OOM / exit 137).
-- Native Mojo gapless over dense pack: [`src/giraffe_gapless.mojo`](../src/giraffe_gapless.mojo) / [`src/giraffe_pack.mojo`](../src/giraffe_pack.mojo) (used by `gapless_extend_seeds`).
+  1. Mojo `giraffe_gbz.map_gbz_native` — device select / `require_device_or_raise`, DeviceContext warmup, ensure dense pack
+  2. Mojo [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo) — batched FASTQ stream → DeviceContext GPU seed (k-mers retained) → science minimizer locate (CuPy or mmap `.min`) → Mojo zip/dist cluster → `gapless_extend_with_pack` → streaming GAF emit  
+  Mojo must **not** load whole production FASTQs into memory (OOM / exit 137).
+- Python [`engine/quartet_map.py`](../engine/quartet_map.py) is the **oracle** only (`map_fastq_to_gaf` for parity tests; `ensure_pack_for_gbz` for pack resolve).
+- Native Mojo gapless over dense pack: [`src/giraffe_gapless.mojo`](../src/giraffe_gapless.mojo) / [`src/giraffe_pack.mojo`](../src/giraffe_pack.mojo).
 - Dual-graph Align overlaps C2T∥G2A (`METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` default); MojoGiraffe streams GAF via `/dev/fd/3` (no temp+cat).
-- Minimizer mmap: [`engine/minimizer_index.py`](../engine/minimizer_index.py); zip/dist: [`engine/zipcodes_index.py`](../engine/zipcodes_index.py).
 - Selection: `METHYLGRAPHER_MOJO_GIRAFFE_READY` defaults to **on** (`1`); set `0` / `false` / `off` to force vg.
-- PE tags: primary pair gets `ri` / `os` / `rc` for MethylCall. Full vg `-M 2` multimapping for PE is not yet mirrored (SE can return up to two scored hits in `quartet_map`).
+- PE tags: primary pair gets `ri` / `os` / `rc` for MethylCall; up to two scored hits per mate (`-M 2` style) when gapless returns them.
 - Named coordinates: path column uses segment ids from the dense pack (same ids MethylCall resolves via PrepareGenome node maps).
 
 ### GFA fixture path
@@ -35,7 +35,7 @@ Toy / development: native Mojo `giraffe_mapper` + `giraffe_index` / `extend_exac
 
 1. **Index / pack** — ensure `{gbz}.mojo_segments/` dense pack.
 2. **Device gate + GPU warmup** — `giraffe_device` + `giraffe_gpu_kernels` (`nvidia:sm_90` / `amdgpu:gfx942`). Driver &lt;580 needs `MODULAR_NVPTX_COMPILER_PATH=ptxas`. `METHYLGRAPHER_GPU_REQUIRE` (default on for nvidia/amd pins) fails closed if DeviceContext cannot be created.
-3. **Streaming locate / cluster / extend / GAF** — `engine.quartet_map` with stage timer (`METHYLGRAPHER_PROFILE_STAGES`); in-process seeds; parallel extend workers.
+3. **Streaming locate / cluster / extend / GAF** — `giraffe_stream_map` (`METHYLGRAPHER_PROFILE_STAGES` stage prints).
 4. **Pair tags** — PE `ri`/`os`/`rc` on the primary pair.
 
 ## MethylCall-consumed GAF fields
@@ -46,15 +46,16 @@ Toy / development: native Mojo `giraffe_mapper` + `giraffe_index` / `extend_exac
 
 | Module | Responsibility |
 |--------|----------------|
-| `giraffe_gbz.mojo` | GBZ entry: device gate, GPU warmup, call streaming `quartet_map` |
+| `giraffe_gbz.mojo` | GBZ entry: device gate, GPU warmup, ensure pack → `giraffe_stream_map` |
+| `giraffe_stream_map.mojo` | **Production** batched FASTQ → seed/locate/cluster/extend/GAF |
 | `giraffe_mapper.mojo` | `MojoGiraffe` CLI (`-gbz` or `-gfa`) |
 | `giraffe_device.mojo` | `cpu` / `nvidia` / `amd` select + `require_device_or_raise` |
-| `giraffe_gpu_kernels.mojo` | Portable seed kernel surface (`nvidia:sm_90` / `amdgpu:gfx942`) |
+| `giraffe_gpu_kernels.mojo` | Portable seed kernels; GPU codes → k-mers for extend |
 | `giraffe_index.mojo` / `giraffe_seed.mojo` / `giraffe_extend.mojo` / `giraffe_gaf_emit.mojo` | GFA fixture-scale native path |
 | `giraffe_gapless.mojo` / `giraffe_pack.mojo` | Native Mojo gapless (+ multi-node) over dense pack |
 | `giraffe_minzip.mojo` / `giraffe_dist.mojo` | Mojo-side batch locate/cluster helpers |
-| `engine/quartet_map.py` | Production streaming locate → cluster → gapless → GAF |
-| `engine/stage_timer.py` | Stage wall breakdown for bakeoffs |
+| `engine/quartet_map.py` | Oracle + `ensure_pack_for_gbz` / `mojo_giraffe_ready` |
+| `engine/stage_timer.py` | Stage wall breakdown for oracle bakeoffs |
 
 ## Fixtures
 

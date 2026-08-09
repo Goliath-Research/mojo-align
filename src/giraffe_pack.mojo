@@ -26,8 +26,25 @@ struct DensePack(Copyable, Movable):
             return String("")
         return String(seg)
 
+    def get_sid(self, sid: String) raises -> String:
+        var seg = self._pack.get(sid)
+        if seg is None:
+            return String("")
+        return String(seg)
+
     def size(self) raises -> Int:
         return Int(py=self._pack.__len__())
+
+    def segment_ids(self) raises -> List[String]:
+        """Toy/fixture only — do not call on production 100M+ packs."""
+        var out = List[String]()
+        var ids = self._pack.ids()
+        var n = Int(py=ids.__len__())
+        var i = 0
+        while i < n:
+            out.append(String(ids[i]))
+            i += 1
+        return out^
 
 
 def reverse_complement_dna(seq: String) raises -> String:

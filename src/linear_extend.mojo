@@ -126,25 +126,14 @@ def extend_read_with_seeds(
     seq: String,
     seed_kmers: List[String],
 ) raises -> LinearHit:
-    """Map using GPU/host seed k-mers (wired into hash locate + extend)."""
+    """Map using GPU/host seed k-mers (wired into hash locate + extend).
+
+    Seed/hash path first (production GRCh38). Exact full-contig scan is only
+    a tiny-index / fixture shortcut — never O(genome×read) on Buffy refs.
+    """
     var qlen = seq.byte_length()
-    var unmapped = LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
 
-    for c in index.contigs:
-        var off = _find_substr(c.seq, seq)
-        if off >= 0:
-            return LinearHit(
-                name, 0, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
-            )
-
-    var rc = reverse_complement(seq)
-    for c in index.contigs:
-        var off = _find_substr(c.seq, rc)
-        if off >= 0:
-            return LinearHit(
-                name, 16, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
-            )
-
+    # Fast path: GPU/host k-mers → postings → gapless verify.
     var hits = List[String]()
     if len(seed_kmers) > 0:
         for mer in seed_kmers:
@@ -153,7 +142,27 @@ def extend_read_with_seeds(
                 hits.append(h.copy())
     else:
         hits = seed_hits(index, seq)
-    return _vote_and_verify(index, name, seq, hits)
+    var voted = _vote_and_verify(index, name, seq, hits)
+    if voted.contig != "*":
+        return voted^
+
+    # Fixture / tiny-index only: exact substring (cap total bases).
+    var total = index.total_bases()
+    if total > 0 and total <= 2_000_000:
+        for c in index.contigs:
+            var off = _find_substr(c.seq, seq)
+            if off >= 0:
+                return LinearHit(
+                    name, 0, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
+                )
+        var rc = reverse_complement(seq)
+        for c in index.contigs:
+            var off2 = _find_substr(c.seq, rc)
+            if off2 >= 0:
+                return LinearHit(
+                    name, 16, c.name, off2 + 1, 60, String(qlen) + "M", seq, "*"
+                )
+    return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
 
 def extend_read(index: LinearIndex, name: String, seq: String) raises -> LinearHit:

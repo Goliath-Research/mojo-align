@@ -1,7 +1,10 @@
-"""Production GBZ-quartet map: .min locate → zip/dist cluster → gapless extend → GAF.
+"""Oracle / reference GBZ-quartet map (Python).
 
-Replaces fixture-scale ``extend_exact`` for Mojo Giraffe when packed segments
-and a readable minimizer index are available.
+Production Align uses Mojo ``giraffe_stream_map`` (see ``src/giraffe_gbz.mojo``).
+This module remains for:
+  - ``ensure_pack_for_gbz`` (one-time dense pack resolve/build)
+  - ``mojo_giraffe_ready`` selection gate
+  - parity / bakeoff oracle via ``map_fastq_to_gaf``
 """
 
 from __future__ import annotations

@@ -57,7 +57,7 @@ bin/methylGrapher MojoFq2bamMeth \
 | `METHYLGRAPHER_ALIGN_DEVICE` | default `-device` |
 | `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` |
 | `METHYLGRAPHER_LINEAR_K` | k-mer size (default 15) |
-| `METHYLGRAPHER_LINEAR_READ_BATCH` | streaming batch size (default 4096) |
+| `METHYLGRAPHER_LINEAR_READ_BATCH` | streaming batch size (default 16384) |
 | `METHYLGRAPHER_GPU_REQUIRE` | `1` = fail-closed GPU bakeoff (no BWA) |
 | `METHYLGRAPHER_BWA_THREADS` | threads for BWA fallback / sort |
 ## Modules
@@ -73,4 +73,4 @@ bin/methylGrapher MojoFq2bamMeth \
 
 ## Performance gates
 
-See [`BENCHMARK_FQ2BAM_METH.md`](BENCHMARK_FQ2BAM_METH.md). Marking Complete requires NVIDIA ≤ Clara `fq2bam_meth` (± tolerance) and AMD competitive with the NVIDIA Mojo twin.
+See [`BENCHMARK_FQ2BAM_METH.md`](BENCHMARK_FQ2BAM_METH.md). Marking Complete requires NVIDIA Mojo wall **strictly &lt; Clara** `pbrun fq2bam_meth` on the same sample/SKU, plus concordance gates (flagstat / CpG), and AMD competitive with the NVIDIA Mojo twin.

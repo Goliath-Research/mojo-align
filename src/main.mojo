@@ -70,7 +70,7 @@ def help_text() -> String:
         "\n"
         "Native Mojo commands:\n"
         "    help / vg_check / Align / MethylCall / MergeCpG / ConversionRate\n"
-        "    MojoGiraffe (GFA native; GBZ → streaming quartet_map)\n"
+        "    MojoGiraffe (GFA native; GBZ → giraffe_stream_map)\n"
         "    Align uses pluggable map backends (cpu_vg | gpu_giraffe | mojo_giraffe).\n"
         "    MojoFq2bamMeth: orchestrated in engine.fq2bam_meth; map kernel is\n"
         "    native src/linear_mapper.mojo (Clara linear substitute).\n"

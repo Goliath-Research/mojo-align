@@ -20,15 +20,15 @@ MergeCpG / ConversionRate onto `engine.cli`.
 
 | Component | Status |
 |---|---|
-| `engine/` (Python 0.2.0 port + patches) | 🟢 Complete — `python -m engine.cli`; Align backends; GBZ streaming `quartet_map`; MojoFq2bamMeth orchestration |
+| `engine/` (Python 0.2.0 port + patches) | 🟢 Complete — `python -m engine.cli`; Align backends; GBZ pack ensure + `quartet_map` **oracle**; MojoFq2bamMeth orchestration |
 | `src/utility.mojo` | 🟢 Complete — Phred / RC / bool / subprocess + gzip text I/O |
 | `src/mcall_core.mojo` | 🟢 Complete — native `alignment_path_parse`, `cs_tag_parse` |
 | `src/gfa.mojo` | 🟢 Complete — segment `Dict` for MethylCall |
 | `src/mcall.mojo` | 🟢 Complete — native `alignment_to_methylation` + `parallelize` MethylCall |
 | `src/merge_cpg.mojo` / `conversion_rate.mojo` | 🟢 Complete — native MergeCpG + ConversionRate |
 | `src/align.mojo` | 🟢 Complete — Align orchestration; map kernel via `engine.align_backends` |
-| `src/giraffe_*.mojo` + `engine/quartet_map.py` | 🟢 Complete — MojoGiraffe: GFA fixture native; **GBZ production** = Mojo device gate/GPU warmup + streaming Python locate/extend/GAF — `docs/GIRAFFE_SPEC.md` |
-| `src/linear_*.mojo` / `MojoFq2bamMeth` | 🔵 In progress — **native Mojo** linear mapper (index + extend → SAM); DeviceContext seed probe (`nvidia:sm_90` / `amdgpu:gfx942`); Python convert/QC/`samtools`; auto BWA fallback on Mojo failure — `docs/LINEAR_FQ2BAM_SPEC.md` |
+| `src/giraffe_*.mojo` + `giraffe_stream_map.mojo` | 🔵 In progress — MojoGiraffe: GFA fixture native; **GBZ production** = Mojo stream map (GPU seed → locate → cluster → gapless → GAF); `quartet_map` oracle only — `docs/GIRAFFE_SPEC.md` |
+| `src/linear_*.mojo` / `MojoFq2bamMeth` | 🔵 In progress — **native Mojo** linear mapper; GPU seeds feed extend; gate Mojo wall **&lt; Clara** — `docs/LINEAR_FQ2BAM_SPEC.md` |
 | `src/main.mojo` | 🟢 Complete — CLI: native Align/MethylCall/MergeCpG/ConversionRate/MojoGiraffe; MojoFq2bamMeth → `engine.fq2bam_meth` (which shells `linear_mapper.mojo`); PrepareGenome/Main → `engine.cli` |
 | Align backends | 🟢 `cpu_vg` / `gpu_giraffe` / `mojo_giraffe` — Parabricks GAF **NO-GO** — `docs/PHASE0_GH200_ALIGN.md` |
 | `bin/methylGrapher` | 🟢 Complete — `METHYLGRAPHER_ENGINE=mojo\|python` (default: python); `MojoFq2bamMeth` dual-ship |
@@ -114,7 +114,7 @@ scripts/benchmark_fq2bam_meth.sh
 | PrepareGenome / Main | `engine/` via Python interop | Multiprocessing-heavy indexing stays in the 0.2.0 port |
 | MethylCall hot path | Native Mojo; GAF filter via `engine.mcall.iter_alignment_batches` | Highest-value per-record work in Mojo; complex GAF bookkeeping for parity |
 | Align | Mojo control plane + `engine.align_backends` | Pluggable science GAF mappers; Parabricks BAM-only (Phase 0 NO-GO) |
-| MojoGiraffe (GBZ) | Mojo device gate + GPU warmup → streaming `engine.quartet_map` | Buffy-scale FASTQ must not load into Mojo `String` rows (OOM); fixture GFA stays native Mojo |
+| MojoGiraffe (GBZ) | Mojo device gate + GPU warmup → `giraffe_stream_map` | Buffy-scale FASTQ must stream (no full-file Mojo load); `quartet_map` is oracle only |
 | MojoFq2bamMeth | Native Mojo `linear_*.mojo` mapper (index + extend → SAM); Python convert/QC/`samtools` | Full linear map in Mojo, not BWA acceleration. DeviceContext seeds both NVIDIA and AMD. Auto `bwa_fallback` if Mojo subprocess fails. Clara/ROCm wall-clock gates before Complete |
 | `pysam` | `vg`/`samtools` via `subprocess` | Avoids Python C-extension; Mojo uses interop for subprocess |
 | `multiprocessing.Pool` | Mojo `parallelize()` on native MethylCall | Shared-memory workers on the hot loop |
@@ -135,14 +135,15 @@ engine/
   gfa.py / utility.py
   giraffe_gbz_helper.py / segment_pack.py
   minimizer_index.py / zipcodes_index.py
-  quartet_map.py        # GBZ streaming locate→cluster→extend→GAF
+  quartet_map.py        # GBZ oracle + ensure_pack / READY gate
   fq2bam_meth.py        # MojoFq2bamMeth orchestrator (convert, Mojo map, BWA fallback, QC)
 
 src/
   main.mojo             # Mojo CLI dispatcher
   align.mojo / mcall.mojo / mcall_core.mojo / gfa.mojo
   merge_cpg.mojo / conversion_rate.mojo / utility.mojo
-  giraffe_*.mojo        # MojoGiraffe (GBZ orchestrates quartet_map; GFA native)
+  giraffe_*.mojo        # MojoGiraffe (GBZ → giraffe_stream_map; GFA native)
+  giraffe_stream_map.mojo # Production GBZ hot path
   linear_index.mojo / linear_seed.mojo / linear_gpu_kernels.mojo
   linear_extend.mojo / linear_mapper.mojo   # native linear map → SAM
   legacy_scaffold/
@@ -181,7 +182,7 @@ docs/
 | `METHYLGRAPHER_LINEAR_MAPPER` | `mojo` (default) \| `bwa` \| `auto` |
 | `METHYLGRAPHER_LINEAR_K` | Mojo linear k-mer size (default 15) |
 | `METHYLGRAPHER_BWA_THREADS` | BWA fallback / `samtools sort` threads |
-| `METHYLGRAPHER_MOJO_READ_BATCH` | streaming FASTQ batch size for `quartet_map` |
+| `METHYLGRAPHER_MOJO_READ_BATCH` | streaming FASTQ batch size for `giraffe_stream_map` |
 | `MODULAR_NVPTX_COMPILER_PATH` | `ptxas` path when NVIDIA driver &lt; Modular’s minimum |
 
 ## License

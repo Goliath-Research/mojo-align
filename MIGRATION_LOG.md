@@ -8,11 +8,28 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — Native Mojo GBZ stream map (hot path)
+
+**Completed:**
+- `src/giraffe_stream_map.mojo` — batched FASTQ → DeviceContext GPU seed (k-mers
+  retained from packed codes) → science minimizer locate → Mojo cluster →
+  `gapless_extend_with_pack` → streaming GAF; PE `ri`/`os`/`rc`.
+- `giraffe_gbz.map_gbz_native` no longer calls Python `map_fastq_to_gaf` for the
+  hot loop; `engine/quartet_map.py` demoted to oracle + `ensure_pack_for_gbz`.
+- GPU seed kernels decode k-mers from DeviceContext codes (hashes feed extend).
+- Smoke: `scripts/smoke_mojo_stream_map.mojo`; tests: `tests/test_mojo_stream_map.py`.
+- Docs: `GIRAFFE_SPEC.md` / README updated.
+
+**Operator gates (unchanged):** Buffy dual-map ≤ ~2 h; DS20M MethylCall parity.
+
+---
+
 ## 2026-08-09 — Docs resync after Mojo Giraffe + linear fixes
 
 **Synced docs to code:**
 - GBZ production: Mojo device gate/GPU warmup → streaming `engine.quartet_map`
   (no full-FASTQ load in Mojo). Documented in `docs/GIRAFFE_SPEC.md` / README.
+  *(Superseded same day by native `giraffe_stream_map` above.)*
 - Linear: native Mojo index+extend; DeviceContext seed is probe/warmup;
   automatic `bwa_fallback` on Mojo failure; `-k` in Mojo help.
 - `METHYLGRAPHER_MOJO_GIRAFFE_READY` default-on (opt-out with `0`/`false`/`off`).

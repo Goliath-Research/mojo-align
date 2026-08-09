@@ -185,14 +185,13 @@ def _gapless_one(
     return empty^
 
 
-def gapless_extend_native(
-    pack_dir: String,
+def gapless_extend_with_pack(
+    pack: DensePack,
     query_name: String,
     seq: String,
     seeds: List[String],
 ) raises -> List[AlignmentHit]:
-    """Native Mojo gapless extend; seeds are ``node:orient:offset``."""
-    var pack = DensePack(pack_dir)
+    """Native Mojo gapless extend against an open dense pack (hot path)."""
     var out = List[AlignmentHit]()
     var qlen = seq.byte_length()
     for seed in seeds:
@@ -211,3 +210,14 @@ def gapless_extend_native(
         if len(out) >= 2:
             break
     return out^
+
+
+def gapless_extend_native(
+    pack_dir: String,
+    query_name: String,
+    seq: String,
+    seeds: List[String],
+) raises -> List[AlignmentHit]:
+    """Native Mojo gapless extend; seeds are ``node:orient:offset``."""
+    var pack = DensePack(pack_dir)
+    return gapless_extend_with_pack(pack, query_name, seq, seeds)
