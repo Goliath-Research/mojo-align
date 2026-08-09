@@ -201,8 +201,21 @@ def alignment(
                     continue
                 jobs.append((ref_type, read_type1, read_type2))
 
-    parallel_raw = os.environ.get("METHYLGRAPHER_DUAL_GRAPH_PARALLEL", "1").strip().lower()
-    parallel = parallel_raw not in {"0", "false", "no", "off"}
+    # Default serialize C2T/G2A when GPU/Mojo DeviceContext is in use — two
+    # concurrent CUDA contexts on one GH200 cause CUDA_ERROR_ILLEGAL_ADDRESS.
+    # Opt in with METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1 only after GPU isolation.
+    parallel_raw = os.environ.get("METHYLGRAPHER_DUAL_GRAPH_PARALLEL", "").strip().lower()
+    if parallel_raw == "":
+        device = os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "").strip().lower()
+        engine = os.environ.get("METHYLGRAPHER_ALIGN_ENGINE", "").strip().lower()
+        gpuish = device in {"nvidia", "amd", "cuda", "hip", "rocm"} or engine in {
+            "gpu_giraffe",
+            "mojo_giraffe",
+            "mojo",
+        }
+        parallel = not gpuish
+    else:
+        parallel = parallel_raw not in {"0", "false", "no", "off"}
     workers = 2 if parallel and len(jobs) > 1 else 1
     print(f"Align dual-graph jobs={len(jobs)} parallel_workers={workers}")
 

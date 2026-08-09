@@ -61,7 +61,7 @@ def locate_batch_hits_native(
     idx.close()
 
     var os_mod = Python.import_module("os")
-    var label = backend + "+mojo_min_mmap+mojo_stream"
+    var label = backend + "+mojo_min_mmap+mojo_pack+mojo_cluster+mojo_stream"
     os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = label
     print("mojo_stream seed_backend=", label)
     return out^
@@ -80,7 +80,7 @@ def locate_batch_hits_with_index(
     var backend = result.backend.copy()
     var out = idx.locate_occs_batch(result.occs, hit_cap)
     var os_mod = Python.import_module("os")
-    var label = backend + "+mojo_min_mmap+mojo_stream"
+    var label = backend + "+mojo_min_mmap+mojo_pack+mojo_cluster+mojo_stream"
     os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = label
     print("mojo_stream seed_backend=", label)
     return out^

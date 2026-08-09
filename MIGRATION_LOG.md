@@ -8,6 +8,16 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — Dual-map serialize + Mojo pack/cluster + QC fail-closed
+
+**Completed:**
+- Serialize C2T/G2A by default on GPU/Mojo (`METHYLGRAPHER_DUAL_GRAPH_PARALLEL=0`)
+  to avoid dual DeviceContext `CUDA_ERROR_ILLEGAL_ADDRESS`.
+- `giraffe_pack.mojo` — contiguous dense-v1 via libc mmap (no per-get Python).
+- `giraffe_dist.mojo` — Mojo-native bucket + abs-Δ prune (no DistIndex import).
+- QC BAM: `qc_bam_fallback=error` default for mojo QC (no multi-hour vg).
+- Smoke: `scripts/smoke_mojo_pack_cluster.mojo`.
+
 ## 2026-08-09 — Native Mojo GBZ stream map (hot path)
 
 **Completed:**

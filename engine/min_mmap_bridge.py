@@ -56,3 +56,33 @@ def close_min_mmap(_mm: Any, fd: int) -> None:
         os.close(int(fd))
     except OSError:
         pass
+
+
+def probe_dense_contiguous(root: str | Path, n_segments: int) -> bool:
+    """True when ``ids.txt`` is contiguous ``1..n_segments`` (dense-v1 hot path)."""
+    root_p = Path(root)
+    ids_path = root_p / "ids.txt"
+    if not ids_path.is_file() or n_segments <= 0:
+        return False
+    with ids_path.open("rb") as fh:
+        first = fh.readline().decode("utf-8", errors="replace").strip()
+        if n_segments == 1:
+            return first == "1"
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        win = min(256, size)
+        fh.seek(-win, os.SEEK_END)
+        tail = fh.read(win).decode("utf-8", errors="replace")
+        last = tail.strip().splitlines()[-1].strip() if tail.strip() else ""
+    meta_n = 0
+    meta = root_p / "meta.json"
+    if meta.is_file():
+        try:
+            import json
+
+            meta_n = int((json.loads(meta.read_text(encoding="utf-8")) or {}).get("n_segments") or 0)
+        except (OSError, ValueError, TypeError):
+            meta_n = 0
+    if first == "1" and last == str(n_segments) and (meta_n == 0 or meta_n == n_segments):
+        return True
+    return False
