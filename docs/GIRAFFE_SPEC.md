@@ -25,6 +25,7 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 - Dual-graph Align overlaps C2T∥G2A (`METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` default); MojoGiraffe streams GAF via `/dev/fd/3` (no temp+cat).
 - Selection: `METHYLGRAPHER_MOJO_GIRAFFE_READY` defaults to **on** (`1`); set `0` / `false` / `off` to force vg.
 - PE tags: primary pair gets `ri` / `os` / `rc` for MethylCall; up to two scored hits per mate (`-M 2` style) when gapless returns them.
+- PE emit order (MethylCall): **primary R1 → optional secondary R1 → primary R2 → optional secondary R2**. The first GAF row for a query must carry `ri`/`os`/`rc` (do not emit untagged secondaries before tagged primaries).
 - Named coordinates: path column uses segment ids from the dense pack (same ids MethylCall resolves via PrepareGenome node maps).
 
 ### GFA fixture path
