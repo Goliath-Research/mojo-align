@@ -81,17 +81,16 @@ payload = {
     "mojo_rc": int("$MOJO_RC"),
     "clara_wall_s": float("$CLARA_WALL") if "$CLARA_WALL" else None,
     "clara_rc": int("$CLARA_RC"),
-    "gate": "mojo_wall <= clara_wall * 1.10 when both succeed",
+    "gate": "mojo_wall < clara_wall (strict) when both succeed",
     "gpu_require": True,
 }
 if payload["mojo_wall_s"] and payload["clara_wall_s"]:
-    lim = payload["clara_wall_s"] * 1.10
-    payload["pass_pm10"] = payload["mojo_wall_s"] <= lim
+    payload["pass_strict_lt"] = payload["mojo_wall_s"] < payload["clara_wall_s"]
     payload["ratio_mojo_over_clara"] = round(
         payload["mojo_wall_s"] / payload["clara_wall_s"], 4
     )
 else:
-    payload["pass_pm10"] = None
+    payload["pass_strict_lt"] = None
 out.write_text(json.dumps(payload, indent=2) + "\n")
 print(json.dumps(payload, indent=2))
 PY

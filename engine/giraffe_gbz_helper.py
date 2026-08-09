@@ -1,8 +1,9 @@
-"""GBZ-native index access for Mojo Giraffe.
+"""GBZ-native index helpers for Mojo Giraffe.
 
-Production map path: dense segment pack + MinimizerIndex (``.min``) + zip/dist
-via ``engine.quartet_map``. Fixture-scale ``extend_exact`` is quarantined for
-tiny packs / empty minimizer indexes only.
+Production Align hot path is Mojo ``giraffe_stream_map`` (not this module).
+This helper resolves GBZ quartets / segment caches and exposes the Python
+``quartet_map`` oracle for parity tests. Fixture-scale ``extend_exact`` is
+quarantined for tiny packs / empty minimizer indexes only.
 """
 
 from __future__ import annotations

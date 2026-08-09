@@ -3,20 +3,27 @@
 Science contract: dual-graph GAF + named-coordinates → Mojo MethylCall.
 See [`GIRAFFE_SPEC.md`](GIRAFFE_SPEC.md).
 
-## Stage profile (A0)
+Production hot path is native Mojo [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo).
+Python [`engine/quartet_map.py`](../engine/quartet_map.py) is the **oracle** (parity / pack ensure), not Align.
+
+## Stage profile
+
+**Oracle** (Python `quartet_map` — for A/B vs Mojo):
 
 ```bash
 python3 scripts/profile_giraffe_stages.py --device cpu \
   --out /tmp/giraffe_stage_profile.json
-# Buffy / subset: set FQ1/FQ2/GBZ/MIN and METHYLGRAPHER_PROFILE_JSON
 ```
 
-Toy GBZ (2026-08-08, GH200 host; cold pack build excluded from STAGE_TIMER):
+**Production Mojo stream map** — set `METHYLGRAPHER_PROFILE_STAGES=1` and run
+`MojoGiraffe -gbz …`; stage lines print as `mojo_stream stages_s …`.
+
+Toy GBZ oracle profile (2026-08-08, GH200; cold pack build excluded):
 
 | Stage | Share (toy) | Notes |
 |-------|-------------|-------|
-| `seed_locate` | ~4% | in-process GPU/host minimizer + `.min` locate (no JSON IPC) |
-| `cluster_extend` | ~75% | zip/dist cluster + gapless (+ multi-node heuristic) |
+| `seed_locate` | ~4% | minimizer + `.min` locate |
+| `cluster_extend` | ~75% | zip/dist cluster + gapless |
 | `gaf_emit` | ~16% | streamed GAF lines |
 | `fastq_batch` | ~5% | streaming PE batches |
 
@@ -37,18 +44,19 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 
 | Backend | Index | Device | Fixture wall | GAF parity |
 |---------|-------|--------|--------------|------------|
-| MojoGiraffe `-gbz` | toy.giraffe.gbz | cpu / nvidia:sm_90 | ~10 s (incl. vg convert) | **PASS** vs golden |
+| MojoGiraffe `-gbz` (`giraffe_stream_map`) | toy.giraffe.gbz | cpu / nvidia:sm_90 | ~10 s (incl. pack) | **PASS** vs golden |
 | vg giraffe 1.70 | same toy GBZ | Grace | toy often `*` paths | use golden for MethylCall tags |
+
 ## DS20M / Buffy progressive gates
 
 | Milestone | Gate | Status |
 |-----------|------|--------|
-| Toy GBZ PE vs golden | path / cs / ri / os / rc | **PASS** |
+| Toy GBZ PE vs golden | path / cs / ri / os / rc | **PASS** (`giraffe_stream_map`) |
 | DS-scale (500 PE) on toy GBZ | GAF lines land | **PASS** (protocol smoke) |
-| Buffy-subset seed+extend (known `vg`-mapped C2T reads) | quartet_map | **PASS** 13/13 (~0.1 s) |
+| Buffy-subset seed+extend | oracle `quartet_map` 13/13; production = stream_map | **PASS** oracle; re-run stream_map on subset |
 | DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PENDING** operator |
-| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** operator (C2T∥G2A parallel + stream GAF wired) |
-| Production `gpu_giraffe` → Mojo GBZ | `READY=1` + dense pack + quartet | **WIRED** (default on; opt out with `READY=0`) |
+| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** (stream GAF wired; C2T/G2A **serialized** by default on GPU) |
+| Production `gpu_giraffe` → Mojo GBZ | READY default-on + dense pack + quartet | **WIRED** (opt out with `READY=0`) |
 
 Build production dense segment packs (preferred — from companion GFA):
 
@@ -58,15 +66,16 @@ python scripts/build_mojo_segment_pack.py \
   --gbz /work/genomes/pangenome/GRCh38/d9-bs/1.70/hprc-d9-bs.wl.C2T.giraffe.gbz \
   --out /work/cache/mojo_segments/hprc-d9-bs.wl.C2T.giraffe.gbz.mojo_segments \
   --also-link-g2a
-export METHYLGRAPHER_MOJO_GIRAFFE_READY=1   # only after Buffy ≤2h + MethylCall parity
+# READY defaults on; opt out until gates pass if desired:
+# export METHYLGRAPHER_MOJO_GIRAFFE_READY=0
 ```
 
 ## NVIDIA vs AMD bakeoff
 
 | Vendor | Device API | Toy GBZ | Notes |
 |--------|------------|---------|-------|
-| NVIDIA GH200 | `nvidia:sm_90` seed helper | PASS | CuPy optional |
-| AMD Instinct | `amdgpu:gfx942` (MI300X) / HIP host kernels | bakeoff | See `docs/ROCM_GIRAFFE_GATES.md`; set `METHYLGRAPHER_AMDGPU_ARCH` if needed |
+| NVIDIA GH200 | `nvidia:sm_90` DeviceContext | PASS | CuPy / host-nvidia fallback **refused** on stream map |
+| AMD Instinct | `amdgpu:gfx942` (MI300X) / HIP | bakeoff | See `docs/ROCM_GIRAFFE_GATES.md`; set `METHYLGRAPHER_AMDGPU_ARCH` if needed |
 
 ## Rollback
 
@@ -74,4 +83,6 @@ export METHYLGRAPHER_MOJO_GIRAFFE_READY=1   # only after Buffy ≤2h + MethylCal
 export METHYLGRAPHER_ALIGN_ENGINE=cpu_vg
 # or
 export METHYLGRAPHER_GPU_GIRAFFE_FALLBACK=vg
+# or temporarily:
+export METHYLGRAPHER_MOJO_GIRAFFE_READY=0
 ```

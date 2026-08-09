@@ -8,6 +8,19 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — Docs resync to full native-Mojo map paths
+
+**Synced docs to code:**
+- Production GBZ Align = `giraffe_stream_map` (not Python `quartet_map` hot loop).
+- Dual-graph C2T/G2A **serialized by default** on GPU/Mojo; `DUAL_GRAPH_PARALLEL=1` opt-in.
+- Linear: seeds wired into `extend_read_with_seeds`; `LINEAR_READ_BATCH` default 16384;
+  Complete gate = Mojo wall **strictly &lt; Clara** (not ±10%).
+- `GPU_REQUIRE`: empty/`1` fail-closes DeviceContext for nvidia/amd; explicit `1` blocks BWA.
+- CuPy / host-nvidia fallback refused on production stream map.
+- Updated: README, `GIRAFFE_SPEC`, `LINEAR_FQ2BAM_SPEC`, `BENCHMARK_*`.
+
+---
+
 ## 2026-08-09 — Dual-map serialize + Mojo pack/cluster + QC fail-closed
 
 **Completed:**
@@ -38,17 +51,11 @@ earlier TODOs when they conflict.
 
 ## 2026-08-09 — Docs resync after Mojo Giraffe + linear fixes
 
-**Synced docs to code:**
-- GBZ production: Mojo device gate/GPU warmup → streaming `engine.quartet_map`
-  (no full-FASTQ load in Mojo). Documented in `docs/GIRAFFE_SPEC.md` / README.
-  *(Superseded same day by native `giraffe_stream_map` above.)*
-- Linear: native Mojo index+extend; DeviceContext seed is probe/warmup;
-  automatic `bwa_fallback` on Mojo failure; `-k` in Mojo help.
-- `METHYLGRAPHER_MOJO_GIRAFFE_READY` default-on (opt-out with `0`/`false`/`off`).
-- Env table: `GPU_REQUIRE`, `GIRAFFE_DEVICE`, `MOJO_READ_BATCH`, `MODULAR_NVPTX_COMPILER_PATH`.
-- `tests/README.md`: `test_quartet_stream`, `test_gpu_minimizer_batch`,
-  `probe_devicecontext_cuda.mojo`.
-- `utility.py` help header: identity/mapq 20/0 (not 50/20).
+**Historical (superseded same day by native stream map + later docs resync):**
+- Earlier draft claimed GBZ → streaming `engine.quartet_map` and linear seed as
+  probe/warmup only — both false after `giraffe_stream_map` + `extend_read_with_seeds`.
+- Still accurate from this entry: READY default-on; env knobs; test inventory;
+  identity/mapq 20/0 help header.
 
 ---
 
@@ -71,8 +78,9 @@ earlier TODOs when they conflict.
 - Spec / gates: `docs/LINEAR_FQ2BAM_SPEC.md`, `docs/BENCHMARK_FQ2BAM_METH.md`.
 
 **Operator gates (block Complete):**
-- NVIDIA subset wall ≤ Clara `pbrun fq2bam_meth` (±10%).
+- NVIDIA subset wall **strictly &lt; Clara** `pbrun fq2bam_meth` (same sample/SKU).
 - AMD MI300X twin competitive with NVIDIA Mojo and ≫ BWA CPU.
+  *(±10% wording from early draft superseded.)*
 
 ---
 
@@ -94,7 +102,8 @@ earlier TODOs when they conflict.
 - Spec + golden fixture: `docs/GIRAFFE_SPEC.md`, `tests/data/giraffe_fixture/`.
 - Native modules `src/giraffe_*.mojo` + `MojoGiraffe` CLI (GFA→GAF, PE tags).
 - Portable GPU seed via `giraffe_device` + `scripts/giraffe_gpu_minimizer.py`
-  (targets `nvidia:sm_90` / `amdgpu`; CuPy optional on GH200).
+  (targets `nvidia:sm_90` / `amdgpu`; CuPy was optional then — production
+  stream map later DeviceContext-only).
 - `engine/align_backends.py` — `cpu_vg` | `gpu_giraffe` | `mojo_giraffe`;
   `gpu_giraffe` defaults to prefer Mojo (`FALLBACK=mojo`) with auto-vg for
   oversized/GBZ-only indexes.

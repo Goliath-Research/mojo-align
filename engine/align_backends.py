@@ -251,8 +251,8 @@ def resolve_map_command(
         bin_path = resolve_mojo_giraffe_bin()
         if not bin_path or not quartet or not fq1:
             return None
-        # Production cutover gate: require explicit READY so Buffy stays on vg
-        # until min/zip/dist + dense pack parity + wall-clock gates pass.
+        # READY defaults on (METHYLGRAPHER_MOJO_GIRAFFE_READY=1). Opt out with
+        # 0/false/off to force vg while Buffy wall / DS20M gates are pending.
         if not mojo_giraffe_ready():
             return None
         gbz_path = quartet["gbz"]
