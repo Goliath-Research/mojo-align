@@ -41,6 +41,16 @@ def locate_batch_hits(
     return locate_batch_hits_native("cpu", min_path, seqs, hit_cap)
 
 
+def locate_occs_label(backend: String) raises -> String:
+    var label = backend + "+mojo_min_mmap+mojo_pack+mojo_cluster+mojo_stream"
+    var os_mod = Python.import_module("os")
+    var prev = String(os_mod.environ.get("METHYLGRAPHER_LAST_SEED_BACKEND", ""))
+    os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = label
+    if prev != label:
+        print("mojo_stream seed_backend=", label, flush=True)
+    return label
+
+
 def locate_batch_hits_native(
     device: String,
     min_path: String,
@@ -59,11 +69,7 @@ def locate_batch_hits_native(
     var backend = result.backend.copy()
     var out = idx.locate_occs_batch(result.occs, hit_cap)
     idx.close()
-
-    var os_mod = Python.import_module("os")
-    var label = backend + "+mojo_min_mmap+mojo_pack+mojo_cluster+mojo_stream"
-    os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = label
-    print("mojo_stream seed_backend=", label)
+    _ = locate_occs_label(backend)
     return out^
 
 
@@ -73,16 +79,18 @@ def locate_batch_hits_with_index(
     seqs: List[String],
     hit_cap: Int = 24,
 ) raises -> List[List[String]]:
-    """Same as native locate but reuses an already-open ``MojoMinIndex``."""
+    """Same as native locate but reuses an already-open ``MojoMinIndex``.
+
+    Prefer ``map_fastq_stream_to_gaf`` GPU session (one DeviceContext for the
+    whole FASTQ). This entry still constructs a DeviceContext per call — fine
+    for smokes / tiny batches, not for production multi-GB FASTQs.
+    """
     if len(seqs) == 0:
         return List[List[String]]()
     var result = minimizers_batch(device, seqs, idx.k, idx.w)
     var backend = result.backend.copy()
     var out = idx.locate_occs_batch(result.occs, hit_cap)
-    var os_mod = Python.import_module("os")
-    var label = backend + "+mojo_min_mmap+mojo_pack+mojo_cluster+mojo_stream"
-    os_mod.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = label
-    print("mojo_stream seed_backend=", label)
+    _ = locate_occs_label(backend)
     return out^
 
 

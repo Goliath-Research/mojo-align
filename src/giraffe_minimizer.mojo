@@ -229,18 +229,23 @@ def minimizers_batch_devicecontext(
     var resolved = device.lower()
     var backend = probe_device_context(resolved)
     var target = kernel_target_label(resolved)
-    print(
-        "mojo_min DeviceContext device=",
-        resolved,
-        " target=",
-        target,
-        " backend=",
-        backend,
-        " k=",
-        k,
-        " w=",
-        w,
-    )
+    var os_mod = Python.import_module("os")
+    var banner_key = "METHYLGRAPHER_MOJO_MIN_BANNER"
+    if String(os_mod.environ.get(banner_key, "")) != backend:
+        os_mod.environ[banner_key] = backend
+        print(
+            "mojo_min DeviceContext device=",
+            resolved,
+            " target=",
+            target,
+            " backend=",
+            backend,
+            " k=",
+            k,
+            " w=",
+            w,
+            flush=True,
+        )
 
     comptime if has_accelerator():
         from std.gpu import block_dim, block_idx, thread_idx

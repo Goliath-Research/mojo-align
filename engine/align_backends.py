@@ -163,6 +163,7 @@ def build_mojo_giraffe_gfa_cmd(
     fq2: Optional[str],
     device: Optional[str] = None,
     k: Optional[int] = None,
+    out_gaf: Optional[str] = None,
 ) -> str:
     if not fq1:
         raise RuntimeError("MojoGiraffe requires fq1")
@@ -173,7 +174,15 @@ def build_mojo_giraffe_gfa_cmd(
     elif os.environ.get("METHYLGRAPHER_GIRAFFE_K", "").strip():
         k_arg = f" -k {os.environ['METHYLGRAPHER_GIRAFFE_K'].strip()}"
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
-    # Stream GAF on caller stdout via fd3; Mojo prints → stderr (no temp+cat).
+    # Prefer a real GAF path: Align's fd3/pipe + underscore-shard router drops
+    # Illumina qnames from MojoGiraffe. File + stderr logs is the production path.
+    out = (out_gaf or "").strip()
+    if out:
+        return (
+            "set -euo pipefail; "
+            f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
+            f'-out_gaf "{out}" -device "{dev}"{k_arg} 1>&2'
+        )
     return (
         "set -euo pipefail; "
         f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
@@ -196,6 +205,7 @@ def build_mojo_giraffe_gbz_cmd(
     fq2: Optional[str],
     device: Optional[str] = None,
     k: Optional[int] = None,
+    out_gaf: Optional[str] = None,
 ) -> str:
     if not fq1:
         raise RuntimeError("MojoGiraffe GBZ mode requires fq1")
@@ -207,7 +217,14 @@ def build_mojo_giraffe_gbz_cmd(
         k_arg = f" -k {os.environ['METHYLGRAPHER_GIRAFFE_K'].strip()}"
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
     zip_arg = f' -zipcodes "{zipcodes}"' if zipcodes else ""
-    # Stream GAF on caller stdout via fd3; Mojo prints → stderr (no temp+cat).
+    out = (out_gaf or "").strip()
+    if out:
+        return (
+            "set -euo pipefail; "
+            f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
+            f"{zip_arg} -fq1 \"{fq1}\"{fq2_arg} "
+            f'-out_gaf "{out}" -device "{dev}"{k_arg} 1>&2'
+        )
     return (
         "set -euo pipefail; "
         f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
@@ -226,6 +243,7 @@ def resolve_map_command(
     giraffe_input: str,
     index_prefix: Optional[str] = None,
     gfa_path: Optional[str] = None,
+    out_gaf: Optional[str] = None,
 ) -> tuple[str, str]:
     """Return ``(engine_used, shell_command)`` for one dual-graph map invocation."""
     engine = normalize_align_engine(align_engine)
@@ -283,6 +301,7 @@ def resolve_map_command(
             zipcodes=quartet.get("zipcodes") or "",
             fq1=fq1,
             fq2=fq2,
+            out_gaf=out_gaf,
         )
         return f"{label}+mojo_gbz", note + cmd
 
@@ -302,6 +321,7 @@ def resolve_map_command(
             gfa_path=gfa,
             fq1=fq1,
             fq2=fq2,
+            out_gaf=out_gaf,
         )
         return f"{label}+mojo_gfa", note + cmd
 

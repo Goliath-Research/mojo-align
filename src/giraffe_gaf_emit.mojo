@@ -46,11 +46,12 @@ def write_gaf(path: String, hits: List[AlignmentHit]) raises:
 
 def open_gaf_write(path: String) raises -> PythonObject:
     """Open GAF for streaming append (Buffy-scale; never buffer whole file)."""
-    var os_mod = Python.import_module("os")
     var pathlib = Python.import_module("pathlib")
-    var parent = pathlib.Path(path).parent
-    parent.mkdir(parents=True, exist_ok=True)
     var builtins = Python.import_module("builtins")
+    # /dev/fd/N (legacy pipe path) must not mkdir parents.
+    if not path.startswith("/dev/"):
+        var parent = pathlib.Path(path).parent
+        parent.mkdir(parents=True, exist_ok=True)
     return builtins.open(path, "w")
 
 

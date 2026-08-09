@@ -80,16 +80,28 @@ def alignment(
         read1_alignment_type = conversion_types
         read2_alignment_type = conversion_types
 
+    from .align_backends import normalize_align_engine
+
+    mojo_direct = normalize_align_engine(align_engine) in {
+        "mojo_giraffe",
+        "gpu_giraffe",
+        "mojo",
+    }
+    # MojoGiraffe emits Illumina qnames (no underscore shard index). The classic
+    # 1000-way shard router silently drops every line — write alignment.gaf directly.
     alignment_file_path = []
     alignment_outs = {}
-    for i in range(tmp_alignment_file_count):
-        alignment_out = f"{work_dir}/alignment.{i}.{output_format}"
-        alignment_file_path.append(alignment_out)
-
-        fh = open(alignment_out, "w")
-        alignment_outs[i] = fh
+    if not mojo_direct:
+        for i in range(tmp_alignment_file_count):
+            alignment_out = f"{work_dir}/alignment.{i}.{output_format}"
+            alignment_file_path.append(alignment_out)
+            fh = open(alignment_out, "w")
+            alignment_outs[i] = fh
 
     shard_lock = threading.Lock()
+    final_gaf = os.path.join(work_dir, "alignment.gaf")
+    if mojo_direct and os.path.exists(final_gaf):
+        os.remove(final_gaf)
 
     def _run_one_map(ref_type, read_type1, read_type2):
         print(f"Aligning R1({read_type1}) & R2({read_type2}) on reference({ref_type})")
@@ -109,6 +121,10 @@ def alignment(
 
         alignment_log = (
             f"{work_dir}/alignment.Ref_{ref_type}.R1_{read_type1}.R2_{read_type2}.log"
+        )
+        mojo_out_gaf = os.path.join(
+            work_dir,
+            f"alignment.mojo.Ref_{ref_type}.R1_{read_type1}.R2_{read_type2}.gaf",
         )
 
         dist_fp = f"{job_index_prefix}.dist"
@@ -139,6 +155,7 @@ def alignment(
             index_params=index_params,
             giraffe_input=giraffe_input,
             index_prefix=job_index_prefix,
+            out_gaf=mojo_out_gaf if mojo_direct else None,
         )
         print(f"Align map backend: {engine_used} ref={ref_type}")
         with open(alignment_log, "w") as alignment_log_fh:
@@ -154,6 +171,36 @@ def alignment(
 
             cmd_run = "bash -lc " + shlex.quote(cmd_run)
         se = utility.SystemExecute()
+
+        if mojo_direct or "MojoGiraffe" in cmd_run:
+            # File-backed GAF; Mojo logs on stderr. Do not use underscore shard router.
+            fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
+            # Drain stdout (usually empty when out_gaf is a file).
+            if fout is not None:
+                for _ in fout:
+                    pass
+            codes = se.wait()
+            if any(rc != 0 for rc in codes):
+                raise RuntimeError(
+                    f"Align map command failed (exit {codes}) backend={engine_used}; "
+                    f"see {alignment_log}"
+                )
+            if not os.path.isfile(mojo_out_gaf) or os.path.getsize(mojo_out_gaf) == 0:
+                raise RuntimeError(
+                    f"MojoGiraffe produced empty GAF {mojo_out_gaf}; see {alignment_log}"
+                )
+            with shard_lock:
+                with open(mojo_out_gaf, "r", encoding="utf-8") as src, open(
+                    final_gaf, "a", encoding="utf-8"
+                ) as dst:
+                    for line in src:
+                        dst.write(line if line.endswith("\n") else line + "\n")
+            print(
+                f"Mojo GAF appended → {final_gaf} "
+                f"(+{os.path.getsize(mojo_out_gaf)} bytes from {mojo_out_gaf})"
+            )
+            return ref_type, engine_used
+
         fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
         for line in fout:
             line = line.decode("utf-8")
@@ -230,14 +277,6 @@ def alignment(
 
     for fh in alignment_outs.values():
         fh.close()
-
-    # Not needed any more
-    # for fn in alignment_file_path:
-    # cmd = f"sort -o {fn} {fn}"
-
-    # se = utility.SystemExecute()
-    # fout, flog = se.execute(cmd, stdout=None, stderr=None)
-    # se.wait()
 
     return
 
@@ -461,6 +500,8 @@ def alignment_main(
                             directional=directional,
                             split_num=tmp_alignment_file_count)
 
+    from .align_backends import normalize_align_engine
+
     alignment(work_dir=work_dir,
               index_prefix=index_prefix,
               output_format="gaf",
@@ -470,10 +511,11 @@ def alignment_main(
               vg_path=vg_path,
               align_engine=align_engine)
 
-    alignment_merge_main(work_dir, worker_num=thread)
-
-    # Just to wait a bit for alignment_merge_main to finish and garbage collection
-    time.sleep(5)
+    # Mojo path already wrote work_dir/alignment.gaf; classic merge expects
+    # underscore-encoded shard qnames and would wipe/empty the Mojo GAF.
+    if normalize_align_engine(align_engine) not in {"mojo_giraffe", "gpu_giraffe", "mojo"}:
+        alignment_merge_main(work_dir, worker_num=thread)
+        time.sleep(5)
 
     alignment_clenup(work_dir)
 
