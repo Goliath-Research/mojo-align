@@ -5,7 +5,7 @@ from std.python import Python
 
 from giraffe_device import extract_kmers_batch, require_device_or_raise, select_device
 from giraffe_dist import cluster_seed_hits
-from giraffe_extend import AlignmentHit, gapless_extend_seeds
+from giraffe_extend import gapless_extend_seeds
 from giraffe_gaf_emit import write_gaf
 from giraffe_gpu_kernels import kernel_target_label, probe_device_context
 from giraffe_minzip import locate_read_hits

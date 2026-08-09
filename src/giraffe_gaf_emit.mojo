@@ -2,7 +2,7 @@
 
 from std.collections import List
 
-from giraffe_extend import AlignmentHit
+from giraffe_hit import AlignmentHit
 from utility import write_text_file
 
 

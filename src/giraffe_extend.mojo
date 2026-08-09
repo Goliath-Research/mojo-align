@@ -3,33 +3,12 @@
 from std.collections import Dict, List
 from std.python import Python
 
+from giraffe_gapless import gapless_extend_native
+from giraffe_hit import AlignmentHit
 from giraffe_index import GraphIndex
 from giraffe_seed import seed_hits
 
-
-struct AlignmentHit(Copyable, Movable):
-    var query_name: String
-    var path: String
-    var qlen: Int
-    var mapq: Int
-    var cs_tag: String
-    var extra_tags: String
-
-    def __init__(
-        out self,
-        query_name: String,
-        path: String,
-        qlen: Int,
-        mapq: Int,
-        cs_tag: String,
-        extra_tags: String = "",
-    ):
-        self.query_name = query_name
-        self.path = path
-        self.qlen = qlen
-        self.mapq = mapq
-        self.cs_tag = cs_tag
-        self.extra_tags = extra_tags
+# Re-export for existing `from giraffe_extend import AlignmentHit` call sites.
 
 
 def extend_exact(index: GraphIndex, query_name: String, seq: String) raises -> List[AlignmentHit]:
@@ -97,7 +76,16 @@ def gapless_extend_seeds(
     seq: String,
     seeds: List[String],
 ) raises -> List[AlignmentHit]:
-    """Gapless extend from dense pack using ``node:orient:offset`` seeds."""
+    """Gapless extend from dense pack using ``node:orient:offset`` seeds.
+
+    Prefers native Mojo ``giraffe_gapless``; falls back to Python
+    ``engine.quartet_map._gapless_extend`` only if native path raises.
+    """
+    try:
+        return gapless_extend_native(pack_dir, query_name, seq, seeds)
+    except e:
+        print("native gapless unavailable; Python fallback: ", e)
+
     var os_mod = Python.import_module("os")
     var sys_mod = Python.import_module("sys")
     sys_mod.path.insert(0, String(os_mod.getcwd()))
@@ -121,6 +109,8 @@ def gapless_extend_seeds(
         var path = String(ext[0])
         var mq = Int(py=ext[1])
         var cs = String(ext[2])
+        if not path.startswith(">"):
+            path = ">" + path
         out.append(AlignmentHit(query_name, path, qlen, mq, cs))
         if len(out) >= 2:
             break

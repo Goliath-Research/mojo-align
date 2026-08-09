@@ -173,13 +173,11 @@ def build_mojo_giraffe_gfa_cmd(
     elif os.environ.get("METHYLGRAPHER_GIRAFFE_K", "").strip():
         k_arg = f" -k {os.environ['METHYLGRAPHER_GIRAFFE_K'].strip()}"
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
-    # Status prints from MojoGiraffe must not mix into GAF stdout (Align shards GAF).
+    # Stream GAF on caller stdout via fd3; Mojo prints → stderr (no temp+cat).
     return (
         "set -euo pipefail; "
-        'tmp="$(mktemp -t mojo_giraffe.XXXXXX.gaf)"; '
         f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
-        f'-out_gaf "$tmp" -device "{dev}"{k_arg} >&2; '
-        'cat "$tmp"; rm -f "$tmp"'
+        f'-out_gaf /dev/fd/3 -device "{dev}"{k_arg} 3>&1 1>&2'
     )
 
 
@@ -209,13 +207,12 @@ def build_mojo_giraffe_gbz_cmd(
         k_arg = f" -k {os.environ['METHYLGRAPHER_GIRAFFE_K'].strip()}"
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
     zip_arg = f' -zipcodes "{zipcodes}"' if zipcodes else ""
+    # Stream GAF on caller stdout via fd3; Mojo prints → stderr (no temp+cat).
     return (
         "set -euo pipefail; "
-        'tmp="$(mktemp -t mojo_giraffe.XXXXXX.gaf)"; '
         f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
         f"{zip_arg} -fq1 \"{fq1}\"{fq2_arg} "
-        f'-out_gaf "$tmp" -device "{dev}"{k_arg} >&2; '
-        'cat "$tmp"; rm -f "$tmp"'
+        f'-out_gaf /dev/fd/3 -device "{dev}"{k_arg} 3>&1 1>&2'
     )
 
 

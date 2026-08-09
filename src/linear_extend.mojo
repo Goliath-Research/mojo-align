@@ -61,32 +61,16 @@ def _find_substr(hay: String, needle: String) raises -> Int:
     return -1
 
 
-def extend_read(index: LinearIndex, name: String, seq: String) raises -> LinearHit:
-    """Map one read: exact substring, else k-mer vote + gapless verify."""
+def _vote_and_verify(
+    index: LinearIndex,
+    name: String,
+    seq: String,
+    hits: List[String],
+) raises -> LinearHit:
+    """K-mer majority vote → gapless verify."""
     var qlen = seq.byte_length()
-    var unmapped = LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
-
-    # Exact forward match.
-    for c in index.contigs:
-        var off = _find_substr(c.seq, seq)
-        if off >= 0:
-            return LinearHit(
-                name, 0, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
-            )
-
-    # Exact reverse-complement match.
-    var rc = reverse_complement(seq)
-    for c in index.contigs:
-        var off = _find_substr(c.seq, rc)
-        if off >= 0:
-            return LinearHit(
-                name, 16, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
-            )
-
-    # K-mer majority vote → candidate (contig, offset - mer_index).
-    var hits = seed_hits(index, seq)
     if len(hits) == 0:
-        return unmapped^
+        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
     var counts = Dict[String, Int]()
     for h in hits:
@@ -111,14 +95,13 @@ def extend_read(index: LinearIndex, name: String, seq: String) raises -> LinearH
             best_key = key.copy()
 
     if best_n <= 0 or best_key.byte_length() == 0:
-        return unmapped^
+        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
     var bp = best_key.split(":")
     if len(bp) < 2:
-        return unmapped^
+        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
     var contig = String(bp[0])
     var seed_off = Int(String(bp[1]))
-    # Gapless verify: compare read to contig[seed_off : seed_off+qlen]
     for c in index.contigs:
         if c.name != contig:
             continue
@@ -134,7 +117,49 @@ def extend_read(index: LinearIndex, name: String, seq: String) raises -> LinearH
             return LinearHit(
                 name, 0, contig, seed_off + 1, mq, String(qlen) + "M", seq, "*"
             )
-    return unmapped^
+    return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
+
+
+def extend_read_with_seeds(
+    index: LinearIndex,
+    name: String,
+    seq: String,
+    seed_kmers: List[String],
+) raises -> LinearHit:
+    """Map using GPU/host seed k-mers (wired into hash locate + extend)."""
+    var qlen = seq.byte_length()
+    var unmapped = LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+
+    for c in index.contigs:
+        var off = _find_substr(c.seq, seq)
+        if off >= 0:
+            return LinearHit(
+                name, 0, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
+            )
+
+    var rc = reverse_complement(seq)
+    for c in index.contigs:
+        var off = _find_substr(c.seq, rc)
+        if off >= 0:
+            return LinearHit(
+                name, 16, c.name, off + 1, 60, String(qlen) + "M", seq, "*"
+            )
+
+    var hits = List[String]()
+    if len(seed_kmers) > 0:
+        for mer in seed_kmers:
+            var found = index.lookup_kmer(mer)
+            for h in found:
+                hits.append(h.copy())
+    else:
+        hits = seed_hits(index, seq)
+    return _vote_and_verify(index, name, seq, hits)
+
+
+def extend_read(index: LinearIndex, name: String, seq: String) raises -> LinearHit:
+    """Map one read: exact substring, else k-mer vote + gapless verify."""
+    var empty = List[String]()
+    return extend_read_with_seeds(index, name, seq, empty)
 
 
 struct PairedHits(Copyable, Movable):

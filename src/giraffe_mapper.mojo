@@ -4,7 +4,8 @@ from std.collections import List
 from std.python import Python
 
 from giraffe_device import extract_kmers_batch, require_device_or_raise
-from giraffe_extend import AlignmentHit, extend_exact
+from giraffe_extend import extend_exact
+from giraffe_hit import AlignmentHit
 from giraffe_gaf_emit import write_gaf
 from giraffe_gbz import map_gbz_via_helper
 from giraffe_gpu_kernels import kernel_target_label

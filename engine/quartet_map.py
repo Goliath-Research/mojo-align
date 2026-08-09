@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ from engine.segment_pack import (
     build_dense_pack_from_gbz,
     resolve_pack,
 )
+from engine.stage_timer import StageTimer
 from engine.zipcodes_index import DistIndex, ZipcodesIndex
 
 # Bound peak RAM on Buffy-scale FASTQs (hundreds of GB uncompressed).
@@ -180,6 +182,38 @@ def _gapless_extend(
             continue
         mq = 40 if len(cand) >= 29 else 20
         return f">{node_id}", mq, f"cs:Z::{len(cand)}"
+
+    # Multi-node heuristic for chopped graphs: try neighboring node ids when
+    # the seed node is shorter than the read (common on HPRC d9-bs).
+    if len(ref) < len(q) and len(pack) <= 50_000_000:
+        path_parts = [f">{node_id}"]
+        covered = best[0] if best else 0
+        qi = covered if isinstance(covered, int) else 0
+        # Prefer forward neighbor ids in the dense pack.
+        for nxt in (node_id + 1, node_id - 1, node_id + 2):
+            if nxt == node_id or nxt < 0:
+                continue
+            nseg = pack.get(str(nxt))
+            if not nseg:
+                continue
+            nref = nseg.upper()
+            if is_rev:
+                nref = nref.translate(comp)[::-1]
+            rem = q[qi:]
+            if not rem:
+                break
+            matched = 0
+            for a, b in zip(rem, nref):
+                if a != b:
+                    break
+                matched += 1
+            if matched < 15:
+                continue
+            path_parts.append(f">{nxt}")
+            qi += matched
+            if qi >= int(0.9 * len(q)):
+                mq = 50 if qi >= len(q) else 35
+                return "".join(path_parts), mq, f"cs:Z::{qi}"
     return None
 
 
@@ -269,15 +303,41 @@ def _seed_batch_hits(
 ) -> Tuple[List[List[MinHit]], str]:
     """GPU (CuPy) or CPU minimizer seed → per-read MinHit lists.
 
-    Prefer the system-Python ``gpu_seed_worker.py`` subprocess so CuPy from the
-    image (``pip3 install cupy-cuda12x``) is used even when Mojo sets
-    ``PYTHONHOME`` to the trimmed pixi env.
+    Prefer **in-process** ``giraffe_gpu_minimizer.minimizers_batch_gpu`` (no JSON
+    IPC). Fall back to ``gpu_seed_worker.py`` when Mojo PYTHONHOME blocks CuPy,
+    then to host ``locate_read``.
     """
     if min_index is None or min_index.n_keys == 0 or not seqs:
         return [[] for _ in seqs], "no-index"
     dev = (device or "cpu").strip().lower() or "cpu"
     backend = "cpu"
     if dev in {"nvidia", "cuda", "amd", "hip", "rocm"}:
+        # 1) In-process CuPy / host minimizer (no subprocess JSON).
+        try:
+            import sys
+            from engine.minimizer_index import MinimizerOcc
+
+            scripts = Path(__file__).resolve().parents[1] / "scripts"
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            from giraffe_gpu_minimizer import minimizers_batch_gpu  # type: ignore
+
+            occs_batch, backend = minimizers_batch_gpu(
+                seqs, k=int(min_index.k), w=int(min_index.w), device=dev
+            )
+            hits = [
+                min_index.locate_from_minimizers(list(occs), hit_cap=24)
+                for occs in occs_batch
+            ]
+            if len(hits) != len(seqs):
+                raise RuntimeError(
+                    f"in-process GPU seed returned {len(hits)} rows for {len(seqs)} seqs"
+                )
+            print(f"quartet_map seed_backend={backend}+inprocess", flush=True)
+            return hits, backend + "+inprocess"
+        except Exception as exc_in:
+            print(f"in-process GPU seed unavailable ({exc_in}); try worker", flush=True)
+        # 2) System-python worker (CuPy outside Mojo PYTHONHOME).
         try:
             import json
             import subprocess
@@ -292,16 +352,10 @@ def _seed_batch_hits(
                 "w": int(min_index.w),
                 "device": dev,
             }
-            # Clear Mojo PYTHONHOME so system python3 can import cupy/encodings.
             env = {
                 k: v
                 for k, v in os.environ.items()
-                if k
-                not in {
-                    "PYTHONHOME",
-                    "PYTHONPATH",
-                    "LD_PRELOAD",
-                }
+                if k not in {"PYTHONHOME", "PYTHONPATH", "LD_PRELOAD"}
             }
             env["PYTHONPATH"] = "/opt/methylgrapher-mojo/scripts:/opt/methylgrapher-mojo"
             proc = subprocess.run(
@@ -329,15 +383,13 @@ def _seed_batch_hits(
                     )
                     for o in occs_raw
                 ]
-                hits.append(
-                    min_index.locate_from_minimizers(occs, hit_cap=24)
-                )
+                hits.append(min_index.locate_from_minimizers(occs, hit_cap=24))
             if len(hits) != len(seqs):
                 raise RuntimeError(
                     f"gpu_seed_worker returned {len(hits)} rows for {len(seqs)} seqs"
                 )
-            print(f"quartet_map seed_backend={backend}", flush=True)
-            return hits, backend
+            print(f"quartet_map seed_backend={backend}+worker", flush=True)
+            return hits, backend + "+worker"
         except Exception as exc:
             print(f"GPU minimizer seed unavailable ({exc}); CPU locate", flush=True)
             backend = "host-locate-fallback"
@@ -462,31 +514,39 @@ def map_fastq_to_gaf(
     n_written = 0
     batch_size = _read_batch_size()
     seed_backend = "unset"
+    timer = StageTimer.from_env()
+    workers_raw = os.environ.get("METHYLGRAPHER_MOJO_EXTEND_WORKERS", "4").strip()
+    try:
+        extend_workers = max(1, int(workers_raw))
+    except ValueError:
+        extend_workers = 4
     print(
-        f"quartet_map device={dev} batch={batch_size} "
+        f"quartet_map device={dev} batch={batch_size} extend_workers={extend_workers} "
         f"mojo_backend={os.environ.get('METHYLGRAPHER_LAST_GPU_BACKEND', '')}",
         flush=True,
     )
     try:
         with open(out_gaf, "w", encoding="utf-8") as fh:
             for batch in _iter_fastq_batches(fq1, fq2, batch_size=batch_size):
-                # Flatten batch for GPU seed, then map with precomputed hits.
-                flat_seqs: List[str] = []
-                for r1, r2 in batch:
-                    _n1, s1 = r1
-                    flat_seqs.append(s1)
-                    if r2 is not None:
-                        _n2, s2 = r2
-                        flat_seqs.append(s2)
-                seed_hits, seed_backend = _seed_batch_hits(
-                    min_index=min_index, seqs=flat_seqs, device=dev
-                )
+                with timer.stage("fastq_batch"):
+                    flat_seqs: List[str] = []
+                    for r1, r2 in batch:
+                        _n1, s1 = r1
+                        flat_seqs.append(s1)
+                        if r2 is not None:
+                            _n2, s2 = r2
+                            flat_seqs.append(s2)
+                with timer.stage("seed_locate"):
+                    seed_hits, seed_backend = _seed_batch_hits(
+                        min_index=min_index, seqs=flat_seqs, device=dev
+                    )
                 os.environ["METHYLGRAPHER_LAST_SEED_BACKEND"] = seed_backend
-                si = 0
-                for r1, r2 in batch:
+
+                def _map_pair(item):
+                    (r1, r2), si_local = item
                     n1, s1 = r1
                     if r2 is None:
-                        for h in map_one_read(
+                        hits = map_one_read(
                             pack=pack,
                             min_index=min_index,
                             zipcodes=zip_index,
@@ -494,16 +554,9 @@ def map_fastq_to_gaf(
                             qname=n1,
                             seq=s1,
                             k_fallback=k,
-                            seeds=seed_hits[si],
-                        ):
-                            n_records += 1
-                            if h["path"] == "*":
-                                continue
-                            fh.write(format_gaf_line(h) + "\n")
-                            n_written += 1
-                        si += 1
-                        continue
-
+                            seeds=seed_hits[si_local],
+                        )
+                        return 1, hits
                     n2, s2 = r2
                     h1s = map_one_read(
                         pack=pack,
@@ -513,7 +566,7 @@ def map_fastq_to_gaf(
                         qname=n1,
                         seq=s1,
                         k_fallback=k,
-                        seeds=seed_hits[si],
+                        seeds=seed_hits[si_local],
                     )
                     h2s = map_one_read(
                         pack=pack,
@@ -523,9 +576,8 @@ def map_fastq_to_gaf(
                         qname=n2,
                         seq=s2,
                         k_fallback=k,
-                        seeds=seed_hits[si + 1],
+                        seeds=seed_hits[si_local + 1],
                     )
-                    si += 2
                     h1 = h1s[0] if h1s else {
                         "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
                         "cs_tag": "cs:Z:*", "extra_tags": "",
@@ -536,18 +588,36 @@ def map_fastq_to_gaf(
                     }
                     h1["extra_tags"] = f"ri:i:1\tos:Z:{s1}\trc:Z:CT"
                     h2["extra_tags"] = f"ri:i:2\tos:Z:{s2}\trc:Z:GA"
-                    n_records += 2
-                    for h in (h1, h2):
-                        if h["path"] == "*":
-                            continue
-                        fh.write(format_gaf_line(h) + "\n")
-                        n_written += 1
+                    return 2, [h1, h2]
+
+                work = []
+                si = 0
+                for r1, r2 in batch:
+                    work.append(((r1, r2), si))
+                    si += 1 if r2 is None else 2
+
+                with timer.stage("cluster_extend"):
+                    if extend_workers <= 1 or len(work) < 8:
+                        mapped = [_map_pair(w) for w in work]
+                    else:
+                        with ThreadPoolExecutor(max_workers=extend_workers) as pool:
+                            mapped = list(pool.map(_map_pair, work))
+
+                with timer.stage("gaf_emit"):
+                    for n_rec, hits in mapped:
+                        n_records += n_rec
+                        for h in hits:
+                            if h["path"] == "*":
+                                continue
+                            fh.write(format_gaf_line(h) + "\n")
+                            n_written += 1
                 fh.flush()
     finally:
         if min_index is not None:
             min_index.close()
         if zip_index is not None:
             zip_index.close()
+        timer.write()
 
     # Return mapped+unmapped record count (PE = 2 per pair) for CLI parity.
     _ = n_written

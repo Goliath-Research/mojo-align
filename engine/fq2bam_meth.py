@@ -193,9 +193,19 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _gpu_require() -> bool:
+    raw = os.environ.get("METHYLGRAPHER_GPU_REQUIRE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def resolve_linear_mapper(device: str) -> str:
     """Return ``mojo`` or ``bwa`` based on env + device availability."""
     raw = os.environ.get("METHYLGRAPHER_LINEAR_MAPPER", "").strip().lower()
+    if _gpu_require() and raw in {"bwa"}:
+        raise RuntimeError(
+            "METHYLGRAPHER_GPU_REQUIRE=1 forbids LINEAR_MAPPER=bwa "
+            "(bakeoff fail-closed)"
+        )
     if raw in {"mojo", "bwa"}:
         return raw
     if raw in {"auto", ""}:
@@ -377,6 +387,11 @@ def run_mojo_fq2bam_meth(
                 log,
             )
         except Exception as exc:
+            if _gpu_require():
+                raise RuntimeError(
+                    f"Mojo linear mapper failed under METHYLGRAPHER_GPU_REQUIRE=1 "
+                    f"(no BWA fallback): {exc}"
+                ) from exc
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(f"mojo_linear_failed={exc}; falling back to bwa\n")
             bwa = shutil.which("bwa")

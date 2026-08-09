@@ -7,14 +7,25 @@ Science contract: directional PE → BAM + QC. See [`LINEAR_FQ2BAM_SPEC.md`](LIN
 ```bash
 scripts/run_toy_fq2bam_meth.sh python cpu
 scripts/benchmark_fq2bam_meth.sh
+# Clara ±10% bakeoff (fail-closed GPU):
+scripts/benchmark_clara_fq2bam_meth.sh [R1] [R2] [REF] nvidia
 ```
 
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|
-| Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | native index + extend; exact-match PE |
-| Mojo linear | `nvidia:sm_90` | PASS (toy) / operator (subset) | DeviceContext warmup; host-fallback if driver &lt;580 |
+| Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | streaming batches + hash postings; seeds→extend |
+| Mojo linear | `nvidia:sm_90` | PASS (toy) / operator (subset) | GPU seeds wired; `GPU_REQUIRE=1` bakeoff |
 | Mojo linear | `amdgpu:gfx942` | operator | ROCm image `1.70-mojo-rocm` |
-| BWA-MEM | CPU | PASS | `METHYLGRAPHER_LINEAR_MAPPER=bwa` or automatic `bwa_fallback` |
+| BWA-MEM | CPU | PASS | `LINEAR_MAPPER=bwa` only; **blocked** when `GPU_REQUIRE=1` |
+
+## Clara baseline (B0)
+
+Harness: [`scripts/benchmark_clara_fq2bam_meth.sh`](../scripts/benchmark_clara_fq2bam_meth.sh).
+
+| Run | Wall | Status |
+|-----|------|--------|
+| Mojo toy (`GPU_REQUIRE=1`, nvidia) | ~1.8 s | recorded locally |
+| Clara `pbrun fq2bam_meth` | — | **PENDING** (`pbrun` not on this host; operator on NGC/GH200) |
 
 ## Production gates (operator)
 
@@ -30,6 +41,7 @@ Default `METHYLGRAPHER_LINEAR_MAPPER` is already `mojo`; operator gates decide w
 Record operator runs:
 
 ```bash
+scripts/benchmark_clara_fq2bam_meth.sh /path/to/R1.fastq.gz /path/to/R2.fastq.gz /path/to/ref.fa nvidia
 scripts/benchmark_fq2bam_meth.sh /path/to/R1.fastq.gz /path/to/R2.fastq.gz /path/to/ref.fa
 ```
 

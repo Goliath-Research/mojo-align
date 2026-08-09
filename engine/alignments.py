@@ -65,6 +65,9 @@ def alignment(
     vg_path="vg",
     align_engine=None,
 ):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     from .align_backends import resolve_map_command
 
     index_prefix_ct = index_prefix + ".wl.C2T"
@@ -86,124 +89,131 @@ def alignment(
         fh = open(alignment_out, "w")
         alignment_outs[i] = fh
 
+    shard_lock = threading.Lock()
+
+    def _run_one_map(ref_type, read_type1, read_type2):
+        print(f"Aligning R1({read_type1}) & R2({read_type2}) on reference({ref_type})")
+
+        fq1 = f"{work_dir}/{read_type1}.R1.fastq"
+        fq2 = f"{work_dir}/{read_type2}.R2.fastq"
+
+        if compress:
+            fq1 += ".gz"
+            fq2 += ".gz"
+
+        job_index_prefix = index_prefix_ga if ref_type == "G2A" else index_prefix_ct
+
+        giraffe_input = f"-f {fq1}"
+        if os.path.exists(fq2):
+            giraffe_input += f" -f {fq2}"
+
+        alignment_log = (
+            f"{work_dir}/alignment.Ref_{ref_type}.R1_{read_type1}.R2_{read_type2}.log"
+        )
+
+        dist_fp = f"{job_index_prefix}.dist"
+        gbz_fp = f"{job_index_prefix}.giraffe.gbz"
+
+        min1_fp = f"{job_index_prefix}.min"
+        min2_fp = f"{job_index_prefix}.shortread.withzip.min"
+        zipcode_fp = f"{job_index_prefix}.shortread.zipcodes"
+
+        assert os.path.exists(dist_fp)
+        assert os.path.exists(gbz_fp)
+
+        assert os.path.exists(min1_fp) or os.path.exists(min2_fp)
+        if os.path.exists(min2_fp):
+            assert os.path.exists(zipcode_fp)
+
+        index_params = f"-Z {gbz_fp} -d {dist_fp}"
+        if os.path.exists(min1_fp):
+            index_params += f" -m {min1_fp}"
+        else:
+            index_params += f" -m {min2_fp} -z {zipcode_fp}"
+
+        engine_used, cmd = resolve_map_command(
+            align_engine=align_engine,
+            vg_path=vg_path,
+            thread=thread,
+            output_format=output_format,
+            index_params=index_params,
+            giraffe_input=giraffe_input,
+            index_prefix=job_index_prefix,
+        )
+        print(f"Align map backend: {engine_used} ref={ref_type}")
+        with open(alignment_log, "w") as alignment_log_fh:
+            alignment_log_fh.write("Command used: \n")
+            alignment_log_fh.write(cmd + "\n\n")
+            alignment_log_fh.write(f"Backend: {engine_used}\n")
+
+        cmd_run = "\n".join(
+            ln for ln in cmd.splitlines() if ln.strip() and not ln.strip().startswith("#")
+        )
+        if "MojoGiraffe" in cmd_run or cmd_run.lstrip().startswith("set "):
+            import shlex
+
+            cmd_run = "bash -lc " + shlex.quote(cmd_run)
+        se = utility.SystemExecute()
+        fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
+        for line in fout:
+            line = line.decode("utf-8")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            l = stripped.split("\t")
+            if len(l) < 12:
+                continue
+
+            asterisk = False
+            for i in [2, 3, 6, 7, 8, 9, 10, 11]:
+                if l[i] == "*":
+                    asterisk = True
+                    break
+            if asterisk:
+                continue
+
+            name_parts = l[0].split("_")
+            if len(name_parts) < 3:
+                continue
+            try:
+                ind = int(name_parts[2])
+            except ValueError:
+                continue
+            with shard_lock:
+                if ind not in alignment_outs:
+                    continue
+                alignment_out_fh = alignment_outs[ind]
+                alignment_out_fh.write(line if line.endswith("\n") else line + "\n")
+
+        codes = se.wait()
+        if any(rc != 0 for rc in codes):
+            raise RuntimeError(
+                f"Align map command failed (exit {codes}) backend={engine_used}; "
+                f"see {alignment_log}"
+            )
+        return ref_type, engine_used
+
+    jobs = []
     for ref_type in conversion_types:
         for read_type1 in read1_alignment_type:
             for read_type2 in read2_alignment_type:
                 if read_type1 == read_type2:
                     continue
+                jobs.append((ref_type, read_type1, read_type2))
 
-                # TODO change log for single end mode
-                print(f"Aligning R1({read_type1}) & R2({read_type2}) on reference({ref_type})")
+    parallel_raw = os.environ.get("METHYLGRAPHER_DUAL_GRAPH_PARALLEL", "1").strip().lower()
+    parallel = parallel_raw not in {"0", "false", "no", "off"}
+    workers = 2 if parallel and len(jobs) > 1 else 1
+    print(f"Align dual-graph jobs={len(jobs)} parallel_workers={workers}")
 
-                fq1 = f"{work_dir}/{read_type1}.R1.fastq"
-                fq2 = f"{work_dir}/{read_type2}.R2.fastq"
-
-                if compress:
-                    fq1 += ".gz"
-                    fq2 += ".gz"
-
-                if ref_type == "G2A":
-                    index_prefix = index_prefix_ga
-                else:
-                    index_prefix = index_prefix_ct
-
-                giraffe_input = f"-f {fq1}"
-                if os.path.exists(fq2):
-                    giraffe_input += f" -f {fq2}"
-
-                alignment_log = f"{work_dir}/alignment.Ref_{ref_type}.R1_{read_type1}.R2_{read_type2}.log"
-
-
-                dist_fp = f"{index_prefix}.dist"
-                gbz_fp = f"{index_prefix}.giraffe.gbz"
-
-                min1_fp = f"{index_prefix}.min"
-                min2_fp = f"{index_prefix}.shortread.withzip.min"
-                zipcode_fp = f"{index_prefix}.shortread.zipcodes"
-
-
-                assert os.path.exists(dist_fp)
-                assert os.path.exists(gbz_fp)
-
-                assert os.path.exists(min1_fp) or os.path.exists(min2_fp)
-                if os.path.exists(min2_fp):
-                    assert os.path.exists(zipcode_fp)
-
-
-                index_params = f"-Z {gbz_fp} -d {dist_fp}"
-                if os.path.exists(min1_fp):
-                    # v1.62.0 and lower
-                    index_params += f" -m {min1_fp}"
-                else:
-                    # v1.63.0 and higher
-                    index_params += f" -m {min2_fp} -z {zipcode_fp}"
-
-
-                engine_used, cmd = resolve_map_command(
-                    align_engine=align_engine,
-                    vg_path=vg_path,
-                    thread=thread,
-                    output_format=output_format,
-                    index_params=index_params,
-                    giraffe_input=giraffe_input,
-                    index_prefix=index_prefix,
-                )
-                print(f"Align map backend: {engine_used}")
-                with open(alignment_log, "w") as alignment_log_fh:
-                    alignment_log_fh.write("Command used: \n")
-                    alignment_log_fh.write(cmd + "\n\n")
-                    alignment_log_fh.write(f"Backend: {engine_used}\n")
-
-                # Strip comment lines if gpu_giraffe prepended a note.
-                cmd_run = "\n".join(
-                    ln for ln in cmd.splitlines() if ln.strip() and not ln.strip().startswith("#")
-                )
-                # MojoGiraffe shell fragment needs bash; vg one-liners work either way.
-                if "MojoGiraffe" in cmd_run or cmd_run.lstrip().startswith("set "):
-                    import shlex
-
-                    cmd_run = "bash -lc " + shlex.quote(cmd_run)
-                se = utility.SystemExecute()
-                fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
-                for line in fout:
-                    line = line.decode("utf-8")
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    # Skip mapper status / progress lines that are not GAF records.
-                    # GAF requires ≥12 tab-separated fields (see GAF spec).
-                    l = stripped.split("\t")
-                    if len(l) < 12:
-                        continue
-
-                    # Skip unaligned
-                    asterisk = False
-                    for i in [2, 3, 6, 7, 8, 9, 10, 11]:
-                        if l[i] == "*":
-                            asterisk = True
-                            break
-                    if asterisk:
-                        continue
-
-                    # Shard by methylGrapher-encoded read name: ..._{C2T|G2A}_{shard}_{seq}
-                    name_parts = l[0].split("_")
-                    if len(name_parts) < 3:
-                        continue
-                    try:
-                        ind = int(name_parts[2])
-                    except ValueError:
-                        continue
-                    if ind not in alignment_outs:
-                        continue
-                    alignment_out_fh = alignment_outs[ind]
-                    alignment_out_fh.write(line if line.endswith("\n") else line + "\n")
-
-                codes = se.wait()
-                if any(rc != 0 for rc in codes):
-                    raise RuntimeError(
-                        f"Align map command failed (exit {codes}) backend={engine_used}; "
-                        f"see {alignment_log}"
-                    )
+    if workers == 1:
+        for job in jobs:
+            _run_one_map(*job)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_run_one_map, *job) for job in jobs]
+            for fut in as_completed(futs):
+                _ = fut.result()
 
     for fh in alignment_outs.values():
         fh.close()
@@ -217,6 +227,8 @@ def alignment(
     # se.wait()
 
     return
+
+
 
 
 def tmp_gaf_processing(tmp_gaf_fp):

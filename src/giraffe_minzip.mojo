@@ -18,16 +18,7 @@ def probe_min_index(min_path: String) raises -> String:
     return String(info)
 
 
-def locate_read_hits(min_path: String, seq: String, hit_cap: Int = 24) raises -> List[String]:
-    """Return ``node_id:orient:offset`` strings from minimizer locate."""
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
-    var mod = Python.import_module("engine.minimizer_index")
-    var idx = mod.MinimizerIndex(min_path)
-    var hits = idx.locate_read(seq, hit_cap=hit_cap)
+def _hits_to_strings(hits: PythonObject) raises -> List[String]:
     var out = List[String]()
     var n = Int(py=hits.__len__())
     var i = 0
@@ -40,6 +31,39 @@ def locate_read_hits(min_path: String, seq: String, hit_cap: Int = 24) raises ->
             String(h.node_id) + ":" + orient + ":" + String(h.offset)
         )
         i = i + 1
+    return out^
+
+
+def locate_read_hits(min_path: String, seq: String, hit_cap: Int = 24) raises -> List[String]:
+    """Return ``node_id:orient:offset`` strings from minimizer locate."""
+    var os_mod = Python.import_module("os")
+    var sys_mod = Python.import_module("sys")
+    sys_mod.path.insert(0, String(os_mod.getcwd()))
+    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    var mod = Python.import_module("engine.minimizer_index")
+    var idx = mod.MinimizerIndex(min_path)
+    var hits = idx.locate_read(seq, hit_cap=hit_cap)
+    var out = _hits_to_strings(hits)
+    idx.close()
+    return out^
+
+
+def locate_batch_hits(
+    min_path: String, seqs: List[String], hit_cap: Int = 24
+) raises -> List[List[String]]:
+    """In-process batch locate into Mojo buffers (one mmap open)."""
+    var os_mod = Python.import_module("os")
+    var sys_mod = Python.import_module("sys")
+    sys_mod.path.insert(0, String(os_mod.getcwd()))
+    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    var mod = Python.import_module("engine.minimizer_index")
+    var idx = mod.MinimizerIndex(min_path)
+    var out = List[List[String]]()
+    for seq in seqs:
+        var hits = idx.locate_read(seq, hit_cap=hit_cap)
+        out.append(_hits_to_strings(hits))
     idx.close()
     return out^
 

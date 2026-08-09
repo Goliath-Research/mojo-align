@@ -10,18 +10,20 @@ from dual-graph `Align` / MojoGiraffe (GAF → MethylCall).
 
 1. **Python orchestrator** ([`engine/fq2bam_meth.py`](../engine/fq2bam_meth.py)): directional convert (R1 C→T, R2 G→A; reference C→T), mapper select, `samtools` sort/index, Parabricks-shaped QC JSON.
 2. **Native Mojo linear mapper** ([`src/linear_mapper.mojo`](../src/linear_mapper.mojo)):
-   - Build/load C2T FASTA + k-mer index (`linear_index`)
-   - Portable `DeviceContext` seed probe/warmup (`linear_gpu_kernels` → `cuda` / `hip` / `cpu`; targets `nvidia:sm_90` / `amdgpu:gfx942`)
-   - Seed-and-extend on the Mojo index (`linear_extend`: exact / RC / k-mer vote + PE SAM flags) → SAM
+   - Streaming FASTQ batches (`METHYLGRAPHER_LINEAR_READ_BATCH`, default 4096) — never full production FASTQ as Mojo rows
+   - Hash postings `Dict[kmer → locs]` (`linear_index`) — no `hit_table` linear scan
+   - Optional fused BS convert (`-bs_r1 C2T` / `-bs_r2 G2A`) in the mapper
+   - Portable GPU/host seeds (`linear_gpu_kernels`) **wired into** `extend_read_with_seeds`
+   - Gapless extend + PE SAM flags → SAM
 3. Stream SAM → `samtools view|sort|index`.
 
-Mapping is **native Mojo** (index + extend + SAM), not a BWA wrap. GPU seed currently warms/probes the accelerator; extend consumes the Mojo in-memory index (device-resident postings are the next kernel step).
+Mapping is **native Mojo** (index + extend + SAM), not a BWA wrap.
 
 ### Fallback
 
 - Default mapper: `mojo` (`METHYLGRAPHER_LINEAR_MAPPER` unset / `mojo` / `auto`).
 - Explicit CPU path: `METHYLGRAPHER_LINEAR_MAPPER=bwa`.
-- If the Mojo mapper subprocess fails, the orchestrator **automatically** falls back to streamed BWA-MEM and records `mapper=bwa_fallback` in the QC JSON (requires `bwa` on `PATH`).
+- If the Mojo mapper subprocess fails, the orchestrator falls back to streamed BWA-MEM (`mapper=bwa_fallback`) **unless** `METHYLGRAPHER_GPU_REQUIRE=1` (bakeoff fail-closed).
 
 ## Device targets
 
@@ -32,7 +34,7 @@ Mapping is **native Mojo** (index + extend + SAM), not a BWA wrap. GPU seed curr
 | `cpu` | host | `DeviceContext(api="cpu")` |
 | `auto` | prefer NVIDIA → AMD → CPU | via `giraffe_device.select_device` |
 
-Unlike Giraffe GBZ (`METHYLGRAPHER_GPU_REQUIRE`), linear Align does **not** fail closed if CUDA/HIP create fails — it logs `host-fallback` and continues the Mojo CPU extend path.
+`METHYLGRAPHER_GPU_REQUIRE=1` (Clara bakeoffs): forbids `LINEAR_MAPPER=bwa` and disables automatic BWA fallback on Mojo failure. Without it, DeviceContext create may log `host-fallback` and continue Mojo CPU extend.
 
 ## CLI
 
@@ -55,8 +57,9 @@ bin/methylGrapher MojoFq2bamMeth \
 | `METHYLGRAPHER_ALIGN_DEVICE` | default `-device` |
 | `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` |
 | `METHYLGRAPHER_LINEAR_K` | k-mer size (default 15) |
+| `METHYLGRAPHER_LINEAR_READ_BATCH` | streaming batch size (default 4096) |
+| `METHYLGRAPHER_GPU_REQUIRE` | `1` = fail-closed GPU bakeoff (no BWA) |
 | `METHYLGRAPHER_BWA_THREADS` | threads for BWA fallback / sort |
-
 ## Modules
 
 | Path | Role |

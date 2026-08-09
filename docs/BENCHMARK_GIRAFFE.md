@@ -3,6 +3,25 @@
 Science contract: dual-graph GAF + named-coordinates → Mojo MethylCall.
 See [`GIRAFFE_SPEC.md`](GIRAFFE_SPEC.md).
 
+## Stage profile (A0)
+
+```bash
+python3 scripts/profile_giraffe_stages.py --device cpu \
+  --out /tmp/giraffe_stage_profile.json
+# Buffy / subset: set FQ1/FQ2/GBZ/MIN and METHYLGRAPHER_PROFILE_JSON
+```
+
+Toy GBZ (2026-08-08, GH200 host; cold pack build excluded from STAGE_TIMER):
+
+| Stage | Share (toy) | Notes |
+|-------|-------------|-------|
+| `seed_locate` | ~4% | in-process GPU/host minimizer + `.min` locate (no JSON IPC) |
+| `cluster_extend` | ~75% | zip/dist cluster + gapless (+ multi-node heuristic) |
+| `gaf_emit` | ~16% | streamed GAF lines |
+| `fastq_batch` | ~5% | streaming PE batches |
+
+`vg giraffe` full-Buffy dual-map baseline remains **~6.2 h** (operator). Mojo gate: dual-map ≤ **~2 h** + DS20M MethylCall parity.
+
 ## Toy GBZ fixture
 
 ```bash
@@ -20,7 +39,6 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 |---------|-------|--------|--------------|------------|
 | MojoGiraffe `-gbz` | toy.giraffe.gbz | cpu / nvidia:sm_90 | ~10 s (incl. vg convert) | **PASS** vs golden |
 | vg giraffe 1.70 | same toy GBZ | Grace | toy often `*` paths | use golden for MethylCall tags |
-
 ## DS20M / Buffy progressive gates
 
 | Milestone | Gate | Status |
@@ -29,8 +47,8 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 | DS-scale (500 PE) on toy GBZ | GAF lines land | **PASS** (protocol smoke) |
 | Buffy-subset seed+extend (known `vg`-mapped C2T reads) | quartet_map | **PASS** 13/13 (~0.1 s) |
 | DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PENDING** operator |
-| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** measurement |
-| Production `gpu_giraffe` → Mojo GBZ | `READY=1` + dense pack + quartet | **WIRED** (default stays `vg_autoscale`) |
+| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** operator (C2T∥G2A parallel + stream GAF wired) |
+| Production `gpu_giraffe` → Mojo GBZ | `READY=1` + dense pack + quartet | **WIRED** (default on; opt out with `READY=0`) |
 
 Build production dense segment packs (preferred — from companion GFA):
 
