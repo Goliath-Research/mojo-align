@@ -31,7 +31,7 @@ def map_gbz_native(
     k: Int,
     device: String,
 ) raises -> Int:
-    """Mojo stream map: GPU seed → locate → cluster → gapless → GAF.
+    """Mojo stream map: GPU seed -> locate -> cluster -> gapless -> GAF.
 
     Production WGBS is paired-end and Buffy-scale (~100s GB FASTQ). Streaming
     batches never materialize the whole FASTQ as Mojo ``String`` rows.
@@ -62,9 +62,9 @@ def map_gbz_native(
         dev,
     )
     if fq2.byte_length() == 0:
-        print("GBZ SE mojo_stream_map hits=", n, " → ", out_gaf)
+        print("GBZ SE mojo_stream_map hits=", n, " -> ", out_gaf)
     else:
-        print("GBZ PE mojo_stream_map hits=", n, " → ", out_gaf)
+        print("GBZ PE mojo_stream_map hits=", n, " -> ", out_gaf)
     return n
 
 
@@ -79,14 +79,14 @@ def map_gbz_via_helper(
     k: Int,
     device: String,
 ) raises -> Int:
-    """Back-compat name → native Mojo stream map."""
+    """Back-compat name -> native Mojo stream map."""
     return map_gbz_native(
         gbz, fq1, out_gaf, fq2, dist, min_path, zipcodes, k, device
     )
 
 
 def load_segments_from_gbz(gbz_path: String) raises -> Dict[String, String]:
-    """Decode GBZ / pack → segment id→sequence for Mojo seed warm-up."""
+    """Decode GBZ / pack -> segment id→sequence for Mojo seed warm-up."""
     var os_mod = Python.import_module("os")
     var sys_mod = Python.import_module("sys")
     sys_mod.path.insert(0, String(os_mod.getcwd()))

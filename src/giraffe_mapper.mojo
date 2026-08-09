@@ -1,4 +1,4 @@
-# End-to-end Mojo Giraffe mapper (GFA or GBZ index → GAF).
+# End-to-end Mojo Giraffe mapper (GFA or GBZ index -> GAF).
 
 from std.collections import List
 from std.python import Python
@@ -116,7 +116,7 @@ def map_fastq_to_gaf(
             i += 1
 
     write_gaf(out_gaf, all_hits)
-    print("wrote ", len(all_hits), " GAF alignments → ", out_gaf)
+    print("wrote ", len(all_hits), " GAF alignments -> ", out_gaf)
     return len(all_hits)
 
 

@@ -1,4 +1,4 @@
-# End-to-end Mojo linear WGBS mapper (C2T FASTA + converted FASTQ → SAM).
+# End-to-end Mojo linear WGBS mapper (C2T FASTA + converted FASTQ -> SAM).
 #
 # Streaming batches — never materializes full production FASTQ as Mojo rows.
 # GPU seeds feed extend (not discarded warmup).
@@ -218,7 +218,7 @@ def map_fastq_to_sam(
     if paired:
         fh2.close()
     fh.close()
-    print("wrote SAM → ", out_sam, " mapped_records=", n_mapped, " reads=", n_reads)
+    print("wrote SAM -> ", out_sam, " mapped_records=", n_mapped, " reads=", n_reads)
     return n_mapped
 
 

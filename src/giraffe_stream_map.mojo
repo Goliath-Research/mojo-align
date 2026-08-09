@@ -1,8 +1,8 @@
 # Production GBZ stream map — Mojo hot path (no Python quartet_map / CuPy loop).
 #
 # NVIDIA/AMD GPU session (DeviceContext):
-#   Upload .min HT + dense pack once → per batch device window-reduce,
-#   Q1Q1 HT probe, cluster, gapless → D2H hits → host GAF emit.
+#   Upload .min HT + dense pack once -> per batch device window-reduce,
+#   Q1Q1 HT probe, cluster, gapless -> D2H hits -> host GAF emit.
 #   Banner: seed_backend=devicecontext-…+gpu_ht+gpu_gapless+mojo_stream
 #
 # CPU / GPU_REQUIRE=0 toys: host Mojo locate/cluster/gapless over mmap.
@@ -248,7 +248,7 @@ def map_fastq_stream_to_gaf(
     k: Int,
     device: String,
 ) raises -> Int:
-    """Stream FASTQ → Mojo seed/cluster/extend → GAF. Returns record count."""
+    """Stream FASTQ -> Mojo seed/cluster/extend -> GAF. Returns record count."""
     var dev = require_device_or_raise(device)
     var backend = probe_device_context(dev)
     var os_mod = Python.import_module("os")
@@ -353,7 +353,7 @@ def map_fastq_stream_to_gaf(
         print(
             "mojo_stream_map done gaf_lines=",
             n_wrt,
-            " → ",
+            " -> ",
             out_gaf,
             flush=True,
         )
@@ -460,7 +460,7 @@ def map_fastq_stream_to_gaf(
         n_records,
         " gaf_lines=",
         n_written,
-        " → ",
+        " -> ",
         out_gaf,
         flush=True,
     )

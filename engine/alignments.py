@@ -179,6 +179,32 @@ def alignment(
         se = utility.SystemExecute()
 
         if mojo_direct or "MojoGiraffe" in cmd_run:
+            # Resume: keep a completed Mojo shard (e.g. C2T done, G2A aborted on
+            # orchestration bug) instead of remapping for another ~hour.
+            if (
+                os.path.isfile(mojo_out_gaf)
+                and os.path.getsize(mojo_out_gaf) > 0
+                and os.environ.get("METHYLGRAPHER_ALIGN_FORCE_REMAP", "").strip()
+                not in {"1", "true", "yes"}
+            ):
+                print(
+                    f"Reusing Mojo GAF shard {mojo_out_gaf} "
+                    f"({os.path.getsize(mojo_out_gaf)} bytes); skip remap",
+                    flush=True,
+                )
+                with shard_lock:
+                    with open(mojo_out_gaf, "r", encoding="utf-8") as src, open(
+                        final_gaf, "a", encoding="utf-8"
+                    ) as dst:
+                        for line in src:
+                            dst.write(line if line.endswith("\n") else line + "\n")
+                print(
+                    f"Mojo GAF appended -> {final_gaf} "
+                    f"(+{os.path.getsize(mojo_out_gaf)} bytes from {mojo_out_gaf})",
+                    flush=True,
+                )
+                return ref_type, engine_used
+
             # File-backed GAF; Mojo logs on stderr. Do not use underscore shard router.
             fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
             # Drain stdout (usually empty when out_gaf is a file).
@@ -201,8 +227,9 @@ def alignment(
                 ) as dst:
                     for line in src:
                         dst.write(line if line.endswith("\n") else line + "\n")
+            # ASCII-only: docker/worker capture often uses LANG=C (ascii stdout).
             print(
-                f"Mojo GAF appended → {final_gaf} "
+                f"Mojo GAF appended -> {final_gaf} "
                 f"(+{os.path.getsize(mojo_out_gaf)} bytes from {mojo_out_gaf})"
             )
             return ref_type, engine_used
