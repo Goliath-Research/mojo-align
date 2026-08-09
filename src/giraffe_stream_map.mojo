@@ -337,13 +337,13 @@ def map_fastq_stream_to_gaf(
                 # PE tags for MethylCall (primary pair).
                 h1.extra_tags = "ri:i:1\tos:Z:" + a.seq + "\trc:Z:CT"
                 h2.extra_tags = "ri:i:2\tos:Z:" + b.seq + "\trc:Z:GA"
-                # Second multimapping hits (-M 2 style) when present.
+                # Primary before secondary (vg giraffe -M 2 / MethylCall convention).
+                batch_hits.append(h1^)
                 if len(h1s) > 1:
                     batch_hits.append(h1s[1].copy())
+                batch_hits.append(h2^)
                 if len(h2s) > 1:
                     batch_hits.append(h2s[1].copy())
-                batch_hits.append(h1^)
-                batch_hits.append(h2^)
                 n_records += 2
             j += 1
         var t_extend = time.perf_counter()
