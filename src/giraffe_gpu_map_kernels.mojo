@@ -426,7 +426,10 @@ def gpu_native_stream_loop(
             return 78
 
         def gapless_kernel(
-            q_codes: UnsafePointer[UInt8, MutAnyOrigin],
+            # Raw ASCII query bases (same alphabet as sequences.bin / pack_seq).
+            # Must NOT be pack_bases_kernel codes (0–3) — upper_code/comp_base
+            # and qb==rb compare ASCII.
+            q_bases: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[Int32, MutAnyOrigin],
             q_stride: Int,
             pack_off: UnsafePointer[UInt64, MutAnyOrigin],
@@ -507,7 +510,7 @@ def gpu_native_stream_loop(
                 var qi = 0
                 var rpos = start
                 while qi < qlen and rpos < seg_len:
-                    var qb = upper_code(q_codes[qbase + qi])
+                    var qb = upper_code(q_bases[qbase + qi])
                     var rb: UInt8 = 0
                     if is_rev:
                         # ref_aln[rpos] = RC(ref)[rpos] = comp(ref[seg_len-1-rpos])
@@ -765,7 +768,7 @@ def gpu_native_stream_loop(
                 var d_out_valid = ctx.enqueue_create_buffer[DType.uint8](n_slots)
                 var grid_slots = (n_slots + BLOCK - 1) // BLOCK
                 ctx.enqueue_function[gapless_kernel](
-                    d_codes.unsafe_ptr(),
+                    d_bases.unsafe_ptr(),
                     d_lens.unsafe_ptr(),
                     max_len,
                     dev_off.unsafe_ptr(),
