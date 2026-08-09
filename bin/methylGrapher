@@ -4,9 +4,10 @@
 # By default runs the Python engine (engine/cli.py), the faithful 0.2.0 port
 # with the methylGrapher-mojo cutover patches (see MIGRATION_LOG.md).
 # Set METHYLGRAPHER_ENGINE=mojo to run the Mojo CLI (src/main.mojo): native
-# help / vg_check / Align / MojoGiraffe / MojoFq2bamMeth / MethylCall /
-# MergeCpG / ConversionRate; PrepareGenome / Main still dispatch to
-# engine.cli. MojoFq2bamMeth is also available on the default Python engine.
+# help / vg_check / Align / MojoGiraffe / MethylCall / MergeCpG /
+# ConversionRate; MojoFq2bamMeth always orchestrates via engine.fq2bam_meth
+# (native map kernel: src/linear_mapper.mojo) and is dual-shipped on the
+# default Python engine too. PrepareGenome / Main stay on engine.cli.
 # Set METHYLGRAPHER_MCALL_ENGINE=python to force Align/MethylCall/MergeCpG/
 # ConversionRate onto engine.cli as well.
 #

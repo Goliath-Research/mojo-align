@@ -12,10 +12,13 @@ tests/
   test_giraffe_gbz_helper.py    # GBZ quartet resolve / segment cache
   test_giraffe_gaf_parity.py    # Mojo GAF vs golden fixture
   test_fq2bam_meth.py           # Linear WGBS convert / QC / end-to-end map
+  test_quartet_stream.py        # streaming batch / MOJO_READ_BATCH
+  test_gpu_minimizer_batch.py   # GPU/host minimizer batch helper
   test_minimizer_index.py       # .min mmap helper
   test_segment_pack.py          # dense sequences.bin / offsets.bin
   test_quartet_map.py           # quartet_map / MojoGiraffe ready
-  probe_gpu.mojo                # Device probe smoke
+  probe_devicecontext_cuda.mojo # std.gpu DeviceContext / kernel probe
+  probe_gpu.mojo                # legacy probe (may lag std.gpu import style)
   data/                         # Toy fixtures (see data/README.md, fq2bam_fixture/)
 ```
 

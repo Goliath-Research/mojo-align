@@ -8,6 +8,21 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — Docs resync after Mojo Giraffe + linear fixes
+
+**Synced docs to code:**
+- GBZ production: Mojo device gate/GPU warmup → streaming `engine.quartet_map`
+  (no full-FASTQ load in Mojo). Documented in `docs/GIRAFFE_SPEC.md` / README.
+- Linear: native Mojo index+extend; DeviceContext seed is probe/warmup;
+  automatic `bwa_fallback` on Mojo failure; `-k` in Mojo help.
+- `METHYLGRAPHER_MOJO_GIRAFFE_READY` default-on (opt-out with `0`/`false`/`off`).
+- Env table: `GPU_REQUIRE`, `GIRAFFE_DEVICE`, `MOJO_READ_BATCH`, `MODULAR_NVPTX_COMPILER_PATH`.
+- `tests/README.md`: `test_quartet_stream`, `test_gpu_minimizer_batch`,
+  `probe_devicecontext_cuda.mojo`.
+- `utility.py` help header: identity/mapq 20/0 (not 50/20).
+
+---
+
 ## 2026-08-08 — MojoFq2bamMeth portable linear GPU Align
 
 **Completed:**

@@ -11,19 +11,21 @@ scripts/benchmark_fq2bam_meth.sh
 
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|
-| Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | exact match PE |
-| Mojo linear | `nvidia:sm_90` | operator | needs Modular NVPTX driver ≥580 or `MODULAR_NVPTX_COMPILER_PATH` |
+| Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | native index + extend; exact-match PE |
+| Mojo linear | `nvidia:sm_90` | PASS (toy) / operator (subset) | DeviceContext warmup; host-fallback if driver &lt;580 |
 | Mojo linear | `amdgpu:gfx942` | operator | ROCm image `1.70-mojo-rocm` |
-| BWA-MEM fallback | CPU | PASS | `METHYLGRAPHER_LINEAR_MAPPER=bwa` |
+| BWA-MEM | CPU | PASS | `METHYLGRAPHER_LINEAR_MAPPER=bwa` or automatic `bwa_fallback` |
 
 ## Production gates (operator)
 
 | Gate | Criterion | Status |
 |------|-----------|--------|
-| Toy PE BAM + QC schema | mapped > 0, JSON keys present | **PASS** (CI/local) |
+| Toy PE BAM + QC schema | mapped > 0, JSON keys, `mapper=mojo` | **PASS** (CI/local) |
 | NVIDIA subset vs Clara `pbrun fq2bam_meth` | Mojo wall ≤ Clara (±10%) | **PENDING** operator on GH200 |
 | AMD MI300X twin | Mojo AMD wall ≈ NVIDIA Mojo twin; ≫ BWA CPU | **PENDING** ROCm bakeoff |
-| Site flip | `METHYLGRAPHER_LINEAR_MAPPER=mojo` default | after NVIDIA+AMD gates |
+| Complete status | both wall-clock gates green | **PENDING** (default mapper is already `mojo`) |
+
+Default `METHYLGRAPHER_LINEAR_MAPPER` is already `mojo`; operator gates decide when to mark the component **Complete** in the README, not when to flip the default.
 
 Record operator runs:
 

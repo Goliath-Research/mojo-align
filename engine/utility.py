@@ -1,7 +1,7 @@
 
 # engine/utility.py — faithful port of python_reference/utility.py (methylGrapher 0.2.0).
-# Patch (methylGrapher-mojo): CLI help text default identity/mapq updated to 50/20
-# to match the mcall.py function defaults (see MIGRATION_LOG.md, patch #3).
+# Patch (methylGrapher-mojo): CLI help defaults identity=20, mapq=0 (stock 0.2.0;
+# see MIGRATION_LOG.md patch #3). MojoFq2bamMeth / Align extras documented below.
 
 import os
 import re
@@ -796,8 +796,10 @@ Align:
     # Required parameters
     -index_prefix <prefix> 
     -fq1 <fastq_file_path> 
-    -fq2 <fastq_file_path> 
     -work_dir <work_directory> 
+    
+    # Optional
+    -fq2 <fastq_file_path>
     
     # Computing options
     -t <number_of_thread(s)> (default: 1)
@@ -839,9 +841,11 @@ MergeCpG:
     -work_dir <work_directory>
 
 MojoFq2bamMeth:
-    Portable linear WGBS Align (Clara fq2bam_meth substitute). Mojo linear
-    GPU kernels (nvidia:sm_90 / amdgpu:gfx942); BWA-MEM is CPU fallback only.
-    Requires samtools; bwa only for METHYLGRAPHER_LINEAR_MAPPER=bwa.
+    Native Mojo linear WGBS Align (Clara fq2bam_meth substitute on NVIDIA+AMD).
+    Map kernel: src/linear_mapper.mojo (index + extend → SAM). DeviceContext
+    seed targets nvidia:sm_90 / amdgpu:gfx942. Default mapper=mojo; set
+    METHYLGRAPHER_LINEAR_MAPPER=bwa for explicit BWA, or rely on automatic
+    bwa_fallback if the Mojo mapper fails. Requires samtools; bwa for fallback.
     methylGrapher MojoFq2bamMeth
     -fq1 <fastq> -fq2 <fastq> -ref <fasta>
     -out_bam <bam> -out_qc_dir <dir> -sample_id <id>
