@@ -2,8 +2,8 @@
 #
 # Stages per batch:
 #   1) Mojo Giraffe (k,w) minimizers via DeviceContext pack+hash (NVIDIA/AMD)
-#      or Mojo host — never CuPy / giraffe_gpu_minimizer
-#   2) Science HT locate (.min mmap; thin Python locate_key_batches once/batch)
+#      host buffers → window reduce (no huge List copies); never CuPy
+#   2) Mojo-native Q1Q1 HT probe over mmap (one open for the whole stream)
 #   3) Mojo zip/dist cluster
 #   4) Mojo gapless_extend_with_pack
 #   5) Streaming GAF emit
@@ -22,7 +22,8 @@ from giraffe_gpu_kernels import (
     probe_device_context,
 )
 from giraffe_hit import AlignmentHit
-from giraffe_minzip import locate_batch_hits_native
+from giraffe_min_index import MojoMinIndex
+from giraffe_minzip import locate_batch_hits_with_index
 from giraffe_pack import DensePack
 
 
@@ -93,11 +94,10 @@ def _stage_enabled() raises -> Bool:
 
 
 def _science_locate_batch(
-    min_path: String, seqs: List[String], device: String, k: Int
+    mut idx: MojoMinIndex, seqs: List[String], device: String
 ) raises -> List[List[String]]:
-    """Mojo-native minimizer locate (DeviceContext / host). ``k`` unused — index k/w."""
-    _ = k
-    return locate_batch_hits_native(device, min_path, seqs, 24)
+    """Mojo-native minimizer locate against an already-open mmap index."""
+    return locate_batch_hits_with_index(idx, device, seqs, 24)
 
 
 def _fixture_extend_small(
@@ -228,6 +228,16 @@ def map_fastq_stream_to_gaf(
     )
 
     var pack = DensePack(pack_dir)
+    var min_idx = MojoMinIndex(min_path)
+    print(
+        "mojo_stream_map min_mmap k=",
+        min_idx.k,
+        " w=",
+        min_idx.w,
+        " cells=",
+        min_idx.cell_count,
+        flush=True,
+    )
     var out_fh = open_gaf_write(out_gaf)
     var fh1 = _open_fastq(fq1)
     var paired = fq2.byte_length() > 0
@@ -266,10 +276,11 @@ def map_fastq_stream_to_gaf(
             for r in batch2:
                 seqs.append(r.seq)
 
-        # Science locate owns DeviceContext minimizer hashing (no discarded seed pass).
+        # Science locate: DeviceContext minimizer hashing + Mojo mmap HT probe.
         var t_gpu = time.perf_counter()
-        var seed_hits = _science_locate_batch(min_path, seqs, dev, k)
+        var seed_hits = _science_locate_batch(min_idx, seqs, dev)
         var t_locate = time.perf_counter()
+        _ = k
 
         var batch_hits = List[AlignmentHit]()
         var j = 0
@@ -329,6 +340,7 @@ def map_fastq_stream_to_gaf(
     if paired:
         fh2.close()
     out_fh.close()
+    min_idx.close()
     print(
         "mojo_stream_map done records=",
         n_records,

@@ -18,7 +18,7 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 - Dense segment pack (`sequences.bin` + `offsets.bin` under `{gbz}.mojo_segments/`) from [`scripts/build_mojo_segment_pack.py`](../scripts/build_mojo_segment_pack.py) (or legacy jsonl / `vg convert` for tiny fixtures).
 - Production GBZ map path (Buffy-scale FASTQ):
   1. Mojo `giraffe_gbz.map_gbz_native` — device select / `require_device_or_raise`, DeviceContext warmup, ensure dense pack
-  2. Mojo [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo) — batched FASTQ stream → Mojo Giraffe `(k,w)` minimizers ([`giraffe_minimizer.mojo`](../src/giraffe_minimizer.mojo): DeviceContext pack+fwd/RC hash on NVIDIA/AMD, Mojo host window reduce; **never CuPy**) → HT locate via thin `MinimizerIndex.locate_key_batches` → Mojo zip/dist cluster → `gapless_extend_with_pack` → streaming GAF emit  
+  2. Mojo [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo) — batched FASTQ → Mojo Giraffe `(k,w)` minimizers ([`giraffe_minimizer.mojo`](../src/giraffe_minimizer.mojo): DeviceContext pack+fwd/RC hash into **host buffers**, window reduce in-place; **never CuPy / huge Lists**) → Mojo-native Q1Q1 HT probe ([`giraffe_min_index.mojo`](../src/giraffe_min_index.mojo) over libc mmap) → Mojo zip/dist cluster → `gapless_extend_with_pack` → streaming GAF emit  
   Mojo must **not** load whole production FASTQs into memory (OOM / exit 137).
 - Python [`engine/quartet_map.py`](../engine/quartet_map.py) is the **oracle** only (`map_fastq_to_gaf` for parity tests; `ensure_pack_for_gbz` for pack resolve).
 - Native Mojo gapless over dense pack: [`src/giraffe_gapless.mojo`](../src/giraffe_gapless.mojo) / [`src/giraffe_pack.mojo`](../src/giraffe_pack.mojo).

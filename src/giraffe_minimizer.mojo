@@ -413,35 +413,75 @@ def minimizers_batch_devicecontext(
             ctx.enqueue_copy(src_buf=dev_valid, dst_buf=host_valid)
             ctx.synchronize()
 
+            # Window-reduce directly from host buffers (no per-position List copies).
             var out = List[List[MinimizerOcc]]()
             ri = 0
             while ri < n_reads:
                 var L = seqs[ri].byte_length()
-                var n_pos = 0
-                if L >= k:
-                    n_pos = L - k + 1
-                var keys_f = List[UInt64]()
-                var keys_r = List[UInt64]()
-                var hashes_f = List[UInt64]()
-                var hashes_r = List[UInt64]()
-                var valid = List[Bool]()
                 var base = ri * max_len
-                var pos = 0
-                while pos < n_pos:
-                    var idx = base + pos
-                    keys_f.append(host_kf[idx])
-                    keys_r.append(host_kr[idx])
-                    hashes_f.append(host_hf[idx])
-                    hashes_r.append(host_hr[idx])
-                    valid.append(host_valid[idx] != 0)
-                    pos += 1
-                out.append(
-                    _window_reduce_from_tables(
-                        L, k, w, keys_f, keys_r, hashes_f, hashes_r, valid
-                    )
-                )
+                var win = k + w - 1
+                var row = List[MinimizerOcc]()
+                if L >= win:
+                    var next_read_offset = 0
+                    var last_hash = UInt64(0)
+                    var last_offset = -1
+                    var have_last = False
+                    var window_start = 0
+                    while window_start <= L - win:
+                        var best_key = UInt64(0)
+                        var best_hash = UInt64(0)
+                        var best_off = 0
+                        var best_rev = False
+                        var have_best = False
+                        var ok = True
+                        var wi = 0
+                        while wi < w:
+                            var pos = window_start + wi
+                            var idx = base + pos
+                            if host_valid[idx] == 0:
+                                ok = False
+                                break
+                            var use_r = host_hr[idx] < host_hf[idx]
+                            var cand_key = host_kf[idx]
+                            var cand_hash = host_hf[idx]
+                            var cand_rev = False
+                            if use_r:
+                                cand_key = host_kr[idx]
+                                cand_hash = host_hr[idx]
+                                cand_rev = True
+                            if (
+                                not have_best
+                                or cand_hash < best_hash
+                                or (cand_hash == best_hash and pos < best_off)
+                            ):
+                                best_key = cand_key
+                                best_hash = cand_hash
+                                best_off = pos
+                                best_rev = cand_rev
+                                have_best = True
+                            wi += 1
+                        if ok and have_best:
+                            var emit = False
+                            if not have_last:
+                                emit = True
+                            elif last_hash == best_hash or last_offset < best_off:
+                                if best_off >= next_read_offset:
+                                    emit = True
+                            if emit:
+                                var off = best_off
+                                if best_rev:
+                                    off = best_off + k - 1
+                                row.append(
+                                    MinimizerOcc(best_key, best_hash, off, best_rev)
+                                )
+                                next_read_offset = best_off + 1
+                                last_hash = best_hash
+                                last_offset = best_off
+                                have_last = True
+                        window_start += 1
+                out.append(row^)
                 ri += 1
-            return MinimizerBatchResult(out^, backend + "+mojo_min")
+            return MinimizerBatchResult(out^, backend + "+mojo_min_buf")
 
     return MinimizerBatchResult(minimizers_batch_host(seqs, k, w), "mojo_min_host")
 
