@@ -10,8 +10,8 @@ from std.sys import has_accelerator
 from giraffe_gaf_emit import append_gaf_hits
 from giraffe_gpu_index import (
     gpu_index_meta_from,
-    h2d_fill,
     log_gpu_index_resident,
+    require_gpu_index_capacity,
 )
 from giraffe_hit import AlignmentHit
 from giraffe_min_index import MojoMinIndex
@@ -110,7 +110,61 @@ def gpu_native_stream_loop(
     else:
         from std.gpu import block_dim, block_idx, thread_idx
         from std.gpu.host import DeviceContext
-        from std.memory import UnsafePointer
+        from std.memory import UnsafePointer, memcpy
+
+        def copy_bytes_offset_kernel(
+            dst: UnsafePointer[UInt8, MutAnyOrigin],
+            src: UnsafePointer[UInt8, MutAnyOrigin],
+            dst_off: Int,
+            n: Int,
+        ):
+            """Device-side memcpy into ``dst[dst_off:dst_off+n]`` (no CUDA runtime API)."""
+            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if tid < n:
+                dst[dst_off + tid] = src[tid]
+
+        def upload_mmap_to_device(
+            ctx: DeviceContext,
+            dst: UnsafePointer[UInt8, MutAnyOrigin],
+            host_addr: Int,
+            nbytes: Int,
+        ) raises:
+            """Chunked H2D via Mojo HostBuffer + enqueue_copy + device copy kernel.
+
+            Application code must not call libcudart/CuPy; DeviceContext owns the
+            NVIDIA/AMD transport. ``api=\"cuda\"`` below is Mojo's NVIDIA backend
+            token (framework naming), not a direct CUDA Runtime dependency.
+            """
+            if nbytes <= 0:
+                return
+            if host_addr == 0:
+                raise Error("upload_mmap_to_device: null host mmap address")
+            # 64 MiB host staging — keeps peak host RAM bounded for multi‑GB HT.
+            comptime CHUNK = 64 * 1024 * 1024
+            comptime BLOCK = 256
+            var off = 0
+            while off < nbytes:
+                var n = nbytes - off
+                if n > CHUNK:
+                    n = CHUNK
+                var host = ctx.enqueue_create_host_buffer[DType.uint8](n)
+                var src = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=host_addr + off
+                )
+                memcpy(dest=host.unsafe_ptr(), src=src, count=n)
+                var stage = ctx.enqueue_create_buffer[DType.uint8](n)
+                ctx.enqueue_copy(src_buf=host, dst_buf=stage)
+                var grid = (n + BLOCK - 1) // BLOCK
+                ctx.enqueue_function[copy_bytes_offset_kernel](
+                    dst,
+                    stage.unsafe_ptr(),
+                    off,
+                    n,
+                    grid_dim=grid,
+                    block_dim=BLOCK,
+                )
+                ctx.synchronize()
+                off += n
 
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
@@ -553,22 +607,40 @@ def gpu_native_stream_loop(
             out_valid[tid] = 1
 
         # ---- single DeviceContext session ----
+        # Mojo NVIDIA backend token is "cuda"; AMD is "hip". We do not call the
+        # CUDA Runtime from app code — uploads use DeviceContext enqueue_copy.
         var api = String("cuda")
         var dlow = dev.lower()
         if dlow == "amd" or dlow == "hip" or dlow == "rocm":
             api = String("hip")
-        var ctx = DeviceContext(api=api)
         var meta = gpu_index_meta_from(min_idx, pack)
         log_gpu_index_resident(meta)
+        require_gpu_index_capacity(meta, dev)
+        var ctx = DeviceContext(api=api)
 
         var n_off_u64 = meta.off_bytes // 8
         var dev_ht = ctx.enqueue_create_buffer[DType.uint64](meta.ht_words)
         var dev_off = ctx.enqueue_create_buffer[DType.uint64](n_off_u64)
         var dev_seq = ctx.enqueue_create_buffer[DType.uint8](meta.seq_bytes)
         ctx.synchronize()
-        h2d_fill(Int(dev_ht.unsafe_ptr()), meta.ht_host_addr, meta.ht_words * 8)
-        h2d_fill(Int(dev_off.unsafe_ptr()), meta.off_host_addr, meta.off_bytes)
-        h2d_fill(Int(dev_seq.unsafe_ptr()), meta.seq_host_addr, meta.seq_bytes)
+        upload_mmap_to_device(
+            ctx,
+            dev_ht.unsafe_ptr().bitcast[UInt8](),
+            meta.ht_host_addr,
+            meta.ht_words * 8,
+        )
+        upload_mmap_to_device(
+            ctx,
+            dev_off.unsafe_ptr().bitcast[UInt8](),
+            meta.off_host_addr,
+            meta.off_bytes,
+        )
+        upload_mmap_to_device(
+            ctx,
+            dev_seq.unsafe_ptr(),
+            meta.seq_host_addr,
+            meta.seq_bytes,
+        )
 
         var label = gpu_native_backend_label(backend)
         print(

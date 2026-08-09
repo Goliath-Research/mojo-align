@@ -1,8 +1,8 @@
-# Device-resident Giraffe index metadata + H2D bootstrap helpers.
+# Device-resident Giraffe index metadata helpers.
 #
-# DeviceBuffer allocation stays in the stream-map GPU session (lifetime).
-# This module builds upload metadata from host mmaps and fills device pointers
-# via chunked ``cudaMemcpy`` (``engine.gpu_h2d``).
+# DeviceBuffer allocation + H2D live in the stream-map GPU session
+# (``giraffe_gpu_map_kernels.upload_mmap_to_device`` via Mojo DeviceContext).
+# This module only builds upload metadata from host mmaps and runs HBM preflight.
 
 from std.python import Python
 
@@ -87,19 +87,13 @@ def gpu_index_meta_from(
     )
 
 
+def gpu_index_science_bytes(meta: GpuIndexMeta) raises -> Int:
+    """HT + pack offsets + sequence bytes (device slabs, no Mojo overhead)."""
+    return meta.ht_words * 8 + meta.off_bytes + meta.seq_bytes
+
+
 def gpu_index_resident_gib(meta: GpuIndexMeta) raises -> Float64:
-    var bytes_total = meta.ht_words * 8 + meta.off_bytes + meta.seq_bytes
-    return Float64(bytes_total) / Float64(1024 * 1024 * 1024)
-
-
-def h2d_fill(dev_ptr: Int, host_ptr: Int, nbytes: Int) raises:
-    """Chunked host→device memcpy into an already-allocated device pointer."""
-    if nbytes <= 0:
-        return
-    if dev_ptr == 0 or host_ptr == 0:
-        raise Error("h2d_fill: null pointer")
-    var h2d = Python.import_module("engine.gpu_h2d")
-    h2d.memcpy_htod_chunked(dev_ptr, host_ptr, nbytes)
+    return Float64(gpu_index_science_bytes(meta)) / Float64(1024 * 1024 * 1024)
 
 
 def log_gpu_index_resident(meta: GpuIndexMeta) raises:
@@ -114,3 +108,18 @@ def log_gpu_index_resident(meta: GpuIndexMeta) raises:
         meta.seq_bytes,
         flush=True,
     )
+
+
+def require_gpu_index_capacity(meta: GpuIndexMeta, device: String) raises:
+    """Query free HBM (nvidia-smi / rocm-smi) before DeviceContext index upload.
+
+    Raises a clear capacity Error instead of a late driver OOM during
+    ``enqueue_create_buffer`` for the multi‑GiB HT.
+    """
+    var mem = Python.import_module("engine.gpu_mem")
+    try:
+        _ = mem.require_index_capacity(
+            gpu_index_science_bytes(meta), device=device
+        )
+    except e:
+        raise Error(String(e))

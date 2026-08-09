@@ -18,7 +18,7 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 - Dense segment pack (`sequences.bin` + `offsets.bin` under `{gbz}.mojo_segments/`) from [`scripts/build_mojo_segment_pack.py`](../scripts/build_mojo_segment_pack.py) (or legacy jsonl / `vg convert` for tiny fixtures).
 - Production GBZ map path (Buffy-scale FASTQ) on **nvidia/amd** is **GPU-native Mojo**:
   1. `giraffe_gbz.map_gbz_native` — device select / `require_device_or_raise`, DeviceContext warmup, `ensure_pack_for_gbz` (Python pack resolve only)
-  2. [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo) → [`giraffe_gpu_map_kernels.mojo`](../src/giraffe_gpu_map_kernels.mojo): **one** DeviceContext uploads `.min` HT + dense pack once ([`giraffe_gpu_index.mojo`](../src/giraffe_gpu_index.mojo) + [`engine/gpu_h2d.py`](../engine/gpu_h2d.py)), then per batch device window-reduce → Q1Q1 unique HT probe → cluster prune → gapless → D2H hits → host GAF emit.
+  2. [`giraffe_stream_map.mojo`](../src/giraffe_stream_map.mojo) → [`giraffe_gpu_map_kernels.mojo`](../src/giraffe_gpu_map_kernels.mojo): **one** DeviceContext uploads `.min` HT + dense pack once ([`giraffe_gpu_index.mojo`](../src/giraffe_gpu_index.mojo) metadata + Mojo `upload_mmap_to_device` / `enqueue_copy` — **no app-level CUDA Runtime / CuPy**), then per batch device window-reduce → Q1Q1 unique HT probe → cluster prune → gapless → D2H hits → host GAF emit.
   3. Banner must include `seed_backend=devicecontext-cuda+gpu_ht+gpu_gapless+mojo_stream` (or HIP). Host mmap locate/extend is **not** the production GPU path when `METHYLGRAPHER_GPU_REQUIRE` is on.
   Mojo must **not** load whole production FASTQs into memory (OOM / exit 137).
 - **CPU / toys** (`device=cpu` or `GPU_REQUIRE=0`): host Mojo HT over mmap + `gapless_extend_with_pack` (fixture exact-match for tiny packs).
@@ -37,7 +37,7 @@ Toy / development: native Mojo `giraffe_mapper` + `giraffe_index` / `extend_exac
 
 1. **Index / pack** — ensure `{gbz}.mojo_segments/` dense pack.
 2. **Device gate + GPU warmup** — `giraffe_device` + `giraffe_gpu_kernels` (`nvidia:sm_90` / `amdgpu:gfx942`). Driver &lt;580 needs `MODULAR_NVPTX_COMPILER_PATH=ptxas`. Empty/`1` `METHYLGRAPHER_GPU_REQUIRE` fails closed if DeviceContext cannot be created for nvidia/amd; set `0` to allow host kernels.
-3. **GPU-native stream** — upload indexes (`gpu_index_resident_gib=…`) then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `METHYLGRAPHER_MOJO_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `cluster_extend` / `gaf_emit`.
+3. **GPU-native stream** — HBM preflight via `nvidia-smi` / `rocm-smi` ([`engine/gpu_mem.py`](../engine/gpu_mem.py); fail closed with free/need GiB before DeviceContext alloc), Mojo-native index upload (`upload_mmap_to_device`), then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `METHYLGRAPHER_MOJO_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `cluster_extend` / `gaf_emit`. DeviceContext backend token `cuda`/`hip` is Mojo framework naming for NVIDIA/AMD — production app code does not call libcudart.
 4. **Pair tags** — PE `ri`/`os`/`rc` on the primary pair (before any secondary).
 
 ## MethylCall-consumed GAF fields

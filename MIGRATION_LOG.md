@@ -8,6 +8,26 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — No app-level CUDA Runtime on native Mojo path
+
+**Problem:** `engine/gpu_h2d.py` called `libcudart` `cudaMemcpy` for index H2D after the
+native-Mojo cutover — an explicit CUDA Runtime dependency in app code.
+
+**Completed:**
+- Index upload is Mojo-only: HostBuffer + `enqueue_copy` + device `copy_bytes_offset_kernel`.
+- `engine/gpu_h2d.py` stub raises if imported; container entrypoint no longer prepends cudart.
+- HBM preflight stays on `nvidia-smi` / `rocm-smi` (not `cudaMemGetInfo`).
+
+## 2026-08-09 — GPU HBM preflight before index upload
+
+**Problem:** Index residency OOM surfaced as raw `CUDA_ERROR_OUT_OF_MEMORY` after
+`gpu_index_resident_gib≈37` while live Align already held ~87 GiB HBM.
+
+**Completed:**
+- `engine/gpu_mem.py` — query free/total via `nvidia-smi` / `rocm-smi` (no CUDA context).
+- `require_gpu_index_capacity` before `DeviceContext` buffer alloc; clear need/free GiB error.
+- Overhead gate default 2.4× science slabs (`METHYLGRAPHER_GPU_RESIDENT_OVERHEAD`); disable with `METHYLGRAPHER_GPU_MEM_PREFLIGHT=0`.
+
 ## 2026-08-09 — GPU-native stream map (HT + gapless on DeviceContext)
 
 **Problem:** Prior “native Mojo” path only GPU-hashed seeds, then host window-reduce /
