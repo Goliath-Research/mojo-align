@@ -8,6 +8,19 @@ earlier TODOs when they conflict.
 
 ---
 
+## 2026-08-09 — GPU-native stream map (HT + gapless on DeviceContext)
+
+**Problem:** Prior “native Mojo” path only GPU-hashed seeds, then host window-reduce /
+mmap HT / cluster / gapless on one CPU thread (~20 k pairs/s, GPU util 0%).
+
+**Completed:**
+- `giraffe_gpu_index.mojo` + `engine/gpu_h2d.py` — chunked H2D of `.min` HT + dense pack once per graph.
+- `giraffe_gpu_map_kernels.mojo` — device window-reduce, Q1Q1 unique HT probe, cluster prune, gapless; D2H hits only; host GAF emit.
+- `giraffe_stream_map` GPU session retargeted; fail-closed when `GPU_REQUIRE` and backend is not DeviceContext CUDA/HIP.
+- Banner: `seed_backend=devicecontext-cuda+gpu_ht+gpu_gapless+mojo_stream`.
+- Toy PE smoke: 6 GAF lines on nvidia (short-read fixture) + non-zero GPU stage timers on longer reads.
+- Fleet Align caps remain stripped until Buffy ≤2 h + DS20M gates.
+
 ## 2026-08-09 — Docs resync to full native-Mojo map paths
 
 **Synced docs to code:**
