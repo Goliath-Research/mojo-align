@@ -438,9 +438,26 @@ def alignment(
     for fh in alignment_outs.values():
         fh.close()
 
+    if mojo_direct:
+        _finalize_mojo_gaf_named_coordinates(final_gaf)
+
     return
 
 
+def _finalize_mojo_gaf_named_coordinates(final_gaf: str) -> None:
+    """Rewrite Mojo GBZ node ids → GFA named-coordinates before MethylCall.
+
+    Align packs use ``vg convert --no-translation``; MethylCall + cpg.tsv use
+    ``*.wl.gfa`` segment ids. Classic giraffe emits ``--named-coordinates``;
+    Mojo must finalize the concatenated GAF the same way.
+    """
+    if not final_gaf or not os.path.isfile(final_gaf) or os.path.getsize(final_gaf) <= 0:
+        return
+    try:
+        from . import named_coords
+    except ImportError:
+        from engine import named_coords  # type: ignore
+    named_coords.ensure_translated_inplace(final_gaf)
 
 
 def tmp_gaf_processing(tmp_gaf_fp):

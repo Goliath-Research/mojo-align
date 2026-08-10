@@ -289,6 +289,9 @@ def translate_gaf_file(
 
 
 def default_index_dir(segments_cache: str | Path | None = None) -> Path:
+    env_idx = os.environ.get("METHYLGRAPHER_NAMED_COORDS_INDEX", "").strip()
+    if env_idx:
+        return Path(env_idx)
     root = Path(
         segments_cache
         or os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
@@ -300,3 +303,105 @@ def default_index_dir(segments_cache: str | Path | None = None) -> Path:
 def index_ready(index_dir: str | Path) -> bool:
     root = Path(index_dir)
     return (root / "meta.json").is_file() and (root / "nodes.bin").is_file()
+
+
+def gaf_has_ids_above(gaf_path: str | Path, max_id: int, *, sample_lines: int = 50000) -> bool:
+    """True if any GAF path node id exceeds ``max_id`` (sampled)."""
+    try:
+        with Path(gaf_path).open("r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= sample_lines:
+                    break
+                parts = line.split("\t")
+                if len(parts) < 6:
+                    continue
+                for tok in parts[5].replace("<", ">").split(">"):
+                    if tok.isdigit() and int(tok) > max_id:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def ensure_translated_inplace(
+    gaf_path: str | Path,
+    index_dir: str | Path | None = None,
+) -> bool:
+    """Translate a Mojo GBZ-id GAF in place to GFA named-coordinates.
+
+    Returns True if a rewrite ran. No-op when the GAF is already in GFA id
+    space or the named_coords index is missing (raises if Mojo-looking OOR
+    ids are present without an index).
+    """
+    gaf_path = Path(gaf_path)
+    if not gaf_path.is_file() or gaf_path.stat().st_size <= 0:
+        return False
+    idx_dir = Path(index_dir) if index_dir else default_index_dir()
+    stamp = Path(str(gaf_path) + ".named_coords.json")
+    max_gfa = 0
+    if index_ready(idx_dir):
+        try:
+            max_gfa = int(
+                json.loads((idx_dir / "meta.json").read_text(encoding="utf-8")).get(
+                    "max_gfa_segment"
+                )
+                or 0
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            max_gfa = 0
+    if max_gfa > 0 and not gaf_has_ids_above(gaf_path, max_gfa):
+        if not stamp.is_file():
+            stamp.write_text(
+                json.dumps(
+                    {
+                        "format": FORMAT_V1,
+                        "n_lines": None,
+                        "index": str(idx_dir.resolve()),
+                        "source_gaf": str(gaf_path.resolve()),
+                        "already_named": True,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return False
+    if not index_ready(idx_dir):
+        raise FileNotFoundError(
+            f"Mojo GAF needs GBZ→GFA named_coords but index missing: {idx_dir}"
+        )
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=gaf_path.name + ".",
+        suffix=".named.gaf",
+        dir=str(gaf_path.parent),
+        delete=False,
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        with NamedCoordsIndex(idx_dir) as idx:
+            n = translate_gaf_file(gaf_path, tmp_path, idx)
+        os.replace(str(tmp_path), str(gaf_path))
+        stamp.write_text(
+            json.dumps(
+                {
+                    "format": FORMAT_V1,
+                    "n_lines": n,
+                    "index": str(idx_dir.resolve()),
+                    "source_gaf": str(gaf_path.resolve()),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"named_coords: finalized {gaf_path} ({n} lines) via {idx_dir}",
+            flush=True,
+        )
+        return True
+    except Exception:
+        if tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
+        raise
