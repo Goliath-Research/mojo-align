@@ -107,6 +107,34 @@ def hbm_info(device: str = "nvidia") -> GpuHbmInfo:
     raise RuntimeError(f"GPU HBM preflight: unsupported device={device!r}")
 
 
+def hbm_fraction_from_env() -> Optional[float]:
+    """Operator-pinned share of *total* HBM that must be free (or ``None``).
+
+    Read from ``METHYLGRAPHER_GPU_HBM_FRACTION`` (worker.env / container ``-e``).
+    """
+    raw = os.environ.get("METHYLGRAPHER_GPU_HBM_FRACTION", "").strip()
+    if not raw:
+        return None
+    try:
+        frac = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "METHYLGRAPHER_GPU_HBM_FRACTION must be a float in (0, 1], "
+            f"got {raw!r}"
+        ) from exc
+    if not (0.0 < frac <= 1.0):
+        raise RuntimeError(
+            f"METHYLGRAPHER_GPU_HBM_FRACTION must be in (0, 1], got {frac}"
+        )
+    return frac
+
+
+def fraction_min_free_gib(fraction: float, *, device: str = "nvidia") -> float:
+    """GiB corresponding to ``fraction`` of this device's *total* HBM."""
+    info = hbm_info(device)
+    return _gib(int(float(info.total_bytes) * float(fraction)))
+
+
 def require_index_capacity(
     science_bytes: int,
     *,
@@ -143,8 +171,7 @@ def require_index_capacity(
         raise RuntimeError("GPU HBM preflight: science_bytes must be > 0")
 
     if hbm_fraction is None:
-        raw_frac = os.environ.get("METHYLGRAPHER_GPU_HBM_FRACTION", "").strip()
-        hbm_fraction = float(raw_frac) if raw_frac else None
+        hbm_fraction = hbm_fraction_from_env()
     if hbm_fraction is not None and not (0.0 < float(hbm_fraction) <= 1.0):
         raise RuntimeError(
             f"GPU HBM preflight: hbm_fraction must be in (0, 1], got {hbm_fraction}"

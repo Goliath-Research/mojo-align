@@ -395,10 +395,30 @@ def alignment(
             from engine import gpu_mem
         except ImportError:
             return
-        min_free = float(os.environ.get("METHYLGRAPHER_GRAPH_HANDOFF_FREE_GIB", "90"))
         timeout = float(os.environ.get("METHYLGRAPHER_GRAPH_HANDOFF_TIMEOUT_S", "180"))
+        # Budget is a share of whatever HBM this device actually has — the same
+        # operator pin the capacity preflight uses. The absolute GiB env stays as
+        # an escape hatch; there is no code fallback, because a fixed GiB target
+        # silently becomes unreachable on a smaller (or busier) GPU.
+        absolute = os.environ.get("METHYLGRAPHER_GRAPH_HANDOFF_FREE_GIB", "").strip()
+        if absolute:
+            min_free = float(absolute)
+            budget = f"{min_free:.1f} GiB (absolute pin)"
+        else:
+            fraction = gpu_mem.hbm_fraction_from_env()
+            if fraction is None:
+                print(
+                    "Align dual-graph HBM handoff: no budget pinned "
+                    "(METHYLGRAPHER_GPU_HBM_FRACTION / "
+                    "METHYLGRAPHER_GRAPH_HANDOFF_FREE_GIB); deferring to the next "
+                    "graph's capacity preflight",
+                    flush=True,
+                )
+                return
+            min_free = gpu_mem.fraction_min_free_gib(fraction, device=device)
+            budget = f"{min_free:.1f} GiB ({fraction:.0%} of total)"
         print(
-            f"Align dual-graph HBM handoff: waiting for ≥{min_free:.0f} GiB free "
+            f"Align dual-graph HBM handoff: waiting for ≥{budget} free "
             f"(device={device})",
             flush=True,
         )
