@@ -112,8 +112,9 @@ def require_index_capacity(
     *,
     device: str = "nvidia",
     overhead: Optional[float] = None,
+    hbm_fraction: Optional[float] = None,
 ) -> dict:
-    """Fail closed if free HBM cannot hold the resident index (+ overhead).
+    """Fail closed if free HBM cannot hold the resident index (+ budget).
 
     Parameters
     ----------
@@ -121,8 +122,13 @@ def require_index_capacity(
         HT + pack offsets + sequence bytes (device slabs).
     overhead:
         Multiplier for Mojo DeviceContext working set beyond science slabs.
-        Observed ~85 GiB HBM for ~37 GiB science on GH200 (~2.3×).
-        Env ``METHYLGRAPHER_GPU_RESIDENT_OVERHEAD`` overrides (default 2.4).
+        Used only when ``hbm_fraction`` is unset. Observed ~85 GiB HBM for
+        ~37 GiB science on GH200 (~2.3×). Env ``METHYLGRAPHER_GPU_RESIDENT_OVERHEAD``
+        overrides when the argument is ``None``.
+    hbm_fraction:
+        Preferred budget: require free HBM ≥ ``fraction * total`` (e.g. ``0.90``).
+        Env ``METHYLGRAPHER_GPU_HBM_FRACTION`` overrides when the argument is
+        ``None``. Operators pin this in worker.env / container ``-e`` (not code).
         Set ``METHYLGRAPHER_GPU_MEM_PREFLIGHT=0`` to skip.
     """
     if os.environ.get("METHYLGRAPHER_GPU_MEM_PREFLIGHT", "1").strip().lower() in {
@@ -136,17 +142,39 @@ def require_index_capacity(
     if science_bytes <= 0:
         raise RuntimeError("GPU HBM preflight: science_bytes must be > 0")
 
+    if hbm_fraction is None:
+        raw_frac = os.environ.get("METHYLGRAPHER_GPU_HBM_FRACTION", "").strip()
+        hbm_fraction = float(raw_frac) if raw_frac else None
+    if hbm_fraction is not None and not (0.0 < float(hbm_fraction) <= 1.0):
+        raise RuntimeError(
+            f"GPU HBM preflight: hbm_fraction must be in (0, 1], got {hbm_fraction}"
+        )
+
     if overhead is None:
         raw = os.environ.get("METHYLGRAPHER_GPU_RESIDENT_OVERHEAD", "").strip()
-        overhead = float(raw) if raw else 2.4
-    if overhead < 1.0:
+        overhead = float(raw) if raw else None
+    if overhead is not None and overhead < 1.0:
         raise RuntimeError(
             f"GPU HBM preflight: overhead must be >= 1.0 (got {overhead})"
         )
 
     info = hbm_info(device)
     need_science = int(science_bytes)
-    need_total = int(float(science_bytes) * float(overhead))
+    if hbm_fraction is not None:
+        need_total = int(float(info.total_bytes) * float(hbm_fraction))
+        budget_mode = "fraction"
+        budget_value = float(hbm_fraction)
+    else:
+        # Legacy overhead path when fraction is not pinned by the operator.
+        if overhead is None:
+            raise RuntimeError(
+                "GPU HBM preflight: set METHYLGRAPHER_GPU_HBM_FRACTION "
+                "(preferred, e.g. 0.90) or METHYLGRAPHER_GPU_RESIDENT_OVERHEAD "
+                "in the container env / worker deploy."
+            )
+        need_total = int(float(science_bytes) * float(overhead))
+        budget_mode = "overhead"
+        budget_value = float(overhead)
     report = {
         "skipped": False,
         "source": info.source,
@@ -154,7 +182,9 @@ def require_index_capacity(
         "total_bytes": info.total_bytes,
         "science_bytes": need_science,
         "need_bytes": need_total,
-        "overhead": float(overhead),
+        "budget_mode": budget_mode,
+        "overhead": float(overhead) if overhead is not None else None,
+        "hbm_fraction": float(hbm_fraction) if hbm_fraction is not None else None,
         "free_gib": _gib(info.free_bytes),
         "total_gib": _gib(info.total_bytes),
         "science_gib": _gib(need_science),
@@ -171,8 +201,9 @@ def require_index_capacity(
         round(report["science_gib"], 3),
         " need_gib=",
         round(report["need_gib"], 3),
-        " overhead=",
-        overhead,
+        " budget=",
+        budget_mode,
+        budget_value,
         flush=True,
     )
 
@@ -185,13 +216,23 @@ def require_index_capacity(
             "Mojo/DeviceContext) before retrying."
         )
     if info.free_bytes < need_total:
+        if budget_mode == "fraction":
+            raise RuntimeError(
+                "GPU HBM insufficient for configured free-fraction budget: need "
+                f"{report['need_gib']:.2f} GiB free "
+                f"({float(hbm_fraction):.0%} of {report['total_gib']:.2f} GiB total); have "
+                f"{report['free_gib']:.2f} GiB free (via {info.source}). "
+                "Set METHYLGRAPHER_GPU_HBM_FRACTION to tune; ensure no other "
+                "process holds HBM, and that the host worker released the prior action."
+            )
         raise RuntimeError(
             "GPU HBM insufficient for Mojo DeviceContext working set: science "
             f"slabs are {report['science_gib']:.2f} GiB but observed residency is "
-            f"~{overhead:.1f}× that (~{report['need_gib']:.2f} GiB need); have "
+            f"~{float(overhead):.1f}× that (~{report['need_gib']:.2f} GiB need); have "
             f"{report['free_gib']:.2f} GiB free / {report['total_gib']:.2f} GiB total "
-            f"(via {info.source}). Set METHYLGRAPHER_GPU_RESIDENT_OVERHEAD to tune; "
-            "ensure no other process holds HBM."
+            f"(via {info.source}). Prefer METHYLGRAPHER_GPU_HBM_FRACTION; or set "
+            "METHYLGRAPHER_GPU_RESIDENT_OVERHEAD to tune; ensure no other process "
+            "holds HBM."
         )
     return report
 
