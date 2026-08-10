@@ -96,6 +96,8 @@ def help_text() -> String:
         "    methylGrapher MojoGiraffe -gbz <gbz> -dist <dist> -min <min>\n"
         "        [-zipcodes <zip>] -fq1 <fastq> [-fq2 <fastq>] -out_gaf <path>\n"
         "        [-device auto|cpu|nvidia|amd] [-k <kmer>]\n"
+        "    QC linear SAM (no host Python packer): add -out_sam <path>\n"
+        "        -segment_offsets <grch38_offsets_dir>\n"
         "\n"
         "MojoFq2bamMeth (native Mojo linear map → BAM; portable device):\n"
         "    methylGrapher MojoFq2bamMeth -fq1 <fastq> -fq2 <fastq> -ref <fa>\n"

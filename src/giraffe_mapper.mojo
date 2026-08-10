@@ -146,12 +146,20 @@ def map_gbz_fastq_to_gaf(
 
 
 def run_mojo_giraffe_cli(args: List[String]) raises -> Int:
-    """CLI: MojoGiraffe (-gfa|-gbz) -fq1 … -out_gaf … [-fq2] [-dist] [-min] [-zipcodes]."""
+    """CLI: MojoGiraffe (-gfa|-gbz) -fq1 … (-out_gaf|-out_sam) …
+
+    ``-out_sam`` enables QC linear SAM emit (sets METHYLGRAPHER_MOJO_EMIT=sam)
+    and requires ``-segment_offsets <dir>`` (grch38-dense-v1 from
+    scripts/build_grch38_offsets.py).
+    """
+    var os_mod = Python.import_module("os")
     var gfa = get_kv_value(args, "gfa", "")
     var gbz = get_kv_value(args, "gbz", "")
     var fq1 = get_kv_value(args, "fq1", "")
     var fq2 = get_kv_value(args, "fq2", "")
-    var out_gaf = get_kv_value(args, "out_gaf", "alignment.gaf")
+    var out_gaf = get_kv_value(args, "out_gaf", "")
+    var out_sam = get_kv_value(args, "out_sam", "")
+    var segment_offsets = get_kv_value(args, "segment_offsets", "")
     var device = get_kv_value(args, "device", "auto")
     var k = Int(get_kv_value(args, "k", "5"))
     var dist = get_kv_value(args, "dist", "")
@@ -159,12 +167,28 @@ def run_mojo_giraffe_cli(args: List[String]) raises -> Int:
     var zipcodes = get_kv_value(args, "zipcodes", "")
     if fq1.byte_length() == 0:
         raise Error("MojoGiraffe requires -fq1")
+    var out_path = out_gaf
+    if out_sam.byte_length() > 0:
+        if segment_offsets.byte_length() == 0:
+            raise Error("MojoGiraffe -out_sam requires -segment_offsets")
+        os_mod.environ["METHYLGRAPHER_MOJO_EMIT"] = "sam"
+        os_mod.environ["METHYLGRAPHER_MOJO_SEGMENT_OFFSETS"] = segment_offsets
+        out_path = out_sam
+        print(
+            "MojoGiraffe QC SAM emit offsets=",
+            segment_offsets,
+            " out=",
+            out_path,
+            flush=True,
+        )
+    elif out_path.byte_length() == 0:
+        out_path = "alignment.gaf"
     if gbz.byte_length() > 0:
         _ = map_gbz_fastq_to_gaf(
-            gbz, fq1, out_gaf, device, k, fq2, dist, min_path, zipcodes
+            gbz, fq1, out_path, device, k, fq2, dist, min_path, zipcodes
         )
         return 0
     if gfa.byte_length() == 0:
         raise Error("MojoGiraffe requires -gfa or -gbz")
-    _ = map_fastq_to_gaf(gfa, fq1, out_gaf, device, k, fq2)
+    _ = map_fastq_to_gaf(gfa, fq1, out_path, device, k, fq2)
     return 0

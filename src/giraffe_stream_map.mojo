@@ -13,7 +13,8 @@ from std.sys import has_accelerator
 
 from giraffe_device import require_device_or_raise
 from giraffe_dist import cluster_seed_hits
-from giraffe_gaf_emit import append_gaf_hits, open_gaf_write
+from giraffe_gaf_emit import append_gaf_hits, emit_footer_log, open_gaf_write
+from giraffe_sam_emit import close_qc_offsets
 from giraffe_gapless import gapless_extend_with_pack
 from giraffe_gpu_kernels import (
     kernel_target_label,
@@ -350,6 +351,8 @@ def map_fastq_stream_to_gaf(
             fh2.close()
         out_fh.close()
         min_idx.close()
+        emit_footer_log()
+        close_qc_offsets()
         print(
             "mojo_stream_map done gaf_lines=",
             n_wrt,
@@ -455,6 +458,8 @@ def map_fastq_stream_to_gaf(
         fh2.close()
     out_fh.close()
     min_idx.close()
+    emit_footer_log()
+    close_qc_offsets()
     print(
         "mojo_stream_map done records=",
         n_records,

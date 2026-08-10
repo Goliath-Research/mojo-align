@@ -1,10 +1,23 @@
 # GAF emitter (named-coordinates path column) for Mojo Giraffe.
+# When METHYLGRAPHER_MOJO_EMIT=sam, streams linear SAM instead (QC BAM path).
 
 from std.collections import List
 from std.python import Python, PythonObject
 
 from giraffe_hit import AlignmentHit
+from giraffe_sam_emit import append_sam_hits, open_sam_write, sam_emit_summary
 from utility import write_text_file
+
+
+def _emit_mode_sam() raises -> Bool:
+    var os_mod = Python.import_module("os")
+    var mode = String(os_mod.environ.get("METHYLGRAPHER_MOJO_EMIT", "")).lower()
+    return mode == "sam" or mode == "qc_sam"
+
+
+def _segment_offsets_root() raises -> String:
+    var os_mod = Python.import_module("os")
+    return String(os_mod.environ.get("METHYLGRAPHER_MOJO_SEGMENT_OFFSETS", ""))
 
 
 def _bq_phred40(qlen: Int) raises -> String:
@@ -82,7 +95,15 @@ def write_gaf(path: String, hits: List[AlignmentHit]) raises:
 
 
 def open_gaf_write(path: String) raises -> PythonObject:
-    """Open GAF for streaming append (Buffy-scale; never buffer whole file)."""
+    """Open GAF (or QC SAM) for streaming append — never buffer whole file."""
+    if _emit_mode_sam():
+        var root = _segment_offsets_root()
+        if root.byte_length() == 0:
+            raise Error(
+                "METHYLGRAPHER_MOJO_EMIT=sam requires METHYLGRAPHER_MOJO_SEGMENT_OFFSETS"
+            )
+        print("mojo_emit mode=sam offsets=", root, " out=", path, flush=True)
+        return open_sam_write(path, root)
     var pathlib = Python.import_module("pathlib")
     var builtins = Python.import_module("builtins")
     # /dev/fd/N (legacy pipe path) must not mkdir parents.
@@ -93,7 +114,12 @@ def open_gaf_write(path: String) raises -> PythonObject:
 
 
 def append_gaf_hits(fh: PythonObject, hits: List[AlignmentHit]) raises -> Int:
-    """Write mapped hits (skip path=*); return lines written."""
+    """Write mapped hits (skip path=*); return lines written.
+
+    SAM mode projects to linear chrom/pos via GRCh38 offset table + os:Z.
+    """
+    if _emit_mode_sam():
+        return append_sam_hits(fh, hits)
     var n = 0
     for h in hits:
         if h.path == "*" or h.path.byte_length() == 0:
@@ -101,3 +127,9 @@ def append_gaf_hits(fh: PythonObject, hits: List[AlignmentHit]) raises -> Int:
         fh.write(format_gaf_line(h) + "\n")
         n += 1
     return n
+
+
+def emit_footer_log() raises:
+    """Optional end-of-stream summary (SAM QC path)."""
+    if _emit_mode_sam():
+        print("mojo_qc_sam done ", sam_emit_summary(), flush=True)
