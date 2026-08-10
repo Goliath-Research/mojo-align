@@ -440,6 +440,17 @@ def _python_alignment_to_parsed(aln: PythonObject) raises -> ParsedAlignment:
             phred_score = String(tag[byte = 5 : tag.byte_length()])
             have_bq = True
 
+    # Mojo GAF may omit bq:Z; synthesize Q40 so MethylCall can proceed.
+    if have_os and not have_bq and original_bs_read.byte_length() > 0:
+        var n = original_bs_read.byte_length()
+        var bq = String("")
+        var bi = 0
+        while bi < n:
+            bq = bq + "I"
+            bi += 1
+        phred_score = bq
+        have_bq = True
+
     out.alignment_tag = alignment_tag
     out.original_bs_read = original_bs_read
     out.read_conversion_type = read_conversion_type

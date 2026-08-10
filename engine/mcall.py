@@ -267,7 +267,9 @@ def get_best_alignment_from_same_read_pair(
                 if mpi == 1:
                     multimapped = True
 
-        assert alignment_score is not None
+        # MojoGiraffe historically omitted AS:i:; fall back to GAF matches (col 9).
+        if alignment_score is None:
+            alignment_score = int(alignment[9])
 
         if multimapped:
             if discard_multimapped:
