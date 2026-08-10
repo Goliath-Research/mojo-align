@@ -13,7 +13,7 @@ from std.sys import has_accelerator
 
 from giraffe_device import require_device_or_raise
 from giraffe_dist import cluster_seed_hits
-from giraffe_gaf_emit import append_gaf_hits, emit_footer_log, open_gaf_write
+from giraffe_gaf_emit import append_gaf_hits, close_emit, emit_footer_log, open_gaf_write
 from giraffe_sam_emit import close_qc_offsets
 from giraffe_gapless import gapless_extend_with_pack
 from giraffe_gpu_kernels import (
@@ -349,7 +349,7 @@ def map_fastq_stream_to_gaf(
         fh1.close()
         if paired:
             fh2.close()
-        out_fh.close()
+        close_emit(out_fh)
         min_idx.close()
         emit_footer_log()
         close_qc_offsets()
@@ -456,7 +456,7 @@ def map_fastq_stream_to_gaf(
     fh1.close()
     if paired:
         fh2.close()
-    out_fh.close()
+    close_emit(out_fh)
     min_idx.close()
     emit_footer_log()
     close_qc_offsets()

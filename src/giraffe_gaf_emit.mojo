@@ -5,7 +5,12 @@ from std.collections import List
 from std.python import Python, PythonObject
 
 from giraffe_hit import AlignmentHit
-from giraffe_sam_emit import append_sam_hits, open_sam_write, sam_emit_summary
+from giraffe_sam_emit import (
+    append_sam_hits,
+    close_sam_write,
+    open_sam_write,
+    sam_emit_summary,
+)
 from utility import write_text_file
 
 
@@ -127,6 +132,14 @@ def append_gaf_hits(fh: PythonObject, hits: List[AlignmentHit]) raises -> Int:
         fh.write(format_gaf_line(h) + "\n")
         n += 1
     return n
+
+
+def close_emit(fh: PythonObject) raises:
+    """Flush/close GAF or QC SAM stream (SAM path keeps a write buffer)."""
+    if _emit_mode_sam():
+        close_sam_write(fh)
+    else:
+        fh.close()
 
 
 def emit_footer_log() raises:

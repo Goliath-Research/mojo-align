@@ -1,4 +1,8 @@
-"""Dense grch38-dense-v1 segment offset table (mmap) for Mojo QC SAM emit."""
+"""Dense grch38-dense-v1 segment offset table (mmap) + buffered QC SAM emit.
+
+SAM formatting lives here so MojoGiraffe QC can use the already-mounted
+``engine/grch38_offsets.py`` overlay without requiring a new runner mount.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ import json
 import mmap
 import struct
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 RECORD = struct.Struct("<IIQ")
 UNSET = 0xFFFFFFFF
@@ -62,6 +66,9 @@ _TABLE: Optional[Grch38OffsetsTable] = None
 _mapped = 0
 _skip_no_seq = 0
 _skip_no_anchor = 0
+_BUF: List[str] = []
+_BUF_CHARS = 0
+_BUF_FLUSH = 4 * 1024 * 1024
 
 
 def open_table(root: str) -> None:
@@ -113,3 +120,113 @@ def summary() -> str:
         f"mapped={_mapped} skip_no_seq={_skip_no_seq} "
         f"skip_no_anchor={_skip_no_anchor}"
     )
+
+
+def _project_path(path: str) -> Optional[Tuple[str, int]]:
+    if not path or path == "*":
+        return None
+    n = len(path)
+    i = 0
+    while i < n:
+        ch = path[i]
+        if ch not in "><":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and path[j] not in "><":
+            j += 1
+        try:
+            sid = int(path[i + 1 : j])
+        except ValueError:
+            i = j
+            continue
+        info = lookup(sid)
+        if info is not None:
+            chrom, start0, _length = info
+            return chrom, int(start0) + 1
+        i = j
+    return None
+
+
+def _tag_value(extras: str, prefix: str) -> str:
+    if not extras:
+        return ""
+    if extras.startswith(prefix):
+        idx = 0
+    else:
+        needle = "\t" + prefix
+        at = extras.find(needle)
+        if at < 0:
+            return ""
+        idx = at + 1
+    start = idx + len(prefix)
+    tab = extras.find("\t", start)
+    return extras[start:] if tab < 0 else extras[start:tab]
+
+
+def _flush(fh: Any) -> None:
+    global _BUF, _BUF_CHARS
+    if not _BUF:
+        return
+    fh.write("".join(_BUF))
+    _BUF = []
+    _BUF_CHARS = 0
+
+
+def open_sam(path: str, offsets_root: str) -> Any:
+    """Open buffered QC SAM + offset table (Mojo QC path)."""
+    global _BUF, _BUF_CHARS
+    _BUF = []
+    _BUF_CHARS = 0
+    open_table(offsets_root)
+    print(f"grch38_offsets open root={offsets_root}", flush=True)
+    fh = open(path, "w", buffering=8 * 1024 * 1024)
+    fh.write("@HD\tVN:1.6\tSO:unsorted\n")
+    for sn, ln in zip(chroms(), chrom_lens()):
+        fh.write(f"@SQ\tSN:{sn}\tLN:{max(int(ln), 1)}\n")
+    return fh
+
+
+def close_sam(fh: Any) -> None:
+    try:
+        _flush(fh)
+        fh.flush()
+        fh.close()
+    finally:
+        close_table()
+
+
+def append_hits(fh: Any, rows: Sequence[Sequence[Any]]) -> int:
+    """rows: (query_name, path, mapq, extra_tags). Returns mapped count."""
+    global _BUF, _BUF_CHARS
+    n = 0
+    for row in rows:
+        qname_s = str(row[0])
+        path_s = str(row[1])
+        mapq = int(row[2])
+        extras = str(row[3]) if len(row) > 3 else ""
+        if not path_s or path_s == "*":
+            continue
+        seq = _tag_value(extras, "os:Z:")
+        if not seq:
+            bump_skip_no_seq()
+            continue
+        proj = _project_path(path_s)
+        if proj is None:
+            bump_skip_no_anchor()
+            continue
+        chrom, pos1 = proj
+        # QUAL '*' — restore_original_sequences uses FASTQ, not BAM qualities.
+        line = (
+            f"{qname_s}\t0\t{chrom}\t{pos1}\t{mapq}\t{len(seq)}M"
+            f"\t*\t0\t0\t{seq}\t*\n"
+        )
+        _BUF.append(line)
+        _BUF_CHARS += len(line)
+        n += 1
+        mapped = bump_mapped()
+        if mapped % 1_000_000 == 0:
+            print(f"mojo_qc_sam progress {summary()}", flush=True)
+        if _BUF_CHARS >= _BUF_FLUSH:
+            _flush(fh)
+    return n
