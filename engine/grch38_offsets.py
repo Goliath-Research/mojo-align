@@ -10,10 +10,16 @@ import json
 import mmap
 import struct
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 RECORD = struct.Struct("<IIQ")
 UNSET = 0xFFFFFFFF
+
+# SAM flags used for QC PE emit (ri:i from Mojo map kernels).
+_FLAG_PAIRED = 0x1
+_FLAG_PROPER_PAIR = 0x2
+_FLAG_READ1 = 0x40
+_FLAG_READ2 = 0x80
 
 
 class Grch38OffsetsTable:
@@ -164,6 +170,16 @@ def _tag_value(extras: str, prefix: str) -> str:
     return extras[start:] if tab < 0 else extras[start:tab]
 
 
+def _read_index(extras: str) -> Optional[int]:
+    """Parse Mojo ``ri:i:1|2`` tag (which FASTQ mate produced the hit)."""
+    raw = _tag_value(extras, "ri:i:")
+    if raw == "1":
+        return 1
+    if raw == "2":
+        return 2
+    return None
+
+
 def _flush(fh: Any) -> None:
     global _BUF, _BUF_CHARS
     if not _BUF:
@@ -197,9 +213,15 @@ def close_sam(fh: Any) -> None:
 
 
 def append_hits(fh: Any, rows: Sequence[Sequence[Any]]) -> int:
-    """rows: (query_name, path, mapq, extra_tags). Returns mapped count."""
+    """rows: (query_name, path, mapq, extra_tags). Returns mapped count.
+
+    Uses ``ri:i`` from Mojo map kernels for READ1/READ2 + PAIRED bits. When both
+    mates of a qname project in the same batch, also set PROPER_PAIR and mate
+    RNEXT/PNEXT/TLEN so samtools flagstat PE rates are meaningful.
+    """
     global _BUF, _BUF_CHARS
-    n = 0
+
+    prepared: List[Tuple[str, str, int, int, str, Optional[int]]] = []
     for row in rows:
         qname_s = str(row[0])
         path_s = str(row[1])
@@ -216,10 +238,46 @@ def append_hits(fh: Any, rows: Sequence[Sequence[Any]]) -> int:
             bump_skip_no_anchor()
             continue
         chrom, pos1 = proj
+        prepared.append((qname_s, chrom, pos1, mapq, seq, _read_index(extras)))
+
+    mates_by_q: Dict[str, Dict[int, int]] = {}
+    for idx, (qname_s, _chrom, _pos1, _mapq, _seq, ri) in enumerate(prepared):
+        if ri is None:
+            continue
+        mates_by_q.setdefault(qname_s, {})[ri] = idx
+
+    n = 0
+    for idx, (qname_s, chrom, pos1, mapq, seq, ri) in enumerate(prepared):
+        flag = 0
+        rnext = "*"
+        pnext = 0
+        tlen = 0
+        if ri == 1:
+            flag |= _FLAG_PAIRED | _FLAG_READ1
+        elif ri == 2:
+            flag |= _FLAG_PAIRED | _FLAG_READ2
+        mate_idx = None
+        if ri is not None:
+            mate_ri = 2 if ri == 1 else 1
+            mate_idx = mates_by_q.get(qname_s, {}).get(mate_ri)
+        if mate_idx is not None:
+            _mq, mate_chrom, mate_pos, _mmapq, mate_seq, _mri = prepared[mate_idx]
+            flag |= _FLAG_PROPER_PAIR
+            rnext = "=" if mate_chrom == chrom else mate_chrom
+            pnext = int(mate_pos)
+            # Template length: 5' of this read to 3' of mate on same contig.
+            if mate_chrom == chrom:
+                this_end = pos1 + len(seq)
+                mate_end = mate_pos + len(mate_seq)
+                if pos1 <= mate_pos:
+                    tlen = mate_end - pos1
+                else:
+                    tlen = -(this_end - mate_pos)
+
         # QUAL '*' — restore_original_sequences uses FASTQ, not BAM qualities.
         line = (
-            f"{qname_s}\t0\t{chrom}\t{pos1}\t{mapq}\t{len(seq)}M"
-            f"\t*\t0\t0\t{seq}\t*\n"
+            f"{qname_s}\t{flag}\t{chrom}\t{pos1}\t{mapq}\t{len(seq)}M"
+            f"\t{rnext}\t{pnext}\t{tlen}\t{seq}\t*\n"
         )
         _BUF.append(line)
         _BUF_CHARS += len(line)
