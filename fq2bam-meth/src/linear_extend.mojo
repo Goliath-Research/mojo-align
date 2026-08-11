@@ -1,6 +1,7 @@
 # Seed-and-extend + SAM emit for linear MojoFq2bamMeth.
 
 from std.collections import Dict, List
+from std.python import Python
 
 from linear_index import LinearIndex
 from linear_seed import seed_hits
@@ -142,23 +143,71 @@ def extend_read_with_seeds(
     if index.dense and len(seed_kmers) > 0:
         var vote = index.vote_dense_seeds(seed_kmers, _seed_stride())
         if vote.cid >= 0 and vote.votes > 0:
+            # Host mirror of GPU mismatch+softclip accept (fallback path).
+            var os_mod = Python.import_module("os")
+            var max_diff = Int(
+                String(os_mod.environ.get("METHYLGRAPHER_LINEAR_MAX_DIFF", "6"))
+            )
+            var max_soft = Int(
+                String(os_mod.environ.get("METHYLGRAPHER_LINEAR_MAX_SOFT", "8"))
+            )
             var window = index.contig_window_id(vote.cid, vote.start, qlen)
-            if window.byte_length() == qlen and window == seq:
-                var mq = 20
-                if vote.votes >= 3:
-                    mq = 40
-                if vote.votes >= 5:
-                    mq = 60
-                return LinearHit(
-                    name,
-                    0,
-                    index.contig_name(vote.cid),
-                    vote.start + 1,
-                    mq,
-                    String(qlen) + "M",
-                    seq,
-                    "*",
-                )
+            if window.byte_length() == qlen:
+                var nm = 0
+                var i = 0
+                while i < qlen:
+                    if String(window[byte = i : i + 1]).upper() != String(
+                        seq[byte = i : i + 1]
+                    ).upper():
+                        nm += 1
+                    i += 1
+                var sl = 0
+                var sr = 0
+                if nm > max_diff:
+                    while sl < max_soft and sl < qlen:
+                        if String(window[byte = sl : sl + 1]).upper() == String(
+                            seq[byte = sl : sl + 1]
+                        ).upper():
+                            break
+                        sl += 1
+                    while sr < max_soft and sr + sl < qlen:
+                        var jr = qlen - 1 - sr
+                        if String(window[byte = jr : jr + 1]).upper() == String(
+                            seq[byte = jr : jr + 1]
+                        ).upper():
+                            break
+                        sr += 1
+                    nm = 0
+                    var jm = sl
+                    while jm < qlen - sr:
+                        if String(window[byte = jm : jm + 1]).upper() != String(
+                            seq[byte = jm : jm + 1]
+                        ).upper():
+                            nm += 1
+                        jm += 1
+                var alen = qlen - sl - sr
+                if nm <= max_diff and alen >= 32:
+                    var mq = 20
+                    if vote.votes >= 3:
+                        mq = 40
+                    if vote.votes >= 5:
+                        mq = 60
+                    var cigar = String("")
+                    if sl > 0:
+                        cigar = cigar + String(sl) + "S"
+                    cigar = cigar + String(alen) + "M"
+                    if sr > 0:
+                        cigar = cigar + String(sr) + "S"
+                    return LinearHit(
+                        name,
+                        0,
+                        index.contig_name(vote.cid),
+                        vote.start + sl + 1,
+                        mq,
+                        cigar,
+                        seq,
+                        "*",
+                    )
         return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
     # Toy / non-dense: GPU/host k-mers → string postings → gapless verify.

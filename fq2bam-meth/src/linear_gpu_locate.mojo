@@ -7,7 +7,7 @@
 # Locate default = binary search on sorted keys. Optional interpolation search
 # via METHYLGRAPHER_LINEAR_LOCATE_ALGO=interp (keys are numeric 2-bit codes).
 
-from std.collections import List
+from std.collections import Dict, List
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
@@ -103,18 +103,31 @@ def _env_str(name: String, default: String) raises -> String:
     return raw
 
 
+def _canonical_contig(name: String) raises -> String:
+    """Strip bwameth ``f``/``r`` prefix so SAM matches the original reference."""
+    if name.byte_length() >= 2:
+        var p = String(name[byte = 0 : 1])
+        if p == "f" or p == "r":
+            return String(name[byte = 1 : name.byte_length()])
+    return name
+
+
 def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
     fh.write("@HD\tVN:1.6\tSO:unsorted\n")
     var n = index.contig_count()
+    var seen = Dict[String, Int]()
     var ci = 0
     while ci < n:
-        fh.write(
-            "@SQ\tSN:"
-            + index.contig_name(ci)
-            + "\tLN:"
-            + String(index.contig_length(ci))
-            + "\n"
-        )
+        var canon = _canonical_contig(index.contig_name(ci))
+        if canon not in seen:
+            seen[canon] = 1
+            fh.write(
+                "@SQ\tSN:"
+                + canon
+                + "\tLN:"
+                + String(index.contig_length(ci))
+                + "\n"
+            )
         ci += 1
     fh.write("@PG\tID:MojoFq2bamMeth\tPN:MojoFq2bamMeth\tVN:0.1.0-mojo\n")
     try:
@@ -137,17 +150,29 @@ def _hit_from_gpu(
     cid: Int,
     start0: Int,
     mapq: Int,
+    flag: Int,
+    soft_l: Int,
+    soft_r: Int,
 ) raises -> LinearHit:
     var qlen = seq.byte_length()
     if cid < 0:
         return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+    var m = qlen - soft_l - soft_r
+    if m < 1:
+        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+    var cigar = String("")
+    if soft_l > 0:
+        cigar = cigar + String(soft_l) + "S"
+    cigar = cigar + String(m) + "M"
+    if soft_r > 0:
+        cigar = cigar + String(soft_r) + "S"
     return LinearHit(
         name,
-        0,
-        index.contig_name(cid),
+        flag,
+        _canonical_contig(index.contig_name(cid)),
         start0 + 1,
         mapq,
-        String(qlen) + "M",
+        cigar,
         seq,
         "*",
     )
@@ -407,7 +432,33 @@ def map_fastq_dense_gpu_locate(
             out_start[idx] = start
             out_end[idx] = end
 
-        def vote_gapless_kernel(
+        def rc_codes_kernel(
+            codes: UnsafePointer[UInt8, MutAnyOrigin],
+            rc_codes: UnsafePointer[UInt8, MutAnyOrigin],
+            read_lens: UnsafePointer[UInt32, MutAnyOrigin],
+            n_reads: Int,
+            max_len: Int,
+        ):
+            """Reverse-complement 2-bit codes per read (strand 16 path)."""
+            var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if rid >= n_reads:
+                return
+            var L = Int(read_lens[rid])
+            var base = rid * max_len
+            var i = 0
+            while i < max_len:
+                rc_codes[base + i] = 255
+                i += 1
+            var j = 0
+            while j < L:
+                var c = codes[base + (L - 1 - j)]
+                var r: UInt8 = 255
+                if c <= 3:
+                    r = c ^ 3
+                rc_codes[base + j] = r
+                j += 1
+
+        def vote_extend_kernel(
             occ_start: UnsafePointer[UInt64, MutAnyOrigin],
             occ_end: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
@@ -421,28 +472,37 @@ def map_fastq_dense_gpu_locate(
             max_len: Int,
             slots_per_read: Int,
             n_reads: Int,
+            max_diff: Int,
+            max_soft: Int,
+            strand_flag: Int32,
             out_cid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
             out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
+            out_flag: UnsafePointer[Int32, MutAnyOrigin],
+            out_sl: UnsafePointer[UInt32, MutAnyOrigin],
+            out_sr: UnsafePointer[UInt32, MutAnyOrigin],
+            out_nm: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            """One thread/read: majority vote on rare loci + gapless verify."""
+            """Vote top loci; accept with mismatches + end soft-clips (BWA-ish)."""
             var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
             if rid >= n_reads:
                 return
             out_cid[rid] = Int32(-1)
             out_pos[rid] = 0
             out_mapq[rid] = 0
+            out_flag[rid] = Int32(4)
+            out_sl[rid] = 0
+            out_sr[rid] = 0
+            out_nm[rid] = 0
             var qlen = Int(read_lens[rid])
             if qlen <= 0:
                 return
 
-            # Small open candidate table in registers/local (unique loci).
             comptime TOP = 128
+            comptime KEEP = 8
             var cand_key = InlineArray[UInt64, TOP](fill=UInt64(0xFFFFFFFFFFFFFFFF))
             var cand_n = InlineArray[Int32, TOP](fill=Int32(0))
             var n_cand = 0
-            var best_i = -1
-            var best_n: Int32 = 0
 
             var slot = 0
             while slot < slots_per_read:
@@ -467,60 +527,166 @@ def map_fastq_dense_gpu_locate(
                                 ci += 1
                             if found >= 0:
                                 cand_n[found] = cand_n[found] + 1
-                                if cand_n[found] > best_n:
-                                    best_n = cand_n[found]
-                                    best_i = found
                             elif n_cand < TOP:
                                 cand_key[n_cand] = vk
                                 cand_n[n_cand] = 1
-                                if best_n < 1:
-                                    best_n = 1
-                                    best_i = n_cand
                                 n_cand += 1
                         pi += 1
                 slot += 1
 
-            if best_i < 0 or best_n <= 0:
+            if n_cand == 0:
                 return
-            var bkey = cand_key[best_i]
-            var bcid = Int(bkey >> 32)
-            var bstart = Int(bkey & UInt64(0xFFFFFFFF))
-            if bcid < 0 or bcid >= n_contigs:
-                return
-            var off0 = Int(contig_off[bcid])
-            var off1 = Int(contig_off[bcid + 1])
-            if bstart < 0 or bstart + qlen > off1 - off0:
-                return
-            var ref_base = off0 + bstart
+
+            # Select up to KEEP highest-vote candidates.
+            var pick_i = InlineArray[Int32, KEEP](fill=Int32(-1))
+            var pick_n = InlineArray[Int32, KEEP](fill=Int32(0))
+            var n_pick = 0
+            var ci2 = 0
+            while ci2 < n_cand:
+                var votes = cand_n[ci2]
+                var inserted = False
+                var p = 0
+                while p < n_pick:
+                    if votes > pick_n[p]:
+                        var shift = n_pick
+                        if shift > KEEP - 1:
+                            shift = KEEP - 1
+                        while shift > p:
+                            pick_i[shift] = pick_i[shift - 1]
+                            pick_n[shift] = pick_n[shift - 1]
+                            shift -= 1
+                        pick_i[p] = Int32(ci2)
+                        pick_n[p] = votes
+                        if n_pick < KEEP:
+                            n_pick += 1
+                        inserted = True
+                        break
+                    p += 1
+                if not inserted and n_pick < KEEP:
+                    pick_i[n_pick] = Int32(ci2)
+                    pick_n[n_pick] = votes
+                    n_pick += 1
+                ci2 += 1
+
             var q_base = rid * max_len
-            var ok = True
-            var j = 0
-            while j < qlen:
-                var rb = sequences[ref_base + j]
-                var rc: UInt8 = 255
-                if rb == 65 or rb == 97:
-                    rc = 0
-                elif rb == 67 or rb == 99:
-                    rc = 1
-                elif rb == 71 or rb == 103:
-                    rc = 2
-                elif rb == 84 or rb == 116:
-                    rc = 3
-                var qc = codes[q_base + j]
-                if rc > 3 or qc > 3 or rc != qc:
-                    ok = False
-                    break
-                j += 1
-            if not ok:
-                return
-            var mq: UInt32 = 20
-            if best_n >= 3:
-                mq = 40
-            if best_n >= 5:
-                mq = 60
-            out_cid[rid] = Int32(bcid)
-            out_pos[rid] = UInt32(bstart)
-            out_mapq[rid] = mq
+            var budget = max_diff
+            if budget < 2:
+                budget = 2
+            if budget > qlen // 2:
+                budget = qlen // 2
+            var clip_cap = max_soft
+            if clip_cap > qlen // 4:
+                clip_cap = qlen // 4
+
+            var pk = 0
+            while pk < n_pick:
+                var ix = Int(pick_i[pk])
+                var bkey = cand_key[ix]
+                var votes = pick_n[pk]
+                var bcid = Int(bkey >> 32)
+                var bstart = Int(bkey & UInt64(0xFFFFFFFF))
+                if bcid >= 0 and bcid < n_contigs and bstart >= 0:
+                    var off0 = Int(contig_off[bcid])
+                    var off1 = Int(contig_off[bcid + 1])
+                    var clen = off1 - off0
+                    if bstart + qlen <= clen:
+                        var ref_base = off0 + bstart
+                        # Mismatch mask along the read.
+                        var nm_all = 0
+                        var j = 0
+                        while j < qlen:
+                            var rb = sequences[ref_base + j]
+                            var rc: UInt8 = 255
+                            if rb == 65 or rb == 97:
+                                rc = 0
+                            elif rb == 67 or rb == 99:
+                                rc = 1
+                            elif rb == 71 or rb == 103:
+                                rc = 2
+                            elif rb == 84 or rb == 116:
+                                rc = 3
+                            var qc = codes[q_base + j]
+                            if rc > 3 or qc > 3 or rc != qc:
+                                nm_all += 1
+                            j += 1
+
+                        var sl = 0
+                        var sr = 0
+                        var nm = nm_all
+                        if nm_all > budget:
+                            # Trim mismatch-heavy ends (soft-clip), re-score middle.
+                            while sl < clip_cap:
+                                var rb0 = sequences[ref_base + sl]
+                                var rc0: UInt8 = 255
+                                if rb0 == 65 or rb0 == 97:
+                                    rc0 = 0
+                                elif rb0 == 67 or rb0 == 99:
+                                    rc0 = 1
+                                elif rb0 == 71 or rb0 == 103:
+                                    rc0 = 2
+                                elif rb0 == 84 or rb0 == 116:
+                                    rc0 = 3
+                                var qc0 = codes[q_base + sl]
+                                if rc0 <= 3 and qc0 <= 3 and rc0 == qc0:
+                                    break
+                                sl += 1
+                            while sr < clip_cap:
+                                var jr = qlen - 1 - sr
+                                if jr <= sl:
+                                    break
+                                var rb1 = sequences[ref_base + jr]
+                                var rc1: UInt8 = 255
+                                if rb1 == 65 or rb1 == 97:
+                                    rc1 = 0
+                                elif rb1 == 67 or rb1 == 99:
+                                    rc1 = 1
+                                elif rb1 == 71 or rb1 == 103:
+                                    rc1 = 2
+                                elif rb1 == 84 or rb1 == 116:
+                                    rc1 = 3
+                                var qc1 = codes[q_base + jr]
+                                if rc1 <= 3 and qc1 <= 3 and rc1 == qc1:
+                                    break
+                                sr += 1
+                            nm = 0
+                            var jm = sl
+                            while jm < qlen - sr:
+                                var rbm = sequences[ref_base + jm]
+                                var rcm: UInt8 = 255
+                                if rbm == 65 or rbm == 97:
+                                    rcm = 0
+                                elif rbm == 67 or rbm == 99:
+                                    rcm = 1
+                                elif rbm == 71 or rbm == 103:
+                                    rcm = 2
+                                elif rbm == 84 or rbm == 116:
+                                    rcm = 3
+                                var qcm = codes[q_base + jm]
+                                if rcm > 3 or qcm > 3 or rcm != qcm:
+                                    nm += 1
+                                jm += 1
+
+                        var alen = qlen - sl - sr
+                        if nm <= budget and alen >= 32:
+                            var mq: UInt32 = 20
+                            if votes >= 3:
+                                mq = 40
+                            if votes >= 5:
+                                mq = 60
+                            if nm == 0 and sl == 0 and sr == 0:
+                                mq = mq
+                            elif nm > 2:
+                                if mq > 20:
+                                    mq = 20
+                            out_cid[rid] = Int32(bcid)
+                            out_pos[rid] = UInt32(bstart + sl)
+                            out_mapq[rid] = mq
+                            out_flag[rid] = strand_flag
+                            out_sl[rid] = UInt32(sl)
+                            out_sr[rid] = UInt32(sr)
+                            out_nm[rid] = UInt32(nm)
+                            return
+                pk += 1
 
         var api = _device_api(resolved)
         var ctx = DeviceContext(api=api)
@@ -620,6 +786,9 @@ def map_fastq_dense_gpu_locate(
         var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 4096)
         var seed_stride = _env_int("METHYLGRAPHER_LINEAR_SEED_STRIDE", 5)
         var max_occ = index.max_occ()
+        # ~4% mismatches + end soft-clip — closes most of the exact-only map gap.
+        var max_diff = _env_int("METHYLGRAPHER_LINEAR_MAX_DIFF", 6)
+        var max_soft = _env_int("METHYLGRAPHER_LINEAR_MAX_SOFT", 8)
         var n_mapped = 0
         var n_reads = 0
         var n_batches = 0
@@ -632,6 +801,10 @@ def map_fastq_dense_gpu_locate(
             seed_stride,
             " max_occ=",
             max_occ,
+            " max_diff=",
+            max_diff,
+            " max_soft=",
+            max_soft,
             " paired=",
             paired,
         )
@@ -701,14 +874,26 @@ def map_fastq_dense_gpu_locate(
 
             var dev_bases = ctx.enqueue_create_buffer[DType.uint8](n_bases)
             var dev_codes = ctx.enqueue_create_buffer[DType.uint8](n_bases)
+            var dev_rc = ctx.enqueue_create_buffer[DType.uint8](n_bases)
             var dev_lens = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_keys = ctx.enqueue_create_buffer[DType.uint64](n_slots)
             var dev_qoff = ctx.enqueue_create_buffer[DType.uint32](n_slots)
             var dev_start = ctx.enqueue_create_buffer[DType.uint64](n_slots)
             var dev_end = ctx.enqueue_create_buffer[DType.uint64](n_slots)
-            var dev_cid = ctx.enqueue_create_buffer[DType.int32](n_seq)
-            var dev_pos = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_mapq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_cid_f = ctx.enqueue_create_buffer[DType.int32](n_seq)
+            var dev_pos_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_mapq_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_flag_f = ctx.enqueue_create_buffer[DType.int32](n_seq)
+            var dev_sl_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_sr_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_nm_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_cid_r = ctx.enqueue_create_buffer[DType.int32](n_seq)
+            var dev_pos_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_mapq_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_flag_r = ctx.enqueue_create_buffer[DType.int32](n_seq)
+            var dev_sl_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_sr_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_nm_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
 
             ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
             ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
@@ -721,6 +906,9 @@ def map_fastq_dense_gpu_locate(
                 block_dim=BLOCK,
             )
             var grid_s = (n_slots + BLOCK - 1) // BLOCK
+            var grid_r = (n_seq + BLOCK - 1) // BLOCK
+
+            # Forward strand
             ctx.enqueue_function[encode_strided_kernel](
                 dev_codes.unsafe_ptr(),
                 dev_keys.unsafe_ptr(),
@@ -760,8 +948,7 @@ def map_fastq_dense_gpu_locate(
                     grid_dim=grid_s,
                     block_dim=BLOCK,
                 )
-            var grid_r = (n_seq + BLOCK - 1) // BLOCK
-            ctx.enqueue_function[vote_gapless_kernel](
+            ctx.enqueue_function[vote_extend_kernel](
                 dev_start.unsafe_ptr(),
                 dev_end.unsafe_ptr(),
                 dev_qoff.unsafe_ptr(),
@@ -775,32 +962,168 @@ def map_fastq_dense_gpu_locate(
                 max_len,
                 slots_per,
                 n_seq,
-                dev_cid.unsafe_ptr(),
-                dev_pos.unsafe_ptr(),
-                dev_mapq.unsafe_ptr(),
+                max_diff,
+                max_soft,
+                Int32(0),
+                dev_cid_f.unsafe_ptr(),
+                dev_pos_f.unsafe_ptr(),
+                dev_mapq_f.unsafe_ptr(),
+                dev_flag_f.unsafe_ptr(),
+                dev_sl_f.unsafe_ptr(),
+                dev_sr_f.unsafe_ptr(),
+                dev_nm_f.unsafe_ptr(),
                 grid_dim=grid_r,
                 block_dim=BLOCK,
             )
 
-            var host_cid = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
-            var host_pos = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var host_mapq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            ctx.enqueue_copy(src_buf=dev_cid, dst_buf=host_cid)
-            ctx.enqueue_copy(src_buf=dev_pos, dst_buf=host_pos)
-            ctx.enqueue_copy(src_buf=dev_mapq, dst_buf=host_mapq)
+            # Reverse strand (RC codes → locate → extend)
+            ctx.enqueue_function[rc_codes_kernel](
+                dev_codes.unsafe_ptr(),
+                dev_rc.unsafe_ptr(),
+                dev_lens.unsafe_ptr(),
+                n_seq,
+                max_len,
+                grid_dim=grid_r,
+                block_dim=BLOCK,
+            )
+            ctx.enqueue_function[encode_strided_kernel](
+                dev_rc.unsafe_ptr(),
+                dev_keys.unsafe_ptr(),
+                dev_qoff.unsafe_ptr(),
+                dev_lens.unsafe_ptr(),
+                n_seq,
+                max_len,
+                k_len,
+                seed_stride,
+                slots_per,
+                grid_dim=grid_s,
+                block_dim=BLOCK,
+            )
+            if use_interp:
+                ctx.enqueue_function[locate_interp_kernel](
+                    dev_keys.unsafe_ptr(),
+                    dev_kmers.unsafe_ptr(),
+                    dev_offsets.unsafe_ptr(),
+                    dev_start.unsafe_ptr(),
+                    dev_end.unsafe_ptr(),
+                    n_slots,
+                    n_table,
+                    max_occ,
+                    grid_dim=grid_s,
+                    block_dim=BLOCK,
+                )
+            else:
+                ctx.enqueue_function[locate_bsearch_kernel](
+                    dev_keys.unsafe_ptr(),
+                    dev_kmers.unsafe_ptr(),
+                    dev_offsets.unsafe_ptr(),
+                    dev_start.unsafe_ptr(),
+                    dev_end.unsafe_ptr(),
+                    n_slots,
+                    n_table,
+                    max_occ,
+                    grid_dim=grid_s,
+                    block_dim=BLOCK,
+                )
+            ctx.enqueue_function[vote_extend_kernel](
+                dev_start.unsafe_ptr(),
+                dev_end.unsafe_ptr(),
+                dev_qoff.unsafe_ptr(),
+                dev_postings.unsafe_ptr(),
+                n_post,
+                dev_seq.unsafe_ptr(),
+                dev_coff.unsafe_ptr(),
+                n_contigs,
+                dev_rc.unsafe_ptr(),
+                dev_lens.unsafe_ptr(),
+                max_len,
+                slots_per,
+                n_seq,
+                max_diff,
+                max_soft,
+                Int32(16),
+                dev_cid_r.unsafe_ptr(),
+                dev_pos_r.unsafe_ptr(),
+                dev_mapq_r.unsafe_ptr(),
+                dev_flag_r.unsafe_ptr(),
+                dev_sl_r.unsafe_ptr(),
+                dev_sr_r.unsafe_ptr(),
+                dev_nm_r.unsafe_ptr(),
+                grid_dim=grid_r,
+                block_dim=BLOCK,
+            )
+
+            var host_cid_f = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_pos_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_mapq_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_flag_f = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_sl_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_sr_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_nm_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_cid_r = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_pos_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_mapq_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_flag_r = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_sl_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_sr_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_nm_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_f)
+            ctx.enqueue_copy(src_buf=dev_pos_f, dst_buf=host_pos_f)
+            ctx.enqueue_copy(src_buf=dev_mapq_f, dst_buf=host_mapq_f)
+            ctx.enqueue_copy(src_buf=dev_flag_f, dst_buf=host_flag_f)
+            ctx.enqueue_copy(src_buf=dev_sl_f, dst_buf=host_sl_f)
+            ctx.enqueue_copy(src_buf=dev_sr_f, dst_buf=host_sr_f)
+            ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_f)
+            ctx.enqueue_copy(src_buf=dev_cid_r, dst_buf=host_cid_r)
+            ctx.enqueue_copy(src_buf=dev_pos_r, dst_buf=host_pos_r)
+            ctx.enqueue_copy(src_buf=dev_mapq_r, dst_buf=host_mapq_r)
+            ctx.enqueue_copy(src_buf=dev_flag_r, dst_buf=host_flag_r)
+            ctx.enqueue_copy(src_buf=dev_sl_r, dst_buf=host_sl_r)
+            ctx.enqueue_copy(src_buf=dev_sr_r, dst_buf=host_sr_r)
+            ctx.enqueue_copy(src_buf=dev_nm_r, dst_buf=host_nm_r)
             ctx.synchronize()
 
             var n1 = len(batch1)
             var j = 0
             while j < n1:
-                var h1 = _hit_from_gpu(
-                    index,
-                    batch1[j].name,
-                    batch1[j].seq,
-                    Int(host_cid[j]),
-                    Int(host_pos[j]),
-                    Int(host_mapq[j]),
-                )
+                # Prefer lower NM, then higher mapq; FW vs RC.
+                var use_rc = False
+                var f_cid = Int(host_cid_f[j])
+                var r_cid = Int(host_cid_r[j])
+                if f_cid < 0 and r_cid >= 0:
+                    use_rc = True
+                elif f_cid >= 0 and r_cid >= 0:
+                    var fnm = Int(host_nm_f[j])
+                    var rnm = Int(host_nm_r[j])
+                    if rnm < fnm or (
+                        rnm == fnm and Int(host_mapq_r[j]) > Int(host_mapq_f[j])
+                    ):
+                        use_rc = True
+                var h1: LinearHit
+                if use_rc:
+                    h1 = _hit_from_gpu(
+                        index,
+                        batch1[j].name,
+                        batch1[j].seq,
+                        r_cid,
+                        Int(host_pos_r[j]),
+                        Int(host_mapq_r[j]),
+                        Int(host_flag_r[j]),
+                        Int(host_sl_r[j]),
+                        Int(host_sr_r[j]),
+                    )
+                else:
+                    h1 = _hit_from_gpu(
+                        index,
+                        batch1[j].name,
+                        batch1[j].seq,
+                        f_cid,
+                        Int(host_pos_f[j]),
+                        Int(host_mapq_f[j]),
+                        Int(host_flag_f[j]),
+                        Int(host_sl_f[j]),
+                        Int(host_sr_f[j]),
+                    )
                 h1.qual = batch1[j].qual
                 if not paired:
                     if h1.contig != "*":
@@ -809,14 +1132,44 @@ def map_fastq_dense_gpu_locate(
                     n_reads += 1
                 else:
                     var r2i = n1 + j
-                    var h2 = _hit_from_gpu(
-                        index,
-                        batch2[j].name,
-                        batch2[j].seq,
-                        Int(host_cid[r2i]),
-                        Int(host_pos[r2i]),
-                        Int(host_mapq[r2i]),
-                    )
+                    var use_rc2 = False
+                    var f2 = Int(host_cid_f[r2i])
+                    var r2 = Int(host_cid_r[r2i])
+                    if f2 < 0 and r2 >= 0:
+                        use_rc2 = True
+                    elif f2 >= 0 and r2 >= 0:
+                        var fnm2 = Int(host_nm_f[r2i])
+                        var rnm2 = Int(host_nm_r[r2i])
+                        if rnm2 < fnm2 or (
+                            rnm2 == fnm2
+                            and Int(host_mapq_r[r2i]) > Int(host_mapq_f[r2i])
+                        ):
+                            use_rc2 = True
+                    var h2: LinearHit
+                    if use_rc2:
+                        h2 = _hit_from_gpu(
+                            index,
+                            batch2[j].name,
+                            batch2[j].seq,
+                            r2,
+                            Int(host_pos_r[r2i]),
+                            Int(host_mapq_r[r2i]),
+                            Int(host_flag_r[r2i]),
+                            Int(host_sl_r[r2i]),
+                            Int(host_sr_r[r2i]),
+                        )
+                    else:
+                        h2 = _hit_from_gpu(
+                            index,
+                            batch2[j].name,
+                            batch2[j].seq,
+                            f2,
+                            Int(host_pos_f[r2i]),
+                            Int(host_mapq_f[r2i]),
+                            Int(host_flag_f[r2i]),
+                            Int(host_sl_f[r2i]),
+                            Int(host_sr_f[r2i]),
+                        )
                     h2.qual = batch2[j].qual
                     var paired_hits = pair_hits(h1, h2)
                     var p1 = paired_hits.r1.copy()

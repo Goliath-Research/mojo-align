@@ -81,14 +81,24 @@ def convert_fasta_c2t(src: Path, dst: Path) -> None:
                 fout.write("".join("T" if ch in "Cc" else ch for ch in line))
 
 
+def fleet_bwameth_c2t_fasta(reference_fasta: Path) -> Path:
+    """bwameth dual-strand FASTA (``f*``=C→T, ``r*``=G→A), Clara's index source."""
+    return Path(str(reference_fasta) + ".bwameth.c2t")
+
+
 def fleet_c2t_fasta(reference_fasta: Path) -> Path:
-    """Sibling C2T FASTA next to the linear ref (``${REF}.C2T.fa``)."""
+    """Sibling single-strand C2T FASTA (``${REF}.C2T.fa``) — legacy / incomplete."""
     return Path(str(reference_fasta) + ".C2T.fa")
 
 
 def fleet_mojo_linear_cache_dir(reference_fasta: Path, k: int) -> Path:
     """Sibling Mojo k-mer cache (``${REF}.mojo_linear_k${k}/``), like bwameth."""
     return Path(str(reference_fasta) + f".mojo_linear_k{k}")
+
+
+def fleet_bwameth_mojo_cache_dir(reference_fasta: Path, k: int) -> Path:
+    """Dense pack beside bwameth.c2t (dual-strand; required for Clara map-rate)."""
+    return Path(str(fleet_bwameth_c2t_fasta(reference_fasta)) + f".mojo_linear_k{k}")
 
 
 def _is_fleet_genome_path(path: Path) -> bool:
@@ -100,12 +110,20 @@ def _is_fleet_genome_path(path: Path) -> bool:
 
 
 def resolve_c2t_fasta(reference_fasta: Path, work: Path) -> Path:
-    """Prefer fleet ``${REF}.C2T.fa``; otherwise write under work/ (or fleet if writable)."""
+    """Prefer bwameth dual-strand FASTA, then ``${REF}.C2T.fa``, else work/.
+
+    Clara ``fq2bam_meth`` / bwameth index both strands (``f*`` + ``r*``). Mapping
+    only against single-strand C2T caps map rate near ~40%.
+    """
+    bw = fleet_bwameth_c2t_fasta(reference_fasta)
+    if bw.is_file():
+        return bw
     fleet = fleet_c2t_fasta(reference_fasta)
     if fleet.is_file():
         return fleet
     if _is_fleet_genome_path(reference_fasta):
-        return fleet
+        # Prefer creating/using bwameth sibling when on fleet.
+        return bw if bw.parent.exists() else fleet
     return work / (reference_fasta.name + ".C2T.fa")
 
 
@@ -115,17 +133,23 @@ def resolve_mojo_linear_cache_dir(
     k: int,
     cache_dir: Optional[Path] = None,
 ) -> Path:
-    """Resolve Mojo linear index dir: explicit → env → fleet sibling → work/."""
+    """Resolve Mojo linear index dir: explicit → env → bwameth pack → C2T pack → work/."""
     if cache_dir is not None:
         return Path(cache_dir)
     env = os.environ.get("METHYLGRAPHER_LINEAR_CACHE_DIR", "").strip()
     if env:
         return Path(env)
+    bw_pack = fleet_bwameth_mojo_cache_dir(reference_fasta, k)
+    if (bw_pack / "kmers.bin").is_file() and (bw_pack / "meta.json").is_file():
+        return bw_pack
     fleet = fleet_mojo_linear_cache_dir(reference_fasta, k)
     if (fleet / "kmers.bin").is_file() and (fleet / "meta.json").is_file():
         return fleet
     if (fleet / "hits.tsv").is_file():  # legacy text cache
         return fleet
+    # Default build target: dual-strand pack next to bwameth.c2t when present.
+    if fleet_bwameth_c2t_fasta(reference_fasta).is_file():
+        return bw_pack
     if _is_fleet_genome_path(reference_fasta):
         return fleet
     return work / "mojo_linear_index"
