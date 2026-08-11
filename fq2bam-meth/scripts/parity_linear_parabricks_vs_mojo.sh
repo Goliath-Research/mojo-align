@@ -276,8 +276,11 @@ run_mojo() {
   export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-256}"
   export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-5}"
   export METHYLGRAPHER_LINEAR_READ_BATCH="${METHYLGRAPHER_LINEAR_READ_BATCH:-2048}"
-  # Dense GRCh38: DeviceContext binary-search locate (keys+offsets resident).
+  # Dense GRCh38: full GPU path (keys+offsets+postings+sequences resident).
   export METHYLGRAPHER_LINEAR_GPU_LOCATE="${METHYLGRAPHER_LINEAR_GPU_LOCATE:-1}"
+  # Locate on sorted 2-bit keys: bsearch (default) or interp.
+  export METHYLGRAPHER_LINEAR_LOCATE_ALGO="${METHYLGRAPHER_LINEAR_LOCATE_ALGO:-bsearch}"
+  export METHYLGRAPHER_GPU_RESIDENT_OVERHEAD="${METHYLGRAPHER_GPU_RESIDENT_OVERHEAD:-1.15}"
   # Driver <580 needs system ptxas (same as Giraffe GH200 notes).
   if [[ -z "${MODULAR_NVPTX_COMPILER_PATH:-}" && -x /usr/bin/ptxas ]]; then
     export MODULAR_NVPTX_COMPILER_PATH=/usr/bin/ptxas

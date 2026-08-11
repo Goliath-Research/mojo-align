@@ -1,8 +1,11 @@
-# GPU locate for dense-v1 linear WGBS (NVIDIA DeviceContext).
+# Full-GPU dense-v1 linear WGBS map (NVIDIA DeviceContext).
 #
-# One session: upload kmers.bin + offsets.bin once (~224 MiB), then per batch
-# 2-bit encode (strided) + binary-search locate on device. Host walks rare
-# postings from mmap and gapless-verifies — no String k-mer decode on hot path.
+# Resident on device (~27 GiB science): kmers + offsets + postings + sequences
+# + contig_offsets. Per batch: 2-bit encode → locate → vote → gapless on GPU.
+# Host only streams FASTQ and formats SAM from compact hit records.
+#
+# Locate default = binary search on sorted keys. Optional interpolation search
+# via METHYLGRAPHER_LINEAR_LOCATE_ALGO=interp (keys are numeric 2-bit codes).
 
 from std.collections import List
 from std.python import Python, PythonObject
@@ -11,7 +14,7 @@ from std.sys import has_accelerator
 from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
 from linear_extend import hit_to_sam_line, pair_hits, LinearHit
-from linear_index import LinearIndex, SeedVote
+from linear_index import LinearIndex
 from utility import open_text_write
 
 
@@ -38,20 +41,16 @@ def _strip_nl(mut s: String):
 def _bs_convert(seq: String, mode: String) raises -> String:
     if mode.byte_length() == 0 or mode == "none":
         return seq
-    var out = String("")
-    var i = 0
-    var n = seq.byte_length()
-    while i < n:
-        var ch = String(seq[byte = i : i + 1])
-        var u = ch.upper()
-        if mode == "C2T" and u == "C":
-            out += "T"
-        elif mode == "G2A" and u == "G":
-            out += "A"
-        else:
-            out += ch
-        i += 1
-    return out^
+    # Python C translate — conversion only; locate/vote/gapless stay on GPU.
+    var builtins = Python.import_module("builtins")
+    var str_mod = builtins.str
+    if mode == "C2T":
+        var tr = str_mod.maketrans("Cc", "Tt")
+        return String(str_mod.translate(seq, tr))
+    if mode == "G2A":
+        var tr2 = str_mod.maketrans("Gg", "Aa")
+        return String(str_mod.translate(seq, tr2))
+    return seq
 
 
 def _open_fastq(path: String) raises -> PythonObject:
@@ -96,6 +95,14 @@ def _env_int(name: String, default: Int) raises -> Int:
     return n
 
 
+def _env_str(name: String, default: String) raises -> String:
+    var os_mod = Python.import_module("os")
+    var raw = String(os_mod.environ.get(name, default))
+    if raw.byte_length() == 0:
+        return default
+    return raw
+
+
 def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
     fh.write("@HD\tVN:1.6\tSO:unsorted\n")
     var n = index.contig_count()
@@ -116,30 +123,34 @@ def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
         pass
 
 
-def _hit_from_vote(
-    index: LinearIndex, name: String, seq: String, vote: SeedVote
+def _require_hbm(science_bytes: Int, device: String) raises:
+    var sys_mod = Python.import_module("sys")
+    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/gpu-common/python")
+    var mem = Python.import_module("gpu_mem")
+    _ = mem.require_index_capacity(science_bytes, device=device, overhead=1.15)
+
+
+def _hit_from_gpu(
+    index: LinearIndex,
+    name: String,
+    seq: String,
+    cid: Int,
+    start0: Int,
+    mapq: Int,
 ) raises -> LinearHit:
     var qlen = seq.byte_length()
-    if vote.cid < 0 or vote.votes <= 0:
+    if cid < 0:
         return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
-    var window = index.contig_window_id(vote.cid, vote.start, qlen)
-    if window.byte_length() == qlen and window == seq:
-        var mq = 20
-        if vote.votes >= 3:
-            mq = 40
-        if vote.votes >= 5:
-            mq = 60
-        return LinearHit(
-            name,
-            0,
-            index.contig_name(vote.cid),
-            vote.start + 1,
-            mq,
-            String(qlen) + "M",
-            seq,
-            "*",
-        )
-    return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+    return LinearHit(
+        name,
+        0,
+        index.contig_name(cid),
+        start0 + 1,
+        mapq,
+        String(qlen) + "M",
+        seq,
+        "*",
+    )
 
 
 def map_fastq_dense_gpu_locate(
@@ -151,17 +162,23 @@ def map_fastq_dense_gpu_locate(
     bs_r1: String = "",
     bs_r2: String = "",
 ) raises -> Int:
-    """Stream PE/SE FASTQ with one DeviceContext locate session (dense-v1)."""
+    """Full-GPU dense map: locate + vote + gapless on device."""
     if not index.dense:
         raise Error("map_fastq_dense_gpu_locate requires dense-v1 index")
-    if index.kmers_addr == 0 or index.offsets_addr == 0:
+    if (
+        index.kmers_addr == 0
+        or index.offsets_addr == 0
+        or index.postings_addr == 0
+        or index.seq_addr == 0
+        or index.contig_off_addr == 0
+    ):
         raise Error("map_fastq_dense_gpu_locate: null mmap addresses")
 
     var resolved = select_device(device)
     var backend = probe_device_context(resolved)
     var target = kernel_target_label(resolved)
     print(
-        "MojoLinear GPU-locate device=",
+        "MojoLinear GPU-full device=",
         resolved,
         " target=",
         target,
@@ -173,7 +190,7 @@ def map_fastq_dense_gpu_locate(
         or backend.startswith("devicecontext-hip")
     ):
         raise Error(
-            "MojoLinear GPU-locate needs DeviceContext cuda/hip, got " + backend
+            "MojoLinear GPU-full needs DeviceContext cuda/hip, got " + backend
         )
 
     comptime if not has_accelerator():
@@ -198,6 +215,7 @@ def map_fastq_dense_gpu_locate(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
             host_addr: Int,
             nbytes: Int,
+            label: String,
         ) raises:
             if nbytes <= 0:
                 return
@@ -206,6 +224,7 @@ def map_fastq_dense_gpu_locate(
             comptime CHUNK = 64 * 1024 * 1024
             comptime BLOCK = 256
             var off = 0
+            var last_log = 0
             while off < nbytes:
                 var n = nbytes - off
                 if n > CHUNK:
@@ -228,6 +247,16 @@ def map_fastq_dense_gpu_locate(
                 )
                 ctx.synchronize()
                 off += n
+                if off - last_log >= 1 << 30 or off == nbytes:
+                    print(
+                        "MojoLinear GPU-full upload ",
+                        label,
+                        " ",
+                        off,
+                        "/",
+                        nbytes,
+                    )
+                    last_log = off
 
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
@@ -253,7 +282,6 @@ def map_fastq_dense_gpu_locate(
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             keys: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
-            read_ids: UnsafePointer[UInt32, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
             n_reads: Int,
             max_len: Int,
@@ -271,7 +299,6 @@ def map_fastq_dense_gpu_locate(
             var L = Int(read_lens[rid])
             keys[idx] = UInt64(0xFFFFFFFFFFFFFFFF)
             q_offs[idx] = UInt32(q_off)
-            read_ids[idx] = UInt32(rid)
             if q_off + k_len > L:
                 return
             var base = rid * max_len + q_off
@@ -324,39 +351,263 @@ def map_fastq_dense_gpu_locate(
             out_start[idx] = start
             out_end[idx] = end
 
+        def locate_interp_kernel(
+            keys: UnsafePointer[UInt64, MutAnyOrigin],
+            kmers: UnsafePointer[UInt64, MutAnyOrigin],
+            offsets: UnsafePointer[UInt64, MutAnyOrigin],
+            out_start: UnsafePointer[UInt64, MutAnyOrigin],
+            out_end: UnsafePointer[UInt64, MutAnyOrigin],
+            n_slots: Int,
+            n_table: Int,
+            max_occ: Int,
+        ):
+            """Interpolation search on sorted numeric 2-bit keys."""
+            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if idx >= n_slots:
+                return
+            out_start[idx] = 0
+            out_end[idx] = 0
+            var key = keys[idx]
+            if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
+                return
+            var lo = 0
+            var hi = n_table - 1
+            var steps = 0
+            while lo <= hi and key >= kmers[lo] and key <= kmers[hi] and steps < 64:
+                steps += 1
+                if kmers[hi] == kmers[lo]:
+                    if kmers[lo] == key:
+                        hi = lo
+                        break
+                    return
+                var span = kmers[hi] - kmers[lo]
+                var mid = lo + Int(((key - kmers[lo]) * UInt64(hi - lo)) // span)
+                if mid < lo:
+                    mid = lo
+                if mid > hi:
+                    mid = hi
+                var mk = kmers[mid]
+                if mk == key:
+                    lo = mid
+                    hi = mid
+                    break
+                if mk < key:
+                    lo = mid + 1
+                else:
+                    if mid == 0:
+                        return
+                    hi = mid - 1
+            if lo > hi or lo >= n_table or kmers[lo] != key:
+                return
+            var start = offsets[lo]
+            var end = offsets[lo + 1]
+            var occ = Int(end - start)
+            if occ <= 0 or occ > max_occ:
+                return
+            out_start[idx] = start
+            out_end[idx] = end
+
+        def vote_gapless_kernel(
+            occ_start: UnsafePointer[UInt64, MutAnyOrigin],
+            occ_end: UnsafePointer[UInt64, MutAnyOrigin],
+            q_offs: UnsafePointer[UInt32, MutAnyOrigin],
+            postings: UnsafePointer[UInt32, MutAnyOrigin],
+            n_postings: Int,
+            sequences: UnsafePointer[UInt8, MutAnyOrigin],
+            contig_off: UnsafePointer[UInt64, MutAnyOrigin],
+            n_contigs: Int,
+            codes: UnsafePointer[UInt8, MutAnyOrigin],
+            read_lens: UnsafePointer[UInt32, MutAnyOrigin],
+            max_len: Int,
+            slots_per_read: Int,
+            n_reads: Int,
+            out_cid: UnsafePointer[Int32, MutAnyOrigin],
+            out_pos: UnsafePointer[UInt32, MutAnyOrigin],
+            out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
+        ):
+            """One thread/read: majority vote on rare loci + gapless verify."""
+            var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if rid >= n_reads:
+                return
+            out_cid[rid] = Int32(-1)
+            out_pos[rid] = 0
+            out_mapq[rid] = 0
+            var qlen = Int(read_lens[rid])
+            if qlen <= 0:
+                return
+
+            # Small open candidate table in registers/local (unique loci).
+            comptime TOP = 128
+            var cand_key = InlineArray[UInt64, TOP](fill=UInt64(0xFFFFFFFFFFFFFFFF))
+            var cand_n = InlineArray[Int32, TOP](fill=Int32(0))
+            var n_cand = 0
+            var best_i = -1
+            var best_n: Int32 = 0
+
+            var slot = 0
+            while slot < slots_per_read:
+                var sidx = rid * slots_per_read + slot
+                var a = Int(occ_start[sidx])
+                var b = Int(occ_end[sidx])
+                var q_off = Int(q_offs[sidx])
+                if b > a and a >= 0 and b <= n_postings:
+                    var pi = a
+                    while pi < b:
+                        var cid = Int(postings[pi * 2])
+                        var pos = Int(postings[pi * 2 + 1])
+                        if cid >= 0 and cid < n_contigs and pos >= q_off:
+                            var start0 = pos - q_off
+                            var vk = (UInt64(cid) << 32) | UInt64(start0)
+                            var found = -1
+                            var ci = 0
+                            while ci < n_cand:
+                                if cand_key[ci] == vk:
+                                    found = ci
+                                    break
+                                ci += 1
+                            if found >= 0:
+                                cand_n[found] = cand_n[found] + 1
+                                if cand_n[found] > best_n:
+                                    best_n = cand_n[found]
+                                    best_i = found
+                            elif n_cand < TOP:
+                                cand_key[n_cand] = vk
+                                cand_n[n_cand] = 1
+                                if best_n < 1:
+                                    best_n = 1
+                                    best_i = n_cand
+                                n_cand += 1
+                        pi += 1
+                slot += 1
+
+            if best_i < 0 or best_n <= 0:
+                return
+            var bkey = cand_key[best_i]
+            var bcid = Int(bkey >> 32)
+            var bstart = Int(bkey & UInt64(0xFFFFFFFF))
+            if bcid < 0 or bcid >= n_contigs:
+                return
+            var off0 = Int(contig_off[bcid])
+            var off1 = Int(contig_off[bcid + 1])
+            if bstart < 0 or bstart + qlen > off1 - off0:
+                return
+            var ref_base = off0 + bstart
+            var q_base = rid * max_len
+            var ok = True
+            var j = 0
+            while j < qlen:
+                var rb = sequences[ref_base + j]
+                var rc: UInt8 = 255
+                if rb == 65 or rb == 97:
+                    rc = 0
+                elif rb == 67 or rb == 99:
+                    rc = 1
+                elif rb == 71 or rb == 103:
+                    rc = 2
+                elif rb == 84 or rb == 116:
+                    rc = 3
+                var qc = codes[q_base + j]
+                if rc > 3 or qc > 3 or rc != qc:
+                    ok = False
+                    break
+                j += 1
+            if not ok:
+                return
+            var mq: UInt32 = 20
+            if best_n >= 3:
+                mq = 40
+            if best_n >= 5:
+                mq = 60
+            out_cid[rid] = Int32(bcid)
+            out_pos[rid] = UInt32(bstart)
+            out_mapq[rid] = mq
+
         var api = _device_api(resolved)
         var ctx = DeviceContext(api=api)
         var k_len = index.k
         var n_table = index.n_keys
         var n_off = n_table + 1
+        var n_post = index.n_postings
+        var n_contigs = len(index.contig_names)
         var kmers_bytes = n_table * 8
         var offsets_bytes = n_off * 8
-        if index.kmers_size < kmers_bytes or index.offsets_size < offsets_bytes:
-            raise Error("MojoLinear GPU-locate: mmap smaller than n_keys tables")
+        var postings_bytes = n_post * 8
+        var seq_bytes = index.seq_size
+        var coff_bytes = (n_contigs + 1) * 8
+        if (
+            index.kmers_size < kmers_bytes
+            or index.offsets_size < offsets_bytes
+            or index.postings_size < postings_bytes
+            or index.seq_size < seq_bytes
+            or index.contig_off_size < coff_bytes
+        ):
+            raise Error("MojoLinear GPU-full: mmap smaller than expected tables")
+
+        var science = (
+            kmers_bytes + offsets_bytes + postings_bytes + seq_bytes + coff_bytes
+        )
+        _require_hbm(science, resolved)
         print(
-            "MojoLinear GPU-locate upload kmers_bytes=",
-            kmers_bytes,
-            " offsets_bytes=",
-            offsets_bytes,
+            "MojoLinear GPU-full upload science_bytes=",
+            science,
             " n_keys=",
             n_table,
+            " n_postings=",
+            n_post,
+            " n_bases=",
+            seq_bytes,
         )
-        # Typed u64 device tables (avoid bitcast lifetime hazards).
+
         var dev_kmers = ctx.enqueue_create_buffer[DType.uint64](n_table)
         var dev_offsets = ctx.enqueue_create_buffer[DType.uint64](n_off)
+        var dev_postings = ctx.enqueue_create_buffer[DType.uint32](n_post * 2)
+        var dev_seq = ctx.enqueue_create_buffer[DType.uint8](seq_bytes)
+        var dev_coff = ctx.enqueue_create_buffer[DType.uint64](n_contigs + 1)
+
         upload_mmap_to_device(
             ctx,
             dev_kmers.unsafe_ptr().bitcast[UInt8](),
             index.kmers_addr,
             kmers_bytes,
+            "kmers",
         )
         upload_mmap_to_device(
             ctx,
             dev_offsets.unsafe_ptr().bitcast[UInt8](),
             index.offsets_addr,
             offsets_bytes,
+            "offsets",
         )
-        print("MojoLinear GPU-locate index resident ok")
+        upload_mmap_to_device(
+            ctx,
+            dev_postings.unsafe_ptr().bitcast[UInt8](),
+            index.postings_addr,
+            postings_bytes,
+            "postings",
+        )
+        upload_mmap_to_device(
+            ctx,
+            dev_seq.unsafe_ptr(),
+            index.seq_addr,
+            seq_bytes,
+            "sequences",
+        )
+        upload_mmap_to_device(
+            ctx,
+            dev_coff.unsafe_ptr().bitcast[UInt8](),
+            index.contig_off_addr,
+            coff_bytes,
+            "contig_offsets",
+        )
+        print("MojoLinear GPU-full index resident ok")
+
+        var locate_algo = _env_str("METHYLGRAPHER_LINEAR_LOCATE_ALGO", "bsearch").lower()
+        var use_interp = locate_algo == "interp" or locate_algo == "interpolation"
+        print(
+            "MojoLinear GPU-full locate_algo=",
+            locate_algo,
+            " (bsearch|interp)",
+        )
 
         var fh = open_text_write(out_sam)
         _write_sam_header(fh, index)
@@ -366,7 +617,7 @@ def map_fastq_dense_gpu_locate(
         if paired:
             fh2 = _open_fastq(fq2)
 
-        var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 2048)
+        var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 4096)
         var seed_stride = _env_int("METHYLGRAPHER_LINEAR_SEED_STRIDE", 5)
         var max_occ = index.max_occ()
         var n_mapped = 0
@@ -375,7 +626,7 @@ def map_fastq_dense_gpu_locate(
         comptime BLOCK = 256
 
         print(
-            "MojoLinear GPU-locate map start batch=",
+            "MojoLinear GPU-full map start batch=",
             batch_size,
             " stride=",
             seed_stride,
@@ -453,9 +704,11 @@ def map_fastq_dense_gpu_locate(
             var dev_lens = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_keys = ctx.enqueue_create_buffer[DType.uint64](n_slots)
             var dev_qoff = ctx.enqueue_create_buffer[DType.uint32](n_slots)
-            var dev_rid = ctx.enqueue_create_buffer[DType.uint32](n_slots)
             var dev_start = ctx.enqueue_create_buffer[DType.uint64](n_slots)
             var dev_end = ctx.enqueue_create_buffer[DType.uint64](n_slots)
+            var dev_cid = ctx.enqueue_create_buffer[DType.int32](n_seq)
+            var dev_pos = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_mapq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
 
             ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
             ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
@@ -472,7 +725,6 @@ def map_fastq_dense_gpu_locate(
                 dev_codes.unsafe_ptr(),
                 dev_keys.unsafe_ptr(),
                 dev_qoff.unsafe_ptr(),
-                dev_rid.unsafe_ptr(),
                 dev_lens.unsafe_ptr(),
                 n_seq,
                 max_len,
@@ -482,50 +734,74 @@ def map_fastq_dense_gpu_locate(
                 grid_dim=grid_s,
                 block_dim=BLOCK,
             )
-            ctx.enqueue_function[locate_bsearch_kernel](
-                dev_keys.unsafe_ptr(),
-                dev_kmers.unsafe_ptr(),
-                dev_offsets.unsafe_ptr(),
+            if use_interp:
+                ctx.enqueue_function[locate_interp_kernel](
+                    dev_keys.unsafe_ptr(),
+                    dev_kmers.unsafe_ptr(),
+                    dev_offsets.unsafe_ptr(),
+                    dev_start.unsafe_ptr(),
+                    dev_end.unsafe_ptr(),
+                    n_slots,
+                    n_table,
+                    max_occ,
+                    grid_dim=grid_s,
+                    block_dim=BLOCK,
+                )
+            else:
+                ctx.enqueue_function[locate_bsearch_kernel](
+                    dev_keys.unsafe_ptr(),
+                    dev_kmers.unsafe_ptr(),
+                    dev_offsets.unsafe_ptr(),
+                    dev_start.unsafe_ptr(),
+                    dev_end.unsafe_ptr(),
+                    n_slots,
+                    n_table,
+                    max_occ,
+                    grid_dim=grid_s,
+                    block_dim=BLOCK,
+                )
+            var grid_r = (n_seq + BLOCK - 1) // BLOCK
+            ctx.enqueue_function[vote_gapless_kernel](
                 dev_start.unsafe_ptr(),
                 dev_end.unsafe_ptr(),
-                n_slots,
-                n_table,
-                max_occ,
-                grid_dim=grid_s,
+                dev_qoff.unsafe_ptr(),
+                dev_postings.unsafe_ptr(),
+                n_post,
+                dev_seq.unsafe_ptr(),
+                dev_coff.unsafe_ptr(),
+                n_contigs,
+                dev_codes.unsafe_ptr(),
+                dev_lens.unsafe_ptr(),
+                max_len,
+                slots_per,
+                n_seq,
+                dev_cid.unsafe_ptr(),
+                dev_pos.unsafe_ptr(),
+                dev_mapq.unsafe_ptr(),
+                grid_dim=grid_r,
                 block_dim=BLOCK,
             )
 
-            var host_qoff = ctx.enqueue_create_host_buffer[DType.uint32](n_slots)
-            var host_rid = ctx.enqueue_create_host_buffer[DType.uint32](n_slots)
-            var host_start = ctx.enqueue_create_host_buffer[DType.uint64](n_slots)
-            var host_end = ctx.enqueue_create_host_buffer[DType.uint64](n_slots)
-            ctx.enqueue_copy(src_buf=dev_qoff, dst_buf=host_qoff)
-            ctx.enqueue_copy(src_buf=dev_rid, dst_buf=host_rid)
-            ctx.enqueue_copy(src_buf=dev_start, dst_buf=host_start)
-            ctx.enqueue_copy(src_buf=dev_end, dst_buf=host_end)
+            var host_cid = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_pos = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_mapq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            ctx.enqueue_copy(src_buf=dev_cid, dst_buf=host_cid)
+            ctx.enqueue_copy(src_buf=dev_pos, dst_buf=host_pos)
+            ctx.enqueue_copy(src_buf=dev_mapq, dst_buf=host_mapq)
             ctx.synchronize()
 
-            # Per-read vote from rare posting ranges (host mmap postings).
             var n1 = len(batch1)
             var j = 0
             while j < n1:
-                var starts1 = List[Int]()
-                var ends1 = List[Int]()
-                var qoffs1 = List[Int]()
-                var slot = 0
-                while slot < slots_per:
-                    var idx1 = j * slots_per + slot
-                    var a = Int(host_start[idx1])
-                    var b = Int(host_end[idx1])
-                    if b > a:
-                        starts1.append(a)
-                        ends1.append(b)
-                        qoffs1.append(Int(host_qoff[idx1]))
-                    slot += 1
-                var vote1 = index.vote_dense_from_ranges(starts1, ends1, qoffs1)
-                var h1 = _hit_from_vote(index, batch1[j].name, batch1[j].seq, vote1)
+                var h1 = _hit_from_gpu(
+                    index,
+                    batch1[j].name,
+                    batch1[j].seq,
+                    Int(host_cid[j]),
+                    Int(host_pos[j]),
+                    Int(host_mapq[j]),
+                )
                 h1.qual = batch1[j].qual
-
                 if not paired:
                     if h1.contig != "*":
                         n_mapped += 1
@@ -533,24 +809,13 @@ def map_fastq_dense_gpu_locate(
                     n_reads += 1
                 else:
                     var r2i = n1 + j
-                    var starts2 = List[Int]()
-                    var ends2 = List[Int]()
-                    var qoffs2 = List[Int]()
-                    var slot2 = 0
-                    while slot2 < slots_per:
-                        var idx2 = r2i * slots_per + slot2
-                        var a2 = Int(host_start[idx2])
-                        var b2 = Int(host_end[idx2])
-                        if b2 > a2:
-                            starts2.append(a2)
-                            ends2.append(b2)
-                            qoffs2.append(Int(host_qoff[idx2]))
-                        slot2 += 1
-                    var vote2 = index.vote_dense_from_ranges(
-                        starts2, ends2, qoffs2
-                    )
-                    var h2 = _hit_from_vote(
-                        index, batch2[j].name, batch2[j].seq, vote2
+                    var h2 = _hit_from_gpu(
+                        index,
+                        batch2[j].name,
+                        batch2[j].seq,
+                        Int(host_cid[r2i]),
+                        Int(host_pos[r2i]),
+                        Int(host_mapq[r2i]),
                     )
                     h2.qual = batch2[j].qual
                     var paired_hits = pair_hits(h1, h2)
@@ -568,14 +833,12 @@ def map_fastq_dense_gpu_locate(
             n_batches += 1
             if n_batches == 1 or n_batches % 5 == 0:
                 print(
-                    "MojoLinear GPU-locate progress batches=",
+                    "MojoLinear GPU-full progress batches=",
                     n_batches,
                     " reads=",
                     n_reads,
                     " mapped=",
                     n_mapped,
-                    " slots=",
-                    n_slots,
                 )
                 try:
                     fh.flush()
@@ -593,6 +856,6 @@ def map_fastq_dense_gpu_locate(
             n_mapped,
             " reads=",
             n_reads,
-            " backend=gpu-locate",
+            " backend=gpu-full",
         )
         return n_mapped
