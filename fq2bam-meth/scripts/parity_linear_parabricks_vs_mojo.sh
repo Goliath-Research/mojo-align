@@ -276,6 +276,8 @@ run_mojo() {
   export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-256}"
   export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-5}"
   export METHYLGRAPHER_LINEAR_READ_BATCH="${METHYLGRAPHER_LINEAR_READ_BATCH:-2048}"
+  export METHYLGRAPHER_LINEAR_MAX_DIFF="${METHYLGRAPHER_LINEAR_MAX_DIFF:-6}"
+  export METHYLGRAPHER_LINEAR_MAX_SOFT="${METHYLGRAPHER_LINEAR_MAX_SOFT:-8}"
   # Dense GRCh38: full GPU path (keys+offsets+postings+sequences resident).
   export METHYLGRAPHER_LINEAR_GPU_LOCATE="${METHYLGRAPHER_LINEAR_GPU_LOCATE:-1}"
   # Locate on sorted 2-bit keys: bsearch (default) or interp.
@@ -293,10 +295,14 @@ run_mojo() {
     k_val=8
     export METHYLGRAPHER_GPU_REQUIRE=0
   fi
-  local fleet_cache="${REF}.mojo_linear_k${k_val}"
+  # Prefer bwameth dual-strand pack (f*/r*); single-strand C2T caps map rate.
+  local fleet_cache="${REF}.bwameth.c2t.mojo_linear_k${k_val}"
   if [[ ! -f "${fleet_cache}/kmers.bin" || ! -f "${fleet_cache}/meta.json" ]]; then
-    echo "NOTE: Mojo dense-v1 pack missing at ${fleet_cache}" >&2
-    echo "      Prebuild once: fq2bam-meth/scripts/ensure_mojo_linear_index.sh $REF $k_val" >&2
+    fleet_cache="${REF}.mojo_linear_k${k_val}"
+  fi
+  if [[ ! -f "${fleet_cache}/kmers.bin" || ! -f "${fleet_cache}/meta.json" ]]; then
+    echo "NOTE: Mojo dense-v1 pack missing (want ${REF}.bwameth.c2t.mojo_linear_k${k_val})" >&2
+    echo "      Building from bwameth.c2t under flock if present..." >&2
   else
     echo "Using fleet Mojo dense-v1 pack: $fleet_cache"
   fi
