@@ -565,10 +565,46 @@ def run_mojo_fq2bam_meth(
         used_mapper = "bwa"
 
     out_bam.parent.mkdir(parents=True, exist_ok=True)
+    # GATK4 / Picard expect coordinate-sorted BAMs with consistent mates.
+    # fixmate -m fills MC/ms so markdup (and ValidateSamFile) can run.
+    bam_fixmate = work / "aligned.fixmate.bam"
+    bam_sorted = work / "aligned.sorted.bam"
     _run(
-        [samtools, "sort", "-@", str(max(1, threads // 2)), "-o", str(out_bam), str(bam_unsorted)],
+        [samtools, "fixmate", "-@", str(max(1, threads // 2)), "-m", str(bam_unsorted), str(bam_fixmate)],
         log,
     )
+    _run(
+        [
+            samtools,
+            "sort",
+            "-@",
+            str(max(1, threads // 2)),
+            "-o",
+            str(bam_sorted),
+            str(bam_fixmate),
+        ],
+        log,
+    )
+    markdup_on = os.environ.get("METHYLGRAPHER_LINEAR_MARKDUP", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if markdup_on:
+        _run(
+            [
+                samtools,
+                "markdup",
+                "-@",
+                str(max(1, threads // 2)),
+                str(bam_sorted),
+                str(out_bam),
+            ],
+            log,
+        )
+    else:
+        shutil.copy2(bam_sorted, out_bam)
     _run([samtools, "index", str(out_bam)], log)
 
     fs = subprocess.run(

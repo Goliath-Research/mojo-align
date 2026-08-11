@@ -15,18 +15,29 @@ from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
 from linear_extend import hit_to_sam_line, pair_hits, LinearHit
 from linear_index import LinearIndex
-from utility import open_text_write
+from utility import open_text_write, reverse_complement
 
 
 struct FastqRec(Copyable, Movable):
     var name: String
-    var seq: String
+    var seq: String  # converted (align)
+    var original_seq: String  # pre-conversion (GATK/Picard SEQ)
     var qual: String
 
-    def __init__(out self, name: String, seq: String, qual: String = "*"):
+    def __init__(
+        out self,
+        name: String,
+        seq: String,
+        qual: String = "*",
+        original_seq: String = "",
+    ):
         self.name = name
         self.seq = seq
         self.qual = qual
+        if original_seq.byte_length() == 0:
+            self.original_seq = seq
+        else:
+            self.original_seq = original_seq
 
 
 def _strip_nl(mut s: String):
@@ -112,7 +123,12 @@ def _canonical_contig(name: String) raises -> String:
     return name
 
 
+def _rg_id() raises -> String:
+    return _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+
+
 def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
+    # Unsorted here; orchestrator samtools sort → coordinate (GATK requires it).
     fh.write("@HD\tVN:1.6\tSO:unsorted\n")
     var n = index.contig_count()
     var seen = Dict[String, Int]()
@@ -129,6 +145,23 @@ def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
                 + "\n"
             )
         ci += 1
+    var rg = _rg_id()
+    var sm = _env_str("METHYLGRAPHER_RG_SM", "sample")
+    var lb = _env_str("METHYLGRAPHER_RG_LB", "lib1")
+    var pl = _env_str("METHYLGRAPHER_RG_PL", "ILLUMINA")
+    fh.write(
+        "@RG\tID:"
+        + rg
+        + "\tSM:"
+        + sm
+        + "\tLB:"
+        + lb
+        + "\tPL:"
+        + pl
+        + "\tPU:"
+        + rg
+        + "\n"
+    )
     fh.write("@PG\tID:MojoFq2bamMeth\tPN:MojoFq2bamMeth\tVN:0.1.0-mojo\n")
     try:
         fh.flush()
@@ -146,7 +179,8 @@ def _require_hbm(science_bytes: Int, device: String) raises:
 def _hit_from_gpu(
     index: LinearIndex,
     name: String,
-    seq: String,
+    align_seq: String,
+    original_seq: String,
     cid: Int,
     start0: Int,
     mapq: Int,
@@ -154,18 +188,24 @@ def _hit_from_gpu(
     soft_l: Int,
     soft_r: Int,
 ) raises -> LinearHit:
-    var qlen = seq.byte_length()
+    """Build SAM hit; SEQ is pre-conversion (GATK/Picard), RC if flag 0x10."""
+    var qlen = align_seq.byte_length()
+    var emit = original_seq
+    if emit.byte_length() == 0:
+        emit = align_seq
     if cid < 0:
-        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+        return LinearHit(name, 4, "*", 0, 0, "*", emit, "*")
     var m = qlen - soft_l - soft_r
     if m < 1:
-        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")
+        return LinearHit(name, 4, "*", 0, 0, "*", emit, "*")
     var cigar = String("")
     if soft_l > 0:
         cigar = cigar + String(soft_l) + "S"
     cigar = cigar + String(m) + "M"
     if soft_r > 0:
         cigar = cigar + String(soft_r) + "S"
+    if (flag & 16) != 0:
+        emit = reverse_complement(emit)
     return LinearHit(
         name,
         flag,
@@ -173,9 +213,13 @@ def _hit_from_gpu(
         start0 + 1,
         mapq,
         cigar,
-        seq,
+        emit,
         "*",
     )
+
+
+def _sam_with_rg(h: LinearHit) raises -> String:
+    return hit_to_sam_line(h) + "\tRG:Z:" + _rg_id()
 
 
 def map_fastq_dense_gpu_locate(
@@ -789,13 +833,11 @@ def map_fastq_dense_gpu_locate(
         # ~4% mismatches + end soft-clip — closes most of the exact-only map gap.
         var max_diff = _env_int("METHYLGRAPHER_LINEAR_MAX_DIFF", 6)
         var max_soft = _env_int("METHYLGRAPHER_LINEAR_MAX_SOFT", 8)
-        # bwameth dual index (f*=C→T, r*=G→A): forward codes are enough.
-        # RC search helps single-strand C2T packs; set LINEAR_RC=1 to force.
-        var rc_raw = _env_str("METHYLGRAPHER_LINEAR_RC", "auto").lower()
-        var do_rc = rc_raw == "1" or rc_raw == "true" or rc_raw == "yes"
-        if rc_raw == "auto":
-            # Heuristic: dual-strand pack has ~2× contigs vs genome.
-            do_rc = n_contigs < 250
+        # Reverse orientation is required even on bwameth f*/r* packs (BWA
+        # still sets 0x10 against the converted contig). Set LINEAR_RC=0 only
+        # for experiments.
+        var rc_raw = _env_str("METHYLGRAPHER_LINEAR_RC", "1").lower()
+        var do_rc = not (rc_raw == "0" or rc_raw == "false" or rc_raw == "no")
         var n_mapped = 0
         var n_reads = 0
         var n_batches = 0
@@ -1125,6 +1167,7 @@ def map_fastq_dense_gpu_locate(
                         index,
                         batch1[j].name,
                         batch1[j].seq,
+                        batch1[j].original_seq,
                         r_cid,
                         Int(host_pos_r[j]),
                         Int(host_mapq_r[j]),
@@ -1137,6 +1180,7 @@ def map_fastq_dense_gpu_locate(
                         index,
                         batch1[j].name,
                         batch1[j].seq,
+                        batch1[j].original_seq,
                         f_cid,
                         Int(host_pos_f[j]),
                         Int(host_mapq_f[j]),
@@ -1148,7 +1192,7 @@ def map_fastq_dense_gpu_locate(
                 if not paired:
                     if h1.contig != "*":
                         n_mapped += 1
-                    fh.write(hit_to_sam_line(h1) + "\n")
+                    fh.write(_sam_with_rg(h1) + "\n")
                     n_reads += 1
                 else:
                     var r2i = n1 + j
@@ -1171,6 +1215,7 @@ def map_fastq_dense_gpu_locate(
                             index,
                             batch2[j].name,
                             batch2[j].seq,
+                            batch2[j].original_seq,
                             r2,
                             Int(host_pos_r[r2i]),
                             Int(host_mapq_r[r2i]),
@@ -1183,6 +1228,7 @@ def map_fastq_dense_gpu_locate(
                             index,
                             batch2[j].name,
                             batch2[j].seq,
+                            batch2[j].original_seq,
                             f2,
                             Int(host_pos_f[r2i]),
                             Int(host_mapq_f[r2i]),
@@ -1198,8 +1244,8 @@ def map_fastq_dense_gpu_locate(
                         n_mapped += 1
                     if p2.contig != "*":
                         n_mapped += 1
-                    fh.write(hit_to_sam_line(p1) + "\n")
-                    fh.write(hit_to_sam_line(p2) + "\n")
+                    fh.write(_sam_with_rg(p1) + "\n")
+                    fh.write(_sam_with_rg(p2) + "\n")
                     n_reads += 2
                 j += 1
 

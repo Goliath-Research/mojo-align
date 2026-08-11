@@ -104,6 +104,24 @@ Clara runs via host `pbrun` when available, otherwise Docker
 
 Aligned with MethylPipeline [`mojo-fq2bam-concordance-gates.md`](../../../MethylPipeline/docs/plans/mojo-fq2bam-concordance-gates.md).
 
+## GATK 4 / Picard metrics (consumer parity)
+
+Clara `fq2bam_meth` is positioned as GATK 4–compatible. Mojo must clear the
+same consumer checks before cutover:
+
+```bash
+python3 fq2bam-meth/scripts/compare_gatk_picard_metrics.py \
+  --clara-bam /work/samples/parabricks_sample/align.linear.parabricks/parabricks_sample.bam \
+  --mojo-bam  /work/samples/parabricks_sample/align.linear.mojo/parabricks_sample.bam \
+  --ref /work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+  --out-dir /tmp/gatk_parity_parabricks_sample
+```
+
+Requires `gatk` on PATH or `GATK_JAR` / `PICARD_JAR`. Gates include
+`ValidateSamFile`, alignment summary `% aligned`, insert-size metrics, and
+flagstat mapped/proper-pair deltas. Mojo BAMs emit `@RG`, restore
+pre-conversion SEQ, and run `samtools fixmate -m` → `sort` → `markdup`.
+
 ## Local smoke (no Clara sample / no GPU)
 
 ```bash
