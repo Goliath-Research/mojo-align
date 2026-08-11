@@ -102,21 +102,16 @@ def _vote_and_verify(
         return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
     var contig = String(bp[0])
     var seed_off = Int(String(bp[1]))
-    for c in index.contigs:
-        if c.name != contig:
-            continue
-        if seed_off < 0 or seed_off + qlen > c.seq.byte_length():
-            continue
-        var window = String(c.seq[byte = seed_off : seed_off + qlen])
-        if window == seq:
-            var mq = 20
-            if best_n >= 3:
-                mq = 40
-            if best_n >= 5:
-                mq = 60
-            return LinearHit(
-                name, 0, contig, seed_off + 1, mq, String(qlen) + "M", seq, "*"
-            )
+    var window = index.contig_window(contig, seed_off, qlen)
+    if window.byte_length() == qlen and window == seq:
+        var mq = 20
+        if best_n >= 3:
+            mq = 40
+        if best_n >= 5:
+            mq = 60
+        return LinearHit(
+            name, 0, contig, seed_off + 1, mq, String(qlen) + "M", seq, "*"
+        )
     return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
 

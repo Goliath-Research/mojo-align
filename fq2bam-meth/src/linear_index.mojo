@@ -1,8 +1,10 @@
 # Linear C2T reference index for MojoFq2bamMeth (short-read WGBS).
 #
-# Fleet cache: dense-v1 binary pack (kmers.bin / offsets.bin / postings.bin),
-# mmap'd like Giraffe mojo_segments. In-memory Dict build remains for tiny
-# fixtures when no pack is present.
+# Fleet cache: dense-v1 binary pack mmap'd like Giraffe mojo_segments
+# (kmers/offsets/postings + sequences/contig_offsets). Python is only used
+# to open mmap / read tiny meta.json — never to load genome bases.
+#
+# Toys without a pack: in-memory Dict + Mojo FASTA parse via open_text_read.
 
 from std.collections import Dict, List
 from std.memory import UnsafePointer
@@ -59,11 +61,26 @@ def _encode_kmer_u64(mer: String, k: Int) raises -> UInt64:
         elif ch == "T":
             bits = 3
         else:
-            # Ambiguous — return sentinel larger than any valid k-mer.
             return UInt64(0xFFFFFFFFFFFFFFFF)
         v = (v << 2) | bits
         i += 1
     return v
+
+
+def _ascii_from_addr(addr: Int, length: Int) raises -> String:
+    if length <= 0:
+        return String("")
+    var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+    var out = String("")
+    var i = 0
+    while i < length:
+        var b = Int(p[i])
+        # Uppercase a-z for gapless compare.
+        if b >= 97 and b <= 122:
+            b = b - 32
+        out += chr(b)
+        i += 1
+    return out^
 
 
 struct LinearIndex(Copyable, Movable):
@@ -83,10 +100,16 @@ struct LinearIndex(Copyable, Movable):
     var offsets_size: Int
     var postings_addr: Int
     var postings_size: Int
+    var seq_addr: Int
+    var seq_size: Int
+    var contig_off_addr: Int
+    var contig_off_size: Int
     var contig_names: List[String]
     var _keep_kmers: PythonObject
     var _keep_offsets: PythonObject
     var _keep_postings: PythonObject
+    var _keep_seq: PythonObject
+    var _keep_contig_off: PythonObject
 
     def __init__(out self, k: Int = 15):
         self.contigs = List[LinearContig]()
@@ -103,27 +126,34 @@ struct LinearIndex(Copyable, Movable):
         self.offsets_size = 0
         self.postings_addr = 0
         self.postings_size = 0
+        self.seq_addr = 0
+        self.seq_size = 0
+        self.contig_off_addr = 0
+        self.contig_off_size = 0
         self.contig_names = List[String]()
         self._keep_kmers = Python.none()
         self._keep_offsets = Python.none()
         self._keep_postings = Python.none()
+        self._keep_seq = Python.none()
+        self._keep_contig_off = Python.none()
 
     def load_fasta(mut self, fasta_path: String) raises:
-        # Bulk-read via Python (Mojo readline on multi-GB refs is glacial).
-        print("MojoLinear loading FASTA ", fasta_path)
-        var builtins = Python.import_module("builtins")
-        var fh = builtins.open(fasta_path, "r")
-        var text = String(fh.read())
-        fh.close()
+        """Toy / non-dense path only — Mojo readline via open_text_read."""
         self.contigs = List[LinearContig]()
+        var fh = open_text_read(fasta_path)
         var name = String("")
         var seq = String("")
-        var lines = text.split("\n")
-        var li = 0
-        var n_lines = len(lines)
-        while li < n_lines:
-            var line = String(lines[li])
-            li += 1
+        while True:
+            var line_obj = fh.readline()
+            var line = String(line_obj)
+            if line.byte_length() == 0:
+                break
+            while line.byte_length() > 0:
+                var last = String(line[byte = line.byte_length() - 1 : line.byte_length()])
+                if last == "\n" or last == "\r":
+                    line = String(line[byte = 0 : line.byte_length() - 1])
+                else:
+                    break
             if line.byte_length() == 0:
                 continue
             if line.startswith(">"):
@@ -141,12 +171,7 @@ struct LinearIndex(Copyable, Movable):
                 seq += line.upper()
         if name.byte_length() > 0:
             self.contigs.append(LinearContig(name, seq))
-        print(
-            "MojoLinear FASTA contigs=",
-            len(self.contigs),
-            " bases=",
-            self.total_bases(),
-        )
+        fh.close()
 
     def _add_posting(mut self, mer: String, loc: String) raises:
         if mer in self.postings:
@@ -186,11 +211,15 @@ struct LinearIndex(Copyable, Movable):
         var kmers_path = cache_dir + "/kmers.bin"
         var offsets_path = cache_dir + "/offsets.bin"
         var postings_path = cache_dir + "/postings.bin"
+        var seq_path = cache_dir + "/sequences.bin"
+        var coff_path = cache_dir + "/contig_offsets.bin"
         if (
             not Bool(os_mod.path.isfile(meta_path))
             or not Bool(os_mod.path.isfile(kmers_path))
             or not Bool(os_mod.path.isfile(offsets_path))
             or not Bool(os_mod.path.isfile(postings_path))
+            or not Bool(os_mod.path.isfile(seq_path))
+            or not Bool(os_mod.path.isfile(coff_path))
         ):
             return False
 
@@ -214,10 +243,13 @@ struct LinearIndex(Copyable, Movable):
             self.contig_names.append(String(names[ni]))
             ni += 1
 
+        # Thin mmap open (same bridge as Giraffe) — Mojo owns all subsequent reads.
         var bridge = Python.import_module("min_mmap_bridge")
         var opened_k = bridge.open_min_mmap(kmers_path)
         var opened_o = bridge.open_min_mmap(offsets_path)
         var opened_p = bridge.open_min_mmap(postings_path)
+        var opened_s = bridge.open_min_mmap(seq_path)
+        var opened_c = bridge.open_min_mmap(coff_path)
         self.kmers_addr = Int(py=opened_k[0])
         self.kmers_size = Int(py=opened_k[1])
         self._keep_kmers = Python.tuple(opened_k[2], opened_k[3])
@@ -227,26 +259,45 @@ struct LinearIndex(Copyable, Movable):
         self.postings_addr = Int(py=opened_p[0])
         self.postings_size = Int(py=opened_p[1])
         self._keep_postings = Python.tuple(opened_p[2], opened_p[3])
-        if self.kmers_addr == 0 or self.offsets_addr == 0 or self.postings_addr == 0:
+        self.seq_addr = Int(py=opened_s[0])
+        self.seq_size = Int(py=opened_s[1])
+        self._keep_seq = Python.tuple(opened_s[2], opened_s[3])
+        self.contig_off_addr = Int(py=opened_c[0])
+        self.contig_off_size = Int(py=opened_c[1])
+        self._keep_contig_off = Python.tuple(opened_c[2], opened_c[3])
+        if (
+            self.kmers_addr == 0
+            or self.offsets_addr == 0
+            or self.postings_addr == 0
+            or self.seq_addr == 0
+            or self.contig_off_addr == 0
+        ):
             raise Error("dense linear pack mmap failed: " + cache_dir)
         self.dense = True
         self.cache_dir = cache_dir
+        # Empty in-memory contig seqs — windows come from sequences.bin mmap.
+        self.contigs = List[LinearContig]()
+        var ci = 0
+        while ci < len(self.contig_names):
+            self.contigs.append(LinearContig(self.contig_names[ci], String("")))
+            ci += 1
         print(
             "MojoLinear dense-v1 mmap n_keys=",
             self.n_keys,
             " n_postings=",
             self.n_postings,
+            " n_bases=",
+            self.seq_size,
             " root=",
             cache_dir,
         )
         return True
 
     def save_cache(self, cache_dir: String) raises:
-        """Build dense-v1 pack via Python (fleet format). Requires contigs loaded."""
+        """Offline helper: dump toy contigs then shell to pack builder."""
         self._bootstrap_sys_path()
         var os_mod = Python.import_module("os")
         _ = os_mod.makedirs(cache_dir, exist_ok=True)
-        # Write a temporary FASTA from in-memory contigs, then pack.
         var tmp_fa = cache_dir + "/ref.fa"
         var fa = open_text_write(tmp_fa)
         for c in self.contigs:
@@ -259,15 +310,6 @@ struct LinearIndex(Copyable, Movable):
 
     def load_cache(mut self, cache_dir: String) raises -> Bool:
         if self._load_dense_pack(cache_dir):
-            # Sequences for extend/verify (ensure_mojo_linear_index.sh links ref.fa).
-            var os_mod = Python.import_module("os")
-            var ref_fa = cache_dir + "/ref.fa"
-            if Bool(os_mod.path.isfile(ref_fa)):
-                self.load_fasta(ref_fa)
-            else:
-                raise Error(
-                    "dense pack missing ref.fa (C2T FASTA link) under " + cache_dir
-                )
             return True
 
         # Legacy hits.tsv (toys / old caches)
@@ -308,6 +350,34 @@ struct LinearIndex(Copyable, Movable):
         fh.close()
         return True
 
+    def contig_window(self, contig: String, start: Int, length: Int) raises -> String:
+        """Return uppercase window; dense path reads sequences.bin via mmap."""
+        if length <= 0 or start < 0:
+            return String("")
+        if self.dense and self.seq_addr != 0:
+            var cid = 0
+            var found = -1
+            while cid < len(self.contig_names):
+                if self.contig_names[cid] == contig:
+                    found = cid
+                    break
+                cid += 1
+            if found < 0:
+                return String("")
+            var off0 = Int(_u64_le(self.contig_off_addr, found))
+            var off1 = Int(_u64_le(self.contig_off_addr, found + 1))
+            var clen = off1 - off0
+            if start + length > clen:
+                return String("")
+            return _ascii_from_addr(self.seq_addr + off0 + start, length)
+        for c in self.contigs:
+            if c.name != contig:
+                continue
+            if start + length > c.seq.byte_length():
+                return String("")
+            return String(c.seq[byte = start : start + length])
+        return String("")
+
     def _dense_lookup(self, key: UInt64) raises -> List[String]:
         var hits = List[String]()
         if self.n_keys <= 0 or key == UInt64(0xFFFFFFFFFFFFFFFF):
@@ -334,8 +404,6 @@ struct LinearIndex(Copyable, Movable):
             var cname = String("?")
             if cid >= 0 and cid < len(self.contig_names):
                 cname = self.contig_names[cid]
-            elif cid >= 0 and cid < len(self.contigs):
-                cname = self.contigs[cid].name
             hits.append(cname + ":" + String(pos))
             i += 1
         return hits^
@@ -356,9 +424,13 @@ struct LinearIndex(Copyable, Movable):
         return hits^
 
     def contig_count(self) -> Int:
+        if self.dense:
+            return len(self.contig_names)
         return len(self.contigs)
 
     def total_bases(self) -> Int:
+        if self.dense:
+            return self.seq_size
         var n = 0
         for c in self.contigs:
             n += c.seq.byte_length()

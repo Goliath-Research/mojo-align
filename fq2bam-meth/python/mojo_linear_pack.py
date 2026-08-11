@@ -40,7 +40,45 @@ def pack_is_complete(cache_dir: Path) -> bool:
         and (cache_dir / "kmers.bin").is_file()
         and (cache_dir / "offsets.bin").is_file()
         and (cache_dir / "postings.bin").is_file()
+        and (cache_dir / "sequences.bin").is_file()
+        and (cache_dir / "contig_offsets.bin").is_file()
     )
+
+
+def write_sequences_bin(c2t_fasta: Path, out_dir: Path) -> dict:
+    """Write Mojo-mmap'd contig bases (no newlines) + u64 CSR offsets.
+
+    Offline pack step only — runtime Mojo never loads FASTA via Python.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    contigs = read_fasta_contigs(c2t_fasta)
+    if not contigs:
+        raise RuntimeError(f"no contigs in {c2t_fasta}")
+    names = [n for n, _ in contigs]
+    offsets = np.zeros(len(contigs) + 1, dtype=np.uint64)
+    seq_path = out_dir / "sequences.bin"
+    with seq_path.open("wb") as fh:
+        for i, (_, seq) in enumerate(contigs):
+            offsets[i] = fh.tell()
+            fh.write(seq)
+        offsets[-1] = fh.tell()
+    (out_dir / "contig_offsets.bin").write_bytes(offsets.astype("<u8", copy=False).tobytes())
+    (out_dir / "contigs.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
+    meta_path = out_dir / "meta.json"
+    meta: dict = {}
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["contigs"] = names
+    meta["n_contigs"] = len(names)
+    meta["n_bases"] = int(offsets[-1])
+    meta["sequences"] = "sequences.bin+contig_offsets.bin"
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"wrote sequences.bin n_contigs={len(names)} n_bases={int(offsets[-1])} → {out_dir}",
+        flush=True,
+    )
+    return meta
 
 
 def _ensure_ref_link(cache_dir: Path, c2t_fasta: Path) -> None:
@@ -220,7 +258,6 @@ def build_dense_pack(c2t_fasta: Path, out_dir: Path, k: int = 15) -> dict:
     (out_dir / "kmers.bin").write_bytes(uniq.astype("<u8", copy=False).tobytes())
     (out_dir / "offsets.bin").write_bytes(offsets.astype("<u8", copy=False).tobytes())
     (out_dir / "postings.bin").write_bytes(postings.astype("<u4", copy=False).tobytes())
-    (out_dir / "contigs.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
 
     meta = {
         "format": "dense-v1",
@@ -234,6 +271,7 @@ def build_dense_pack(c2t_fasta: Path, out_dir: Path, k: int = 15) -> dict:
         "posting": "u32_contig_id,u32_pos0",
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    write_sequences_bin(c2t_fasta, out_dir)
     # Remove obsolete text cache if present
     legacy = out_dir / "hits.tsv"
     if legacy.is_file():
@@ -247,7 +285,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--ref", required=True, help="C2T FASTA (or raw FASTA to index as-is)")
     p.add_argument("--out", required=True, help="Output pack directory")
     p.add_argument("-k", type=int, default=15)
+    p.add_argument(
+        "--sequences-only",
+        action="store_true",
+        help="Only (re)write sequences.bin + contig_offsets.bin for an existing pack",
+    )
     args = p.parse_args(argv)
+    if args.sequences_only:
+        write_sequences_bin(Path(args.ref), Path(args.out))
+        return 0
     build_dense_pack(Path(args.ref), Path(args.out), k=args.k)
     return 0
 
