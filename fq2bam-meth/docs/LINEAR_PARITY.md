@@ -36,12 +36,37 @@ Inputs:
 |------|------|
 | `/work/samples/parabricks_sample/Data/sample_1.fq.gz` | R1 |
 | `/work/samples/parabricks_sample/Data/sample_2.fq.gz` | R2 |
-| `/work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta` | reference |
+| `/work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta` | tutorial ref (no `.bwameth.c2t`) |
+| Fleet Ensembl GRCh38 (auto-fallback) | used when Clara index is missing |
+
+## Reference / bwameth index
+
+Clara `pbrun fq2bam_meth` needs `${REF}.bwameth.c2t`. The tutorial assembly38
+Ref does not include it. The harness falls back to the fleet indexed linear
+ref when present:
+
+`/work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa`
+
+To index assembly38 yourself (slow, once):
+
+```bash
+fq2bam-meth/scripts/ensure_bwameth_index.sh \
+  /work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta
+```
+
+Or pass an already-indexed FASTA:
+
+```bash
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
+  --ref /work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+  --device nvidia
+```
 
 ## Run both arms + score
 
 ```bash
 # Defaults: sample-dir=/work/samples/parabricks_sample, first 50k PE pairs
+# Uses fleet indexed GRCh38 if assembly38 lacks .bwameth.c2t
 fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 
 # Full sample:
