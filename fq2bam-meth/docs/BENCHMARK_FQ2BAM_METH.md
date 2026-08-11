@@ -17,11 +17,8 @@ End-to-end concordance on NVIDIA’s public `parabricks_sample` bundle (or any
 FASTQ pair), writing side-by-side product dirs:
 
 ```bash
-# after extracting https://s3.amazonaws.com/parabricks.sample/parabricks_sample.tar.gz
-export PARABRICKS_SAMPLE=$PWD/parabricks_sample
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-  --sample-dir /work/samples/parabricks_sample \
-  --device nvidia
+fq2bam-meth/scripts/fetch_parabricks_sample.sh   # → /work/samples/parabricks_sample
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 ```
 
 See [`LINEAR_PARITY.md`](LINEAR_PARITY.md).

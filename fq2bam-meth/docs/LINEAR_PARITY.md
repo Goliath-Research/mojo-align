@@ -23,39 +23,32 @@ on the same inputs, using the per-path sample layout.
 
 ## NVIDIA Parabricks tutorial sample
 
-Clara documents a public bundle used by the `fq2bam` tutorial (same FASTQs +
-GRCh38 reference work for `fq2bam_meth`):
+Stage once under the fleet sample tree:
 
 ```bash
-wget -O parabricks_sample.tar.gz \
-  "https://s3.amazonaws.com/parabricks.sample/parabricks_sample.tar.gz"
-tar xvf parabricks_sample.tar.gz
-export PARABRICKS_SAMPLE=$PWD/parabricks_sample
+fq2bam-meth/scripts/fetch_parabricks_sample.sh
+# → /work/samples/parabricks_sample/{Data,Ref,align.linear.*}
 ```
 
-Inputs used:
+Inputs:
 
 | Path | Role |
 |------|------|
-| `$PARABRICKS_SAMPLE/Data/sample_1.fq.gz` | R1 |
-| `$PARABRICKS_SAMPLE/Data/sample_2.fq.gz` | R2 |
-| `$PARABRICKS_SAMPLE/Ref/Homo_sapiens_assembly38.fasta` | reference |
+| `/work/samples/parabricks_sample/Data/sample_1.fq.gz` | R1 |
+| `/work/samples/parabricks_sample/Data/sample_2.fq.gz` | R2 |
+| `/work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta` | reference |
 
 ## Run both arms + score
 
 ```bash
-# Default: first 50k PE pairs (full sample is large; set --max-pairs 0 for all)
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-  --parabricks-sample "$PARABRICKS_SAMPLE" \
-  --sample-dir /work/samples/parabricks_sample \
-  --sample-id parabricks_sample \
-  --device nvidia
+# Defaults: sample-dir=/work/samples/parabricks_sample, first 50k PE pairs
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
+
+# Full sample:
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --max-pairs 0 --device nvidia
 
 # Score only (BAMs already present)
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-  --sample-dir /work/samples/parabricks_sample \
-  --sample-id parabricks_sample \
-  --compare-only
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --compare-only
 ```
 
 Clara runs via host `pbrun` when available, otherwise Docker

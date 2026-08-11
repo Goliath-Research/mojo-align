@@ -52,13 +52,9 @@ pixi run python -m pytest
 
 ## Linear parity (Clara vs Mojo)
 
-Side-by-side `align.linear.parabricks` vs `align.linear.mojo` on NVIDIA’s
-`parabricks_sample` tutorial inputs:
-
 ```bash
-export PARABRICKS_SAMPLE=/path/to/parabricks_sample
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-  --sample-dir /work/samples/parabricks_sample --device nvidia
+fq2bam-meth/scripts/fetch_parabricks_sample.sh   # once → /work/samples/parabricks_sample
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 ```
 
 Details: [`fq2bam-meth/docs/LINEAR_PARITY.md`](fq2bam-meth/docs/LINEAR_PARITY.md).

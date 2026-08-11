@@ -35,7 +35,7 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PATH="$HOME/.pixi/bin:${PATH:-}"
 
-SAMPLE_DIR="${SAMPLE_DIR:-/tmp/samples/parabricks_sample}"
+SAMPLE_DIR="${SAMPLE_DIR:-/work/samples/parabricks_sample}"
 SAMPLE_ID="${SAMPLE_ID:-parabricks_sample}"
 PB_SAMPLE="${PARABRICKS_SAMPLE:-}"
 MAX_PAIRS="${MAX_PAIRS:-50000}"
@@ -93,6 +93,8 @@ if [[ "$USE_TOY" -eq 1 ]]; then
 else
   if [[ -z "$PB_SAMPLE" ]]; then
     for cand in \
+      /work/samples/parabricks_sample \
+      "$SAMPLE_DIR" \
       "$PWD/parabricks_sample" \
       "$HOME/parabricks_sample" \
       /workdir/parabricks_sample \
@@ -105,17 +107,19 @@ else
   fi
   if [[ -z "$PB_SAMPLE" || ! -d "$PB_SAMPLE/Data" ]]; then
     cat >&2 <<EOF
-ERROR: Parabricks sample not found.
-Download NVIDIA's tutorial bundle, then re-run:
+ERROR: Parabricks sample not found under /work/samples/parabricks_sample.
 
-  wget -O parabricks_sample.tar.gz \\
-    "https://s3.amazonaws.com/parabricks.sample/parabricks_sample.tar.gz"
-  tar xvf parabricks_sample.tar.gz
-  export PARABRICKS_SAMPLE=\$PWD/parabricks_sample
+Fetch once:
+
+  fq2bam-meth/scripts/fetch_parabricks_sample.sh
 
 Or pass --parabricks-sample DIR / --toy for the local smoke fixture.
 EOF
     exit 2
+  fi
+  # Default sample-dir to the staged NVIDIA tree when still at the default path.
+  if [[ "$SAMPLE_DIR" == "/work/samples/parabricks_sample" ]]; then
+    SAMPLE_DIR="$PB_SAMPLE"
   fi
   R1_SRC="$PB_SAMPLE/Data/sample_1.fq.gz"
   R2_SRC="$PB_SAMPLE/Data/sample_2.fq.gz"
