@@ -789,6 +789,13 @@ def map_fastq_dense_gpu_locate(
         # ~4% mismatches + end soft-clip — closes most of the exact-only map gap.
         var max_diff = _env_int("METHYLGRAPHER_LINEAR_MAX_DIFF", 6)
         var max_soft = _env_int("METHYLGRAPHER_LINEAR_MAX_SOFT", 8)
+        # bwameth dual index (f*=C→T, r*=G→A): forward codes are enough.
+        # RC search helps single-strand C2T packs; set LINEAR_RC=1 to force.
+        var rc_raw = _env_str("METHYLGRAPHER_LINEAR_RC", "auto").lower()
+        var do_rc = rc_raw == "1" or rc_raw == "true" or rc_raw == "yes"
+        if rc_raw == "auto":
+            # Heuristic: dual-strand pack has ~2× contigs vs genome.
+            do_rc = n_contigs < 250
         var n_mapped = 0
         var n_reads = 0
         var n_batches = 0
@@ -805,6 +812,8 @@ def map_fastq_dense_gpu_locate(
             max_diff,
             " max_soft=",
             max_soft,
+            " rc=",
+            do_rc,
             " paired=",
             paired,
         )
@@ -976,82 +985,93 @@ def map_fastq_dense_gpu_locate(
                 block_dim=BLOCK,
             )
 
-            # Reverse strand (RC codes → locate → extend)
-            ctx.enqueue_function[rc_codes_kernel](
-                dev_codes.unsafe_ptr(),
-                dev_rc.unsafe_ptr(),
-                dev_lens.unsafe_ptr(),
-                n_seq,
-                max_len,
-                grid_dim=grid_r,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[encode_strided_kernel](
-                dev_rc.unsafe_ptr(),
-                dev_keys.unsafe_ptr(),
-                dev_qoff.unsafe_ptr(),
-                dev_lens.unsafe_ptr(),
-                n_seq,
-                max_len,
-                k_len,
-                seed_stride,
-                slots_per,
-                grid_dim=grid_s,
-                block_dim=BLOCK,
-            )
-            if use_interp:
-                ctx.enqueue_function[locate_interp_kernel](
+            if do_rc:
+                # Reverse strand (RC codes → locate → extend)
+                ctx.enqueue_function[rc_codes_kernel](
+                    dev_codes.unsafe_ptr(),
+                    dev_rc.unsafe_ptr(),
+                    dev_lens.unsafe_ptr(),
+                    n_seq,
+                    max_len,
+                    grid_dim=grid_r,
+                    block_dim=BLOCK,
+                )
+                ctx.enqueue_function[encode_strided_kernel](
+                    dev_rc.unsafe_ptr(),
                     dev_keys.unsafe_ptr(),
-                    dev_kmers.unsafe_ptr(),
-                    dev_offsets.unsafe_ptr(),
+                    dev_qoff.unsafe_ptr(),
+                    dev_lens.unsafe_ptr(),
+                    n_seq,
+                    max_len,
+                    k_len,
+                    seed_stride,
+                    slots_per,
+                    grid_dim=grid_s,
+                    block_dim=BLOCK,
+                )
+                if use_interp:
+                    ctx.enqueue_function[locate_interp_kernel](
+                        dev_keys.unsafe_ptr(),
+                        dev_kmers.unsafe_ptr(),
+                        dev_offsets.unsafe_ptr(),
+                        dev_start.unsafe_ptr(),
+                        dev_end.unsafe_ptr(),
+                        n_slots,
+                        n_table,
+                        max_occ,
+                        grid_dim=grid_s,
+                        block_dim=BLOCK,
+                    )
+                else:
+                    ctx.enqueue_function[locate_bsearch_kernel](
+                        dev_keys.unsafe_ptr(),
+                        dev_kmers.unsafe_ptr(),
+                        dev_offsets.unsafe_ptr(),
+                        dev_start.unsafe_ptr(),
+                        dev_end.unsafe_ptr(),
+                        n_slots,
+                        n_table,
+                        max_occ,
+                        grid_dim=grid_s,
+                        block_dim=BLOCK,
+                    )
+                ctx.enqueue_function[vote_extend_kernel](
                     dev_start.unsafe_ptr(),
                     dev_end.unsafe_ptr(),
-                    n_slots,
-                    n_table,
-                    max_occ,
-                    grid_dim=grid_s,
+                    dev_qoff.unsafe_ptr(),
+                    dev_postings.unsafe_ptr(),
+                    n_post,
+                    dev_seq.unsafe_ptr(),
+                    dev_coff.unsafe_ptr(),
+                    n_contigs,
+                    dev_rc.unsafe_ptr(),
+                    dev_lens.unsafe_ptr(),
+                    max_len,
+                    slots_per,
+                    n_seq,
+                    max_diff,
+                    max_soft,
+                    Int32(16),
+                    dev_cid_r.unsafe_ptr(),
+                    dev_pos_r.unsafe_ptr(),
+                    dev_mapq_r.unsafe_ptr(),
+                    dev_flag_r.unsafe_ptr(),
+                    dev_sl_r.unsafe_ptr(),
+                    dev_sr_r.unsafe_ptr(),
+                    dev_nm_r.unsafe_ptr(),
+                    grid_dim=grid_r,
                     block_dim=BLOCK,
                 )
             else:
-                ctx.enqueue_function[locate_bsearch_kernel](
-                    dev_keys.unsafe_ptr(),
-                    dev_kmers.unsafe_ptr(),
-                    dev_offsets.unsafe_ptr(),
-                    dev_start.unsafe_ptr(),
-                    dev_end.unsafe_ptr(),
-                    n_slots,
-                    n_table,
-                    max_occ,
-                    grid_dim=grid_s,
-                    block_dim=BLOCK,
+                # Mark RC outputs unmapped so host merge keeps FW hits.
+                var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
+                    n_seq
                 )
-            ctx.enqueue_function[vote_extend_kernel](
-                dev_start.unsafe_ptr(),
-                dev_end.unsafe_ptr(),
-                dev_qoff.unsafe_ptr(),
-                dev_postings.unsafe_ptr(),
-                n_post,
-                dev_seq.unsafe_ptr(),
-                dev_coff.unsafe_ptr(),
-                n_contigs,
-                dev_rc.unsafe_ptr(),
-                dev_lens.unsafe_ptr(),
-                max_len,
-                slots_per,
-                n_seq,
-                max_diff,
-                max_soft,
-                Int32(16),
-                dev_cid_r.unsafe_ptr(),
-                dev_pos_r.unsafe_ptr(),
-                dev_mapq_r.unsafe_ptr(),
-                dev_flag_r.unsafe_ptr(),
-                dev_sl_r.unsafe_ptr(),
-                dev_sr_r.unsafe_ptr(),
-                dev_nm_r.unsafe_ptr(),
-                grid_dim=grid_r,
-                block_dim=BLOCK,
-            )
+                var zi = 0
+                while zi < n_seq:
+                    host_cid_r_init[zi] = Int32(-1)
+                    zi += 1
+                ctx.enqueue_copy(src_buf=host_cid_r_init, dst_buf=dev_cid_r)
 
             var host_cid_f = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
             var host_pos_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
