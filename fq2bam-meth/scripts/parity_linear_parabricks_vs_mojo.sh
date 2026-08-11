@@ -274,9 +274,18 @@ run_mojo() {
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
   # Toy fixture uses short k; Clara sample uses default 15.
   local k_args=()
+  local k_val="${METHYLGRAPHER_LINEAR_K:-15}"
   if [[ "$USE_TOY" -eq 1 ]]; then
     k_args=(-k 8)
+    k_val=8
     export METHYLGRAPHER_GPU_REQUIRE=0
+  fi
+  local fleet_cache="${REF}.mojo_linear_k${k_val}"
+  if [[ ! -f "${fleet_cache}/hits.tsv" ]]; then
+    echo "NOTE: Mojo linear cache missing at ${fleet_cache}" >&2
+    echo "      Prebuild once: fq2bam-meth/scripts/ensure_mojo_linear_index.sh $REF $k_val" >&2
+  else
+    echo "Using fleet Mojo linear cache: $fleet_cache"
   fi
   "$REPO_ROOT/bin/methylGrapher" MojoFq2bamMeth \
     -fq1 "$R1" -fq2 "$R2" -ref "$REF" \

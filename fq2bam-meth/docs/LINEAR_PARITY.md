@@ -39,28 +39,30 @@ Inputs:
 | `/work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta` | tutorial ref (no `.bwameth.c2t`) |
 | Fleet Ensembl GRCh38 (auto-fallback) | used when Clara index is missing |
 
-## Reference / bwameth index
+## Reference indexes (under `/work/genomes`)
 
-Clara `pbrun fq2bam_meth` needs `${REF}.bwameth.c2t`. The tutorial assembly38
-Ref does not include it. The harness falls back to the fleet indexed linear
-ref when present:
+Fleet linear GRCh38 (default after assembly38 bwameth fallback):
 
 `/work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa`
 
-To index assembly38 yourself (slow, once):
+Sibling indexes (prebuild once; do not rebuild per sample):
+
+| Sibling | Tool |
+|---------|------|
+| `${REF}.bwameth.c2t` (+ `.bwt` …) | Clara `fq2bam_meth` |
+| `${REF}.C2T.fa` | Mojo C→T reference |
+| `${REF}.mojo_linear_k15/` | Mojo k-mer cache (`meta.txt`, `hits.tsv`, `ref.fa`) |
 
 ```bash
-fq2bam-meth/scripts/ensure_bwameth_index.sh \
-  /work/samples/parabricks_sample/Ref/Homo_sapiens_assembly38.fasta
+# Clara (if missing)
+fq2bam-meth/scripts/ensure_bwameth_index.sh "$REF"
+
+# Mojo linear (if missing) — slow, once
+fq2bam-meth/scripts/ensure_mojo_linear_index.sh "$REF" 15
 ```
 
-Or pass an already-indexed FASTA:
-
-```bash
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-  --ref /work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
-  --device nvidia
-```
+MojoFq2bamMeth auto-uses `${REF}.mojo_linear_k${k}/` when the ref lives under
+`/work/genomes` (override with `-cache_dir` / `METHYLGRAPHER_LINEAR_CACHE_DIR`).
 
 ## Run both arms + score
 

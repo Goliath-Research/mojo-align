@@ -850,6 +850,7 @@ MojoFq2bamMeth:
     -fq1 <fastq> -fq2 <fastq> -ref <fasta>
     -out_bam <bam> -out_qc_dir <dir> -sample_id <id>
     [-t <threads>] [-device auto|cpu|nvidia|amd] [-work_dir <dir>] [-k <kmer>]
+    [-cache_dir <dir>]   # default: ${REF}.mojo_linear_k${k}/ under /work/genomes
 
 vg_check:
     methylGrapher vg_check [-vg_path <path>]

@@ -119,6 +119,7 @@ def map_fastq_to_sam(
     cache_dir: String = "",
     bs_r1: String = "",
     bs_r2: String = "",
+    build_cache_only: Bool = False,
 ) raises -> Int:
     var index = LinearIndex(k)
     var loaded = False
@@ -140,6 +141,12 @@ def map_fastq_to_sam(
         " device=",
         device,
     )
+
+    if build_cache_only:
+        if cache_dir.byte_length() == 0:
+            raise Error("MojoLinear -build_cache_only requires -cache_dir")
+        print("MojoLinear cache ready -> ", cache_dir)
+        return 0
 
     var fh = open_text_write(out_sam)
     _write_sam_header(fh, index)
@@ -223,7 +230,7 @@ def map_fastq_to_sam(
 
 
 def run_mojo_linear_cli(args: List[String]) raises -> Int:
-    """CLI: -ref <fa> -fq1 <fq> -out_sam <path> [-fq2] [-device] [-k] [-cache_dir]."""
+    """CLI: -ref <fa> [-fq1] -out_sam <path> [-fq2] [-device] [-k] [-cache_dir] [-build_cache_only]."""
     var ref_fa = get_kv_value(args, "ref", "")
     var fq1 = get_kv_value(args, "fq1", "")
     var fq2 = get_kv_value(args, "fq2", "")
@@ -233,10 +240,26 @@ def run_mojo_linear_cli(args: List[String]) raises -> Int:
     var cache_dir = get_kv_value(args, "cache_dir", "")
     var bs_r1 = get_kv_value(args, "bs_r1", "")
     var bs_r2 = get_kv_value(args, "bs_r2", "")
-    if ref_fa.byte_length() == 0 or fq1.byte_length() == 0:
-        raise Error("MojoLinearMap requires -ref and -fq1")
+    var build_cache_only = False
+    for a in args:
+        if a == "-build_cache_only" or a == "--build_cache_only":
+            build_cache_only = True
+            break
+    if ref_fa.byte_length() == 0:
+        raise Error("MojoLinearMap requires -ref")
+    if not build_cache_only and fq1.byte_length() == 0:
+        raise Error("MojoLinearMap requires -fq1 (or pass -build_cache_only)")
     _ = map_fastq_to_sam(
-        ref_fa, fq1, out_sam, device, k, fq2, cache_dir, bs_r1, bs_r2
+        ref_fa,
+        fq1,
+        out_sam,
+        device,
+        k,
+        fq2,
+        cache_dir,
+        bs_r1,
+        bs_r2,
+        build_cache_only,
     )
     return 0
 

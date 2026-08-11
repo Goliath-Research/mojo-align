@@ -67,6 +67,54 @@ def convert_fasta_c2t(src: Path, dst: Path) -> None:
                 fout.write("".join("T" if ch in "Cc" else ch for ch in line))
 
 
+def fleet_c2t_fasta(reference_fasta: Path) -> Path:
+    """Sibling C2T FASTA next to the linear ref (``${REF}.C2T.fa``)."""
+    return Path(str(reference_fasta) + ".C2T.fa")
+
+
+def fleet_mojo_linear_cache_dir(reference_fasta: Path, k: int) -> Path:
+    """Sibling Mojo k-mer cache (``${REF}.mojo_linear_k${k}/``), like bwameth."""
+    return Path(str(reference_fasta) + f".mojo_linear_k{k}")
+
+
+def _is_fleet_genome_path(path: Path) -> bool:
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    return "/genomes/" in resolved or resolved.startswith("/work/genomes/")
+
+
+def resolve_c2t_fasta(reference_fasta: Path, work: Path) -> Path:
+    """Prefer fleet ``${REF}.C2T.fa``; otherwise write under work/ (or fleet if writable)."""
+    fleet = fleet_c2t_fasta(reference_fasta)
+    if fleet.is_file():
+        return fleet
+    if _is_fleet_genome_path(reference_fasta):
+        return fleet
+    return work / (reference_fasta.name + ".C2T.fa")
+
+
+def resolve_mojo_linear_cache_dir(
+    reference_fasta: Path,
+    work: Path,
+    k: int,
+    cache_dir: Optional[Path] = None,
+) -> Path:
+    """Resolve Mojo linear index dir: explicit → env → fleet sibling → work/."""
+    if cache_dir is not None:
+        return Path(cache_dir)
+    env = os.environ.get("METHYLGRAPHER_LINEAR_CACHE_DIR", "").strip()
+    if env:
+        return Path(env)
+    fleet = fleet_mojo_linear_cache_dir(reference_fasta, k)
+    if (fleet / "hits.tsv").is_file():
+        return fleet
+    if _is_fleet_genome_path(reference_fasta):
+        return fleet
+    return work / "mojo_linear_index"
+
+
 def _run(cmd: List[str], log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log:
@@ -339,6 +387,7 @@ def run_mojo_fq2bam_meth(
     work_dir: Optional[Path] = None,
     log_path: Optional[Path] = None,
     k: int = 15,
+    cache_dir: Optional[Path] = None,
 ) -> Dict[str, str]:
     samtools = shutil.which("samtools")
     if not samtools:
@@ -364,7 +413,7 @@ def run_mojo_fq2bam_meth(
         with log.open("a", encoding="utf-8") as handle:
             handle.write(f"device_probe_skipped={exc}\n")
 
-    c2t_ref = work / (reference_fasta.name + ".C2T.fa")
+    c2t_ref = resolve_c2t_fasta(reference_fasta, work)
     if not c2t_ref.is_file():
         convert_fasta_c2t(reference_fasta, c2t_ref)
 
@@ -378,7 +427,13 @@ def run_mojo_fq2bam_meth(
     if mapper == "mojo":
         try:
             out_sam = work / "aligned.sam"
-            cache_dir = work / "mojo_linear_index"
+            resolved_cache = resolve_mojo_linear_cache_dir(
+                reference_fasta, work, k, cache_dir=cache_dir
+            )
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"c2t_ref={c2t_ref} mojo_linear_cache={resolved_cache}\n"
+                )
             run_mojo_linear_map(
                 c2t_ref=c2t_ref,
                 c2t_r1=c2t_r1,
@@ -386,7 +441,7 @@ def run_mojo_fq2bam_meth(
                 out_sam=out_sam,
                 device=device,
                 k=k,
-                cache_dir=cache_dir,
+                cache_dir=resolved_cache,
                 log=log,
             )
             _run(
@@ -491,6 +546,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("-device", default=os.environ.get("METHYLGRAPHER_ALIGN_DEVICE", "auto"))
     p.add_argument("-work_dir", default=None)
     p.add_argument("-k", type=int, default=int(os.environ.get("METHYLGRAPHER_LINEAR_K", "15")))
+    p.add_argument(
+        "-cache_dir",
+        default=None,
+        help="Mojo linear k-mer cache (default: ${REF}.mojo_linear_k${k}/ under /work/genomes)",
+    )
     args = p.parse_args(argv)
     run_mojo_fq2bam_meth(
         fq1=Path(args.fq1),
@@ -503,6 +563,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         device=args.device,
         work_dir=Path(args.work_dir) if args.work_dir else None,
         k=args.k,
+        cache_dir=Path(args.cache_dir) if args.cache_dir else None,
     )
     print("MojoFq2bamMeth OK", args.out_bam)
     return 0
