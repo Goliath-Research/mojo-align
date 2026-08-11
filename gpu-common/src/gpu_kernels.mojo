@@ -226,7 +226,15 @@ def seed_kmers_on_device(
                     nonzero += 1
                 t += 1
             print("MojoGiraffe GPU hashed_positions=", nonzero)
-            # Decode k-mers from GPU-packed codes (hashes feed extend, not discarded).
+            # Decode k-mers from GPU-packed codes. Optional stride cuts host
+            # string rebuild (linear WGBS: METHYLGRAPHER_LINEAR_SEED_STRIDE).
+            var seed_stride = 1
+            var stride_raw = String(
+                os_mod.environ.get("METHYLGRAPHER_LINEAR_SEED_STRIDE", "1")
+            )
+            var stride_n = Int(stride_raw)
+            if stride_n > 1:
+                seed_stride = stride_n
             var bases = List[String]()
             bases.append("A")
             bases.append("C")
@@ -255,7 +263,7 @@ def seed_kmers_on_device(
                                 j += 1
                             if ok:
                                 mers.append(mer^)
-                        pos += 1
+                        pos += seed_stride
                 if len(mers) == 0:
                     # Fallback host extract for this read if GPU produced nothing.
                     mers = extract_kmers(seqs[ri], k)

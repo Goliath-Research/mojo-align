@@ -272,6 +272,10 @@ run_mojo() {
   export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
   export METHYLGRAPHER_GPU_REQUIRE="${METHYLGRAPHER_GPU_REQUIRE:-1}"
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
+  # Rare-kmer locate: skip ultra-repetitive C2T keys (max occ ~7.7M otherwise).
+  export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-256}"
+  export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-5}"
+  export METHYLGRAPHER_LINEAR_READ_BATCH="${METHYLGRAPHER_LINEAR_READ_BATCH:-2048}"
   # Driver <580 needs system ptxas (same as Giraffe GH200 notes).
   if [[ -z "${MODULAR_NVPTX_COMPILER_PATH:-}" && -x /usr/bin/ptxas ]]; then
     export MODULAR_NVPTX_COMPILER_PATH=/usr/bin/ptxas

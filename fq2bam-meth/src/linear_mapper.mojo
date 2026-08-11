@@ -88,24 +88,31 @@ def _read_one(fh: PythonObject) raises -> FastqRead:
 
 def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
     fh.write("@HD\tVN:1.6\tSO:unsorted\n")
-    for c in index.contigs:
+    var n = index.contig_count()
+    var ci = 0
+    while ci < n:
         fh.write(
             "@SQ\tSN:"
-            + c.name
+            + index.contig_name(ci)
             + "\tLN:"
-            + String(c.seq.byte_length())
+            + String(index.contig_length(ci))
             + "\n"
         )
+        ci += 1
     fh.write("@PG\tID:MojoFq2bamMeth\tPN:MojoFq2bamMeth\tVN:0.1.0-mojo\n")
+    try:
+        fh.flush()
+    except:
+        pass
 
 
 def _batch_size() raises -> Int:
-    # Larger default helps beat Clara wall on GH200; override via env.
+    # Keep batches modest: GPU seed is cheap; host locate must stay responsive.
     var os_mod = Python.import_module("os")
-    var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_READ_BATCH", "16384"))
+    var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_READ_BATCH", "4096"))
     var n = Int(raw)
     if n < 1:
-        return 16384
+        return 4096
     return n
 
 
@@ -159,7 +166,16 @@ def map_fastq_to_sam(
 
     var n_mapped = 0
     var n_reads = 0
+    var n_batches = 0
     var bs = _batch_size()
+    print(
+        "MojoLinear map start batch=",
+        bs,
+        " max_occ=",
+        index.max_occ(),
+        " paired=",
+        paired,
+    )
 
     while True:
         var batch1 = List[FastqRead]()
@@ -220,6 +236,21 @@ def map_fastq_to_sam(
                 fh.write(hit_to_sam_line(p2) + "\n")
                 n_reads += 2
             j += 1
+
+        n_batches += 1
+        if n_batches == 1 or n_batches % 5 == 0:
+            print(
+                "MojoLinear progress batches=",
+                n_batches,
+                " reads=",
+                n_reads,
+                " mapped=",
+                n_mapped,
+            )
+            try:
+                fh.flush()
+            except:
+                pass
 
     fh1.close()
     if paired:

@@ -115,6 +115,17 @@ def _vote_and_verify(
     return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
 
 
+def _seed_stride() raises -> Int:
+    from std.python import Python
+
+    var os_mod = Python.import_module("os")
+    var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_SEED_STRIDE", "5"))
+    var n = Int(raw)
+    if n < 1:
+        return 5
+    return n
+
+
 def extend_read_with_seeds(
     index: LinearIndex,
     name: String,
@@ -123,18 +134,43 @@ def extend_read_with_seeds(
 ) raises -> LinearHit:
     """Map using GPU/host seed k-mers (wired into hash locate + extend).
 
-    Seed/hash path first (production GRCh38). Exact full-contig scan is only
-    a tiny-index / fixture shortcut — never O(genome×read) on Buffy refs.
+    Dense GRCh38 path: rare-kmer vote with occupancy cap + seed-offset
+    correction (never expand multi-million posting lists into Strings).
     """
     var qlen = seq.byte_length()
 
-    # Fast path: GPU/host k-mers → postings → gapless verify.
+    if index.dense and len(seed_kmers) > 0:
+        var vote = index.vote_dense_seeds(seed_kmers, _seed_stride())
+        if vote.cid >= 0 and vote.votes > 0:
+            var window = index.contig_window_id(vote.cid, vote.start, qlen)
+            if window.byte_length() == qlen and window == seq:
+                var mq = 20
+                if vote.votes >= 3:
+                    mq = 40
+                if vote.votes >= 5:
+                    mq = 60
+                return LinearHit(
+                    name,
+                    0,
+                    index.contig_name(vote.cid),
+                    vote.start + 1,
+                    mq,
+                    String(qlen) + "M",
+                    seq,
+                    "*",
+                )
+        return LinearHit(name, 4, "*", 0, 0, "*", seq, "*")^
+
+    # Toy / non-dense: GPU/host k-mers → string postings → gapless verify.
     var hits = List[String]()
     if len(seed_kmers) > 0:
-        for mer in seed_kmers:
-            var found = index.lookup_kmer(mer)
+        var stride = _seed_stride()
+        var qi = 0
+        while qi < len(seed_kmers):
+            var found = index.lookup_kmer(seed_kmers[qi])
             for h in found:
                 hits.append(h.copy())
+            qi += stride
     else:
         hits = seed_hits(index, seq)
     var voted = _vote_and_verify(index, name, seq, hits)

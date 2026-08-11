@@ -22,6 +22,17 @@ struct LinearContig(Copyable, Movable):
         self.seq = seq
 
 
+struct SeedVote(Copyable, Movable):
+    var cid: Int
+    var start: Int
+    var votes: Int
+
+    def __init__(out self, cid: Int = -1, start: Int = 0, votes: Int = 0):
+        self.cid = cid
+        self.start = start
+        self.votes = votes
+
+
 def _u64_le(addr: Int, idx: Int) -> UInt64:
     var base = addr + idx * 8
     var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=base)
@@ -350,6 +361,45 @@ struct LinearIndex(Copyable, Movable):
         fh.close()
         return True
 
+    def contig_length(self, cid: Int) raises -> Int:
+        if self.dense and self.contig_off_addr != 0:
+            if cid < 0 or cid >= len(self.contig_names):
+                return 0
+            var off0 = Int(_u64_le(self.contig_off_addr, cid))
+            var off1 = Int(_u64_le(self.contig_off_addr, cid + 1))
+            return off1 - off0
+        if cid < 0 or cid >= len(self.contigs):
+            return 0
+        return self.contigs[cid].seq.byte_length()
+
+    def contig_name(self, cid: Int) raises -> String:
+        if self.dense:
+            if cid < 0 or cid >= len(self.contig_names):
+                return String("?")
+            return self.contig_names[cid]
+        if cid < 0 or cid >= len(self.contigs):
+            return String("?")
+        return self.contigs[cid].name
+
+    def contig_window_id(
+        self, cid: Int, start: Int, length: Int
+    ) raises -> String:
+        """Uppercase window by contig id (dense mmap or in-memory)."""
+        if length <= 0 or start < 0:
+            return String("")
+        if self.dense and self.seq_addr != 0:
+            var clen = self.contig_length(cid)
+            if start + length > clen:
+                return String("")
+            var off0 = Int(_u64_le(self.contig_off_addr, cid))
+            return _ascii_from_addr(self.seq_addr + off0 + start, length)
+        if cid < 0 or cid >= len(self.contigs):
+            return String("")
+        var seq = self.contigs[cid].seq
+        if start + length > seq.byte_length():
+            return String("")
+        return String(seq[byte = start : start + length])
+
     def contig_window(self, contig: String, start: Int, length: Int) raises -> String:
         """Return uppercase window; dense path reads sequences.bin via mmap."""
         if length <= 0 or start < 0:
@@ -364,12 +414,7 @@ struct LinearIndex(Copyable, Movable):
                 cid += 1
             if found < 0:
                 return String("")
-            var off0 = Int(_u64_le(self.contig_off_addr, found))
-            var off1 = Int(_u64_le(self.contig_off_addr, found + 1))
-            var clen = off1 - off0
-            if start + length > clen:
-                return String("")
-            return _ascii_from_addr(self.seq_addr + off0 + start, length)
+            return self.contig_window_id(found, start, length)
         for c in self.contigs:
             if c.name != contig:
                 continue
@@ -378,10 +423,19 @@ struct LinearIndex(Copyable, Movable):
             return String(c.seq[byte = start : start + length])
         return String("")
 
-    def _dense_lookup(self, key: UInt64) raises -> List[String]:
-        var hits = List[String]()
+    def max_occ(self) raises -> Int:
+        """Skip k-mers with more than this many genome hits (BWA-style)."""
+        var os_mod = Python.import_module("os")
+        var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_MAX_OCC", "128"))
+        var n = Int(raw)
+        if n < 1:
+            return 128
+        return n
+
+    def _dense_find_key(self, key: UInt64) raises -> Int:
+        """Return kmer table index or -1."""
         if self.n_keys <= 0 or key == UInt64(0xFFFFFFFFFFFFFFFF):
-            return hits^
+            return -1
         var lo = 0
         var hi = self.n_keys
         while lo < hi:
@@ -392,21 +446,86 @@ struct LinearIndex(Copyable, Movable):
             else:
                 hi = mid
         if lo >= self.n_keys:
-            return hits^
+            return -1
         if _u64_le(self.kmers_addr, lo) != key:
+            return -1
+        return lo
+
+    def dense_occ(self, key: UInt64) raises -> Int:
+        var idx = self._dense_find_key(key)
+        if idx < 0:
+            return 0
+        var start = Int(_u64_le(self.offsets_addr, idx))
+        var end = Int(_u64_le(self.offsets_addr, idx + 1))
+        return end - start
+
+    def _dense_lookup(self, key: UInt64) raises -> List[String]:
+        """Legacy string hits; skips over-occupied k-mers."""
+        var hits = List[String]()
+        var idx = self._dense_find_key(key)
+        if idx < 0:
             return hits^
-        var start = Int(_u64_le(self.offsets_addr, lo))
-        var end = Int(_u64_le(self.offsets_addr, lo + 1))
+        var start = Int(_u64_le(self.offsets_addr, idx))
+        var end = Int(_u64_le(self.offsets_addr, idx + 1))
+        if end - start > self.max_occ():
+            return hits^
         var i = start
         while i < end:
             var cid = Int(_u32_le(self.postings_addr, i * 2))
             var pos = Int(_u32_le(self.postings_addr, i * 2 + 1))
-            var cname = String("?")
-            if cid >= 0 and cid < len(self.contig_names):
-                cname = self.contig_names[cid]
-            hits.append(cname + ":" + String(pos))
+            hits.append(self.contig_name(cid) + ":" + String(pos))
             i += 1
         return hits^
+
+    def vote_dense_seeds(
+        self,
+        seed_kmers: List[String],
+        stride: Int,
+    ) raises -> SeedVote:
+        """Majority-vote alignment start from rare k-mers.
+
+        Seed list index i is query offset i (GPU decode order).
+        """
+        var out = SeedVote(-1, 0, 0)
+        if len(seed_kmers) == 0:
+            return out^
+        var step = stride
+        if step < 1:
+            step = 1
+        var max_o = self.max_occ()
+        var counts = Dict[Int, Int]()
+        # Seeds are already strided at extract (index i → query offset i*stride).
+        var si = 0
+        while si < len(seed_kmers):
+            var q_off = si * step
+            var mer = seed_kmers[si]
+            var key = _encode_kmer_u64(mer, self.k)
+            var idx = self._dense_find_key(key)
+            if idx >= 0:
+                var start = Int(_u64_le(self.offsets_addr, idx))
+                var end = Int(_u64_le(self.offsets_addr, idx + 1))
+                var occ = end - start
+                if occ > 0 and occ <= max_o:
+                    var i = start
+                    while i < end:
+                        var cid = Int(_u32_le(self.postings_addr, i * 2))
+                        var pos = Int(_u32_le(self.postings_addr, i * 2 + 1))
+                        if pos >= q_off:
+                            var start0 = pos - q_off
+                            # Pack cid:start0 into one Int key (coords fit u32).
+                            var vk = (cid << 32) | start0
+                            if vk in counts:
+                                counts[vk] = counts[vk] + 1
+                            else:
+                                counts[vk] = 1
+                            var n = counts[vk]
+                            if n > out.votes:
+                                out.votes = n
+                                out.cid = cid
+                                out.start = start0
+                        i += 1
+            si += 1
+        return out^
 
     def lookup_kmer(self, mer: String) raises -> List[String]:
         if self.dense:
