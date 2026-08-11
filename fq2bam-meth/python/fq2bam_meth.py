@@ -35,6 +35,10 @@ def _open_text(path: Path):
     return path.open("r", encoding="utf-8", errors="replace")
 
 
+_C2T_TABLE = str.maketrans("Cc", "Tt")
+_G2A_TABLE = str.maketrans("Gg", "Aa")
+
+
 def _convert_base(base: str, mode: str) -> str:
     b = base.upper()
     if mode == "C2T":
@@ -45,14 +49,24 @@ def _convert_base(base: str, mode: str) -> str:
 
 
 def convert_fastq(src: Path, dst: Path, mode: str) -> None:
+    """Directional convert; uses str.translate (not per-base Python loops)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
+    table = _C2T_TABLE if mode == "C2T" else _G2A_TABLE
     opener = gzip.open if str(dst).endswith(".gz") else open
     with _open_text(src) as fin, opener(dst, "wt", encoding="utf-8") as fout:
-        for i, line in enumerate(fin):
-            if i % 4 == 1:
-                fout.write("".join(_convert_base(ch, mode) for ch in line.rstrip("\n")) + "\n")
-            else:
-                fout.write(line if line.endswith("\n") else line + "\n")
+        while True:
+            header = fin.readline()
+            if not header:
+                break
+            seq = fin.readline()
+            plus = fin.readline()
+            qual = fin.readline()
+            if not seq:
+                break
+            fout.write(header)
+            fout.write(seq.translate(table))
+            fout.write(plus if plus else "+\n")
+            fout.write(qual if qual else "\n")
 
 
 def convert_fasta_c2t(src: Path, dst: Path) -> None:
@@ -290,6 +304,8 @@ def run_mojo_linear_map(
     k: int,
     cache_dir: Path,
     log: Path,
+    bs_r1: str = "",
+    bs_r2: str = "",
 ) -> None:
     root = _repo_root()
     cmd = _mojo_bin() + [
@@ -317,25 +333,29 @@ def run_mojo_linear_map(
         "-cache_dir",
         str(cache_dir),
     ]
+    if bs_r1:
+        cmd.extend(["-bs_r1", bs_r1])
+    if bs_r2:
+        cmd.extend(["-bs_r2", bs_r2])
     with log.open("a", encoding="utf-8") as handle:
         handle.write("COMMAND: " + " ".join(cmd) + "\n")
-        proc = subprocess.run(
+        handle.flush()
+        # Stream Mojo stdout/stderr live (full-genome runs can take minutes).
+        proc = subprocess.Popen(
             cmd,
             cwd=str(root),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=False,
         )
-        if proc.stdout:
-            handle.write(proc.stdout)
-        if proc.stderr:
-            handle.write(proc.stderr)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                proc.stderr.strip()
-                or proc.stdout.strip()
-                or f"Mojo linear mapper failed (exit {proc.returncode})"
-            )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            handle.write(line)
+            handle.flush()
+            print(line, end="", flush=True)
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"Mojo linear mapper failed (exit {rc}); see {log}")
 
 
 def run_bwa_mem_stream(
@@ -419,13 +439,18 @@ def run_mojo_fq2bam_meth(
     if not c2t_ref.is_file():
         convert_fasta_c2t(reference_fasta, c2t_ref)
 
-    c2t_r1 = work / "C2T.R1.fastq.gz"
-    g2a_r2 = work / "G2A.R2.fastq.gz"
-    convert_fastq(fq1, c2t_r1, "C2T")
-    convert_fastq(fq2, g2a_r2, "G2A")
-
     bam_unsorted = work / "aligned.bam"
     used_mapper = mapper
+    # Mojo path: fuse BS convert in the mapper (-bs_r1/-bs_r2) — do not rewrite
+    # multi-GB FASTQs to NFS with a Python loop (that was the full-sample hang).
+    c2t_r1 = fq1
+    g2a_r2 = fq2
+    if mapper != "mojo":
+        c2t_r1 = work / "C2T.R1.fastq.gz"
+        g2a_r2 = work / "G2A.R2.fastq.gz"
+        convert_fastq(fq1, c2t_r1, "C2T")
+        convert_fastq(fq2, g2a_r2, "G2A")
+
     if mapper == "mojo":
         try:
             out_sam = work / "aligned.sam"
@@ -448,17 +473,20 @@ def run_mojo_fq2bam_meth(
             )
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(
-                    f"c2t_ref={c2t_ref} mojo_linear_cache={resolved_cache}\n"
+                    f"c2t_ref={c2t_ref} mojo_linear_cache={resolved_cache} "
+                    f"bs_fused=C2T/G2A fq1={fq1} fq2={fq2}\n"
                 )
             run_mojo_linear_map(
                 c2t_ref=c2t_ref,
-                c2t_r1=c2t_r1,
-                g2a_r2=g2a_r2,
+                c2t_r1=fq1,
+                g2a_r2=fq2,
                 out_sam=out_sam,
                 device=device,
                 k=k,
                 cache_dir=resolved_cache,
                 log=log,
+                bs_r1="C2T",
+                bs_r2="G2A",
             )
             _run(
                 [samtools, "view", "-bS", str(out_sam), "-o", str(bam_unsorted)],
@@ -477,6 +505,12 @@ def run_mojo_fq2bam_meth(
                 raise RuntimeError(
                     f"Mojo linear mapper failed and bwa unavailable: {exc}"
                 ) from exc
+            c2t_r1 = work / "C2T.R1.fastq.gz"
+            g2a_r2 = work / "G2A.R2.fastq.gz"
+            if not c2t_r1.is_file():
+                convert_fastq(fq1, c2t_r1, "C2T")
+            if not g2a_r2.is_file():
+                convert_fastq(fq2, g2a_r2, "G2A")
             _ensure_bwa_index(c2t_ref, log)
             run_bwa_mem_stream(
                 bwa=bwa,

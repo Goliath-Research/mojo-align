@@ -109,21 +109,21 @@ struct LinearIndex(Copyable, Movable):
         self._keep_postings = Python.none()
 
     def load_fasta(mut self, fasta_path: String) raises:
+        # Bulk-read via Python (Mojo readline on multi-GB refs is glacial).
+        print("MojoLinear loading FASTA ", fasta_path)
+        var builtins = Python.import_module("builtins")
+        var fh = builtins.open(fasta_path, "r")
+        var text = String(fh.read())
+        fh.close()
         self.contigs = List[LinearContig]()
-        var fh = open_text_read(fasta_path)
         var name = String("")
         var seq = String("")
-        while True:
-            var line_obj = fh.readline()
-            var line = String(line_obj)
-            if line.byte_length() == 0:
-                break
-            while line.byte_length() > 0:
-                var last = String(line[byte = line.byte_length() - 1 : line.byte_length()])
-                if last == "\n" or last == "\r":
-                    line = String(line[byte = 0 : line.byte_length() - 1])
-                else:
-                    break
+        var lines = text.split("\n")
+        var li = 0
+        var n_lines = len(lines)
+        while li < n_lines:
+            var line = String(lines[li])
+            li += 1
             if line.byte_length() == 0:
                 continue
             if line.startswith(">"):
@@ -141,7 +141,12 @@ struct LinearIndex(Copyable, Movable):
                 seq += line.upper()
         if name.byte_length() > 0:
             self.contigs.append(LinearContig(name, seq))
-        fh.close()
+        print(
+            "MojoLinear FASTA contigs=",
+            len(self.contigs),
+            " bases=",
+            self.total_bases(),
+        )
 
     def _add_posting(mut self, mer: String, loc: String) raises:
         if mer in self.postings:
