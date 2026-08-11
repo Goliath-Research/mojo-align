@@ -47,11 +47,11 @@ fi
 
 mkdir -p \
   "$SAMPLE_DIR/align.linear.parabricks" \
-  "$SAMPLE_DIR/align.linear.mojo"
+  "$SAMPLE_DIR/align.linear.mojo" \
+  "$SAMPLE_DIR/work"
 
-# Convenience symlinks at sample root (shared inputs for both align paths)
-ln -sfn "Data/sample_1.fq.gz" "$SAMPLE_DIR/parabricks_sample_R1.fastq.gz"
-ln -sfn "Data/sample_2.fq.gz" "$SAMPLE_DIR/parabricks_sample_R2.fastq.gz"
+# Do NOT symlink sample_* → root names that the parity harness writes;
+# subset outputs go under work/ so Data/ stays immutable.
 
 cat > "$SAMPLE_DIR/README.md" << EOF
 # parabricks_sample

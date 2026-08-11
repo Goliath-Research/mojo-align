@@ -129,26 +129,36 @@ EOF
   done
 fi
 
-# Materialize shared inputs at sample root (optional subset for wall-clock).
-R1="$SAMPLE_DIR/${SAMPLE_ID}_R1.fastq.gz"
-R2="$SAMPLE_DIR/${SAMPLE_ID}_R2.fastq.gz"
+# Materialize inputs under work/ — never write into Data/ (immutable source).
+mkdir -p "$SAMPLE_DIR/work"
+R1_SRC="$(readlink -f "$R1_SRC")"
+R2_SRC="$(readlink -f "$R2_SRC")"
+R1="$SAMPLE_DIR/work/${SAMPLE_ID}_R1.fastq.gz"
+R2="$SAMPLE_DIR/work/${SAMPLE_ID}_R2.fastq.gz"
 if [[ "$MAX_PAIRS" -gt 0 ]]; then
-  echo "Subsetting first $MAX_PAIRS PE pairs → $SAMPLE_DIR"
+  echo "Subsetting first $MAX_PAIRS PE pairs → $SAMPLE_DIR/work"
+  # Refuse to clobber source FASTQs if paths ever collide.
+  if [[ "$R1" -ef "$R1_SRC" || "$R2" -ef "$R2_SRC" ]]; then
+    echo "ERROR: subset output path resolves to source FASTQ; aborting" >&2
+    exit 2
+  fi
   python3 - <<PY
 from pathlib import Path
 import gzip
+import os
 
 def open_text(p: Path):
     return gzip.open(p, "rt") if str(p).endswith(".gz") else p.open("r")
 
-def open_out(p: Path):
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return gzip.open(p, "wt")
-
 n = int("$MAX_PAIRS")
 r1_src, r2_src = Path("$R1_SRC"), Path("$R2_SRC")
 r1_out, r2_out = Path("$R1"), Path("$R2")
-with open_text(r1_src) as f1, open_text(r2_src) as f2, open_out(r1_out) as o1, open_out(r2_out) as o2:
+for src, out in ((r1_src, r1_out), (r2_src, r2_out)):
+    if out.exists() and src.resolve() == out.resolve():
+        raise SystemExit("subset output would overwrite source FASTQ")
+r1_out.parent.mkdir(parents=True, exist_ok=True)
+with open_text(r1_src) as f1, open_text(r2_src) as f2, \
+     gzip.open(r1_out, "wt") as o1, gzip.open(r2_out, "wt") as o2:
     for i in range(n):
         for _ in range(4):
             l1 = f1.readline()
@@ -157,17 +167,12 @@ with open_text(r1_src) as f1, open_text(r2_src) as f2, open_out(r1_out) as o1, o
                 raise SystemExit(f"EOF before {n} pairs (got {i})")
             o1.write(l1)
             o2.write(l2)
-print(f"wrote {n} pairs")
+print(f"wrote {n} pairs → {r1_out} / {r2_out}")
 PY
 else
-  # Link/copy full inputs
-  if [[ "$R1_SRC" == *.gz ]]; then
-    ln -sfn "$(readlink -f "$R1_SRC")" "$R1" 2>/dev/null || cp -f "$R1_SRC" "$R1"
-    ln -sfn "$(readlink -f "$R2_SRC")" "$R2" 2>/dev/null || cp -f "$R2_SRC" "$R2"
-  else
-    gzip -c "$R1_SRC" >"$R1"
-    gzip -c "$R2_SRC" >"$R2"
-  fi
+  # Point at full source files without copying
+  R1="$R1_SRC"
+  R2="$R2_SRC"
 fi
 
 run_clara() {
