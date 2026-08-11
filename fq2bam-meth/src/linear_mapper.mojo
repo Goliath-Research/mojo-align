@@ -9,6 +9,7 @@ from std.sys import argv as sys_argv, exit
 
 from linear_extend import extend_read, extend_read_with_seeds, hit_to_sam_line, pair_hits
 from linear_gpu_kernels import seed_kmers_portable
+from linear_gpu_locate import map_fastq_dense_gpu_locate
 from linear_index import LinearIndex
 from utility import get_kv_value, open_text_write
 
@@ -154,6 +155,24 @@ def map_fastq_to_sam(
             raise Error("MojoLinear -build_cache_only requires -cache_dir")
         print("MojoLinear cache ready -> ", cache_dir)
         return 0
+
+    # Dense GRCh38 + NVIDIA/AMD: one-session GPU locate (no String k-mer path).
+    var os_mod = Python.import_module("os")
+    var gpu_locate = String(
+        os_mod.environ.get("METHYLGRAPHER_LINEAR_GPU_LOCATE", "1")
+    ).lower()
+    var gpu_locate_on = (
+        gpu_locate == ""
+        or gpu_locate == "1"
+        or gpu_locate == "true"
+        or gpu_locate == "yes"
+    )
+    if index.dense and gpu_locate_on:
+        var dev_l = device.lower()
+        if dev_l == "nvidia" or dev_l == "amd" or dev_l == "auto":
+            return map_fastq_dense_gpu_locate(
+                index, fq1, out_sam, device, fq2, bs_r1, bs_r2
+            )
 
     var fh = open_text_write(out_sam)
     _write_sam_header(fh, index)

@@ -477,6 +477,55 @@ struct LinearIndex(Copyable, Movable):
             i += 1
         return hits^
 
+    def vote_dense_from_ranges(
+        self,
+        starts: List[Int],
+        ends: List[Int],
+        q_offs: List[Int],
+    ) raises -> SeedVote:
+        """Vote from GPU-located rare posting ranges (host walks postings mmap)."""
+        var out = SeedVote(-1, 0, 0)
+        var n = len(starts)
+        if n == 0 or n != len(ends) or n != len(q_offs):
+            return out^
+        if self.postings_addr == 0:
+            return out^
+        var max_o = self.max_occ()
+        var counts = Dict[Int, Int]()
+        var si = 0
+        while si < n:
+            var start = starts[si]
+            var end = ends[si]
+            var q_off = q_offs[si]
+            if start < 0 or end < start or end > self.n_postings:
+                si += 1
+                continue
+            if end - start > max_o:
+                si += 1
+                continue
+            var i = start
+            while i < end:
+                var cid = Int(_u32_le(self.postings_addr, i * 2))
+                var pos = Int(_u32_le(self.postings_addr, i * 2 + 1))
+                if cid < 0 or cid >= len(self.contig_names):
+                    i += 1
+                    continue
+                if pos >= q_off:
+                    var start0 = pos - q_off
+                    var vk = (cid << 32) | start0
+                    if vk in counts:
+                        counts[vk] = counts[vk] + 1
+                    else:
+                        counts[vk] = 1
+                    var votes = counts[vk]
+                    if votes > out.votes:
+                        out.votes = votes
+                        out.cid = cid
+                        out.start = start0
+                i += 1
+            si += 1
+        return out^
+
     def vote_dense_seeds(
         self,
         seed_kmers: List[String],
