@@ -14,12 +14,24 @@ from utility import get_kv_value
 
 
 struct FastqRead(Copyable, Movable):
+    """Converted FASTQ record; ``original_seq`` feeds MethylCall ``os:Z``."""
+
     var name: String
     var seq: String
+    var original_seq: String
+    var conversion: String
 
-    def __init__(out self, name: String, seq: String):
+    def __init__(
+        out self,
+        name: String,
+        seq: String,
+        original_seq: String,
+        conversion: String,
+    ):
         self.name = name
         self.seq = seq
+        self.original_seq = original_seq
+        self.conversion = conversion
 
 
 def _strip_nl(mut s: String):
@@ -29,6 +41,47 @@ def _strip_nl(mut s: String):
             s = String(s[byte = 0 : s.byte_length() - 1])
         else:
             break
+
+
+def _rc_from_conversion(conversion: String, fallback: String) -> String:
+    if conversion == "C2T":
+        return "CT"
+    if conversion == "G2A":
+        return "GA"
+    return fallback
+
+
+def _pe_extra_tags(
+    ri: Int, original_seq: String, conversion: String, fallback_rc: String
+) -> String:
+    var os = original_seq
+    var rc = _rc_from_conversion(conversion, fallback_rc)
+    return "ri:i:" + String(ri) + "\tos:Z:" + os + "\trc:Z:" + rc
+
+
+def _parse_mg_fastq_fields(n: String, s: String) -> FastqRead:
+    var bare = n
+    var original = s
+    var conversion = String("")
+    var parts = n.split("_")
+    if len(parts) >= 4:
+        var conv = String(parts[1])
+        if conv == "C2T" or conv == "G2A":
+            bare = String(parts[0])
+            conversion = conv
+            original = String(parts[3])
+            var pi = 4
+            while pi < len(parts):
+                original = original + "_" + String(parts[pi])
+                pi += 1
+        else:
+            bare = String(parts[0])
+    elif len(parts) > 0:
+        bare = String(parts[0])
+    var sp = bare.split(" ")
+    if len(sp) > 0:
+        bare = String(sp[0])
+    return FastqRead(bare, s, original, conversion)
 
 
 def _parse_fastq(path: String) raises -> List[FastqRead]:
@@ -46,11 +99,7 @@ def _parse_fastq(path: String) raises -> List[FastqRead]:
         _strip_nl(s)
         if n.startswith("@"):
             n = String(n[byte = 1 : n.byte_length()])
-        var bare = n
-        var parts = n.split("_")
-        if len(parts) > 0:
-            bare = String(parts[0])
-        rows.append(FastqRead(bare, s))
+        rows.append(_parse_mg_fastq_fields(n, s))
     fh.close()
     return rows^
 
@@ -109,8 +158,8 @@ def map_fastq_to_gaf(
             var r2 = mates[i].copy()
             var h1 = _first_hit(index, r1.name, r1.seq)
             var h2 = _first_hit(index, r2.name, r2.seq)
-            h1.extra_tags = "ri:i:1\tos:Z:" + r1.seq + "\trc:Z:CT"
-            h2.extra_tags = "ri:i:2\tos:Z:" + r2.seq + "\trc:Z:GA"
+            h1.extra_tags = _pe_extra_tags(1, r1.original_seq, r1.conversion, "CT")
+            h2.extra_tags = _pe_extra_tags(2, r2.original_seq, r2.conversion, "GA")
             all_hits.append(h1.copy())
             all_hits.append(h2.copy())
             i += 1

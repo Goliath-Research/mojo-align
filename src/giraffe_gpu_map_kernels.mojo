@@ -49,12 +49,24 @@ comptime DIST_CAP = 200
 
 
 struct StreamReadGPU(Copyable, Movable):
+    """Converted FASTQ record; ``original_seq`` feeds MethylCall ``os:Z``."""
+
     var name: String
     var seq: String
+    var original_seq: String
+    var conversion: String
 
-    def __init__(out self, name: String, seq: String):
+    def __init__(
+        out self,
+        name: String,
+        seq: String,
+        original_seq: String,
+        conversion: String,
+    ):
         self.name = name
         self.seq = seq
+        self.original_seq = original_seq
+        self.conversion = conversion
 
 
 def gpu_native_backend_label(backend: String) raises -> String:
@@ -70,10 +82,51 @@ def _strip_nl(mut s: String):
             break
 
 
+def _rc_from_conversion(conversion: String, fallback: String) -> String:
+    if conversion == "C2T":
+        return "CT"
+    if conversion == "G2A":
+        return "GA"
+    return fallback
+
+
+def _pe_extra_tags(
+    ri: Int, original_seq: String, conversion: String, fallback_rc: String
+) -> String:
+    var os = original_seq
+    var rc = _rc_from_conversion(conversion, fallback_rc)
+    return "ri:i:" + String(ri) + "\tos:Z:" + os + "\trc:Z:" + rc
+
+
+def _parse_mg_fastq_fields(n: String, s: String) -> StreamReadGPU:
+    var bare = n
+    var original = s
+    var conversion = String("")
+    var parts = n.split("_")
+    if len(parts) >= 4:
+        var conv = String(parts[1])
+        if conv == "C2T" or conv == "G2A":
+            bare = String(parts[0])
+            conversion = conv
+            original = String(parts[3])
+            var pi = 4
+            while pi < len(parts):
+                original = original + "_" + String(parts[pi])
+                pi += 1
+        else:
+            bare = String(parts[0])
+    elif len(parts) > 0:
+        bare = String(parts[0])
+    var sp = bare.split(" ")
+    if len(sp) > 0:
+        bare = String(sp[0])
+    return StreamReadGPU(bare, s, original, conversion)
+
+
 def _read_one_gpu(fh: PythonObject) raises -> StreamReadGPU:
     var n = String(fh.readline())
     if n.byte_length() == 0:
-        return StreamReadGPU("", "")
+        return StreamReadGPU("", "", "", "")
     var s = String(fh.readline())
     _ = String(fh.readline())
     _ = String(fh.readline())
@@ -81,14 +134,7 @@ def _read_one_gpu(fh: PythonObject) raises -> StreamReadGPU:
     _strip_nl(s)
     if n.startswith("@"):
         n = String(n[byte = 1 : n.byte_length()])
-    var bare = n
-    var parts = n.split("_")
-    if len(parts) > 0:
-        bare = String(parts[0])
-    var sp = bare.split(" ")
-    if len(sp) > 0:
-        bare = String(sp[0])
-    return StreamReadGPU(bare, s)
+    return _parse_mg_fastq_fields(n, s)
 
 
 def gpu_native_stream_loop(
@@ -926,8 +972,12 @@ def gpu_native_stream_loop(
                             h1 = h1s[0].copy()
                         if len(h2s) > 0:
                             h2 = h2s[0].copy()
-                        h1.extra_tags = "ri:i:1\tos:Z:" + a.seq + "\trc:Z:CT"
-                        h2.extra_tags = "ri:i:2\tos:Z:" + b.seq + "\trc:Z:GA"
+                        h1.extra_tags = _pe_extra_tags(
+                            1, a.original_seq, a.conversion, "CT"
+                        )
+                        h2.extra_tags = _pe_extra_tags(
+                            2, b.original_seq, b.conversion, "GA"
+                        )
                         batch_hits.append(h1^)
                         if len(h1s) > 1:
                             batch_hits.append(h1s[1].copy())
@@ -992,8 +1042,12 @@ def gpu_native_stream_loop(
                             h1b = h1s2[0].copy()
                         if len(h2s2) > 0:
                             h2b = h2s2[0].copy()
-                        h1b.extra_tags = "ri:i:1\tos:Z:" + a2.seq + "\trc:Z:CT"
-                        h2b.extra_tags = "ri:i:2\tos:Z:" + b2.seq + "\trc:Z:GA"
+                        h1b.extra_tags = _pe_extra_tags(
+                            1, a2.original_seq, a2.conversion, "CT"
+                        )
+                        h2b.extra_tags = _pe_extra_tags(
+                            2, b2.original_seq, b2.conversion, "GA"
+                        )
                         batch_hits2.append(h1b^)
                         if len(h1s2) > 1:
                             batch_hits2.append(h1s2[1].copy())

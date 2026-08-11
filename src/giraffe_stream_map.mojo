@@ -28,12 +28,30 @@ from giraffe_pack import DensePack
 
 
 struct StreamRead(Copyable, Movable):
+    """One FASTQ record.
+
+    ``seq`` is the converted body used for mapping. ``original_seq`` /
+    ``conversion`` come from methylGrapher headers
+    ``{qname}_{C2T|G2A}_{shard}_{original}`` and feed MethylCall ``os:Z`` /
+    ``rc:Z`` (must not be the converted body).
+    """
+
     var name: String
     var seq: String
+    var original_seq: String
+    var conversion: String
 
-    def __init__(out self, name: String, seq: String):
+    def __init__(
+        out self,
+        name: String,
+        seq: String,
+        original_seq: String,
+        conversion: String,
+    ):
         self.name = name
         self.seq = seq
+        self.original_seq = original_seq
+        self.conversion = conversion
 
 
 def _strip_nl(mut s: String):
@@ -43,6 +61,50 @@ def _strip_nl(mut s: String):
             s = String(s[byte = 0 : s.byte_length() - 1])
         else:
             break
+
+
+def _rc_from_conversion(conversion: String, fallback: String) -> String:
+    if conversion == "C2T":
+        return "CT"
+    if conversion == "G2A":
+        return "GA"
+    return fallback
+
+
+def _pe_extra_tags(
+    ri: Int, original_seq: String, conversion: String, fallback_rc: String
+) -> String:
+    var os = original_seq
+    if os.byte_length() == 0:
+        os = String("")
+    var rc = _rc_from_conversion(conversion, fallback_rc)
+    return "ri:i:" + String(ri) + "\tos:Z:" + os + "\trc:Z:" + rc
+
+
+def _parse_mg_fastq_fields(n: String, s: String) -> StreamRead:
+    """Split methylGrapher converted-FASTQ header; fall back to body as os."""
+    var bare = n
+    var original = s
+    var conversion = String("")
+    var parts = n.split("_")
+    if len(parts) >= 4:
+        var conv = String(parts[1])
+        if conv == "C2T" or conv == "G2A":
+            bare = String(parts[0])
+            conversion = conv
+            original = String(parts[3])
+            var pi = 4
+            while pi < len(parts):
+                original = original + "_" + String(parts[pi])
+                pi += 1
+        else:
+            bare = String(parts[0])
+    elif len(parts) > 0:
+        bare = String(parts[0])
+    var sp = bare.split(" ")
+    if len(sp) > 0:
+        bare = String(sp[0])
+    return StreamRead(bare, s, original, conversion)
 
 
 def _open_fastq(path: String) raises -> PythonObject:
@@ -57,7 +119,7 @@ def _open_fastq(path: String) raises -> PythonObject:
 def _read_one(fh: PythonObject) raises -> StreamRead:
     var n = String(fh.readline())
     if n.byte_length() == 0:
-        return StreamRead("", "")
+        return StreamRead("", "", "", "")
     var s = String(fh.readline())
     _ = String(fh.readline())
     _ = String(fh.readline())
@@ -65,14 +127,7 @@ def _read_one(fh: PythonObject) raises -> StreamRead:
     _strip_nl(s)
     if n.startswith("@"):
         n = String(n[byte = 1 : n.byte_length()])
-    var bare = n
-    var parts = n.split("_")
-    if len(parts) > 0:
-        bare = String(parts[0])
-    var sp = bare.split(" ")
-    if len(sp) > 0:
-        bare = String(sp[0])
-    return StreamRead(bare, s)
+    return _parse_mg_fastq_fields(n, s)
 
 
 def _batch_size() raises -> Int:
@@ -419,9 +474,9 @@ def map_fastq_stream_to_gaf(
                     h1 = h1s[0].copy()
                 if len(h2s) > 0:
                     h2 = h2s[0].copy()
-                # PE tags for MethylCall (primary pair).
-                h1.extra_tags = "ri:i:1\tos:Z:" + a.seq + "\trc:Z:CT"
-                h2.extra_tags = "ri:i:2\tos:Z:" + b.seq + "\trc:Z:GA"
+                # PE tags for MethylCall: os:Z must be original (not converted body).
+                h1.extra_tags = _pe_extra_tags(1, a.original_seq, a.conversion, "CT")
+                h2.extra_tags = _pe_extra_tags(2, b.original_seq, b.conversion, "GA")
                 # Primary before secondary (vg giraffe -M 2 / MethylCall convention).
                 batch_hits.append(h1^)
                 if len(h1s) > 1:

@@ -13,7 +13,7 @@ import os
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from engine.minimizer_index import MinimizerIndex, MinHit
 from engine.segment_pack import (
@@ -30,6 +30,15 @@ from engine.zipcodes_index import DistIndex, ZipcodesIndex
 _DEFAULT_READ_BATCH = 8192
 
 
+class FastqRec(NamedTuple):
+    """Converted FASTQ record; ``original_seq`` feeds MethylCall ``os:Z``."""
+
+    name: str
+    seq: str
+    original_seq: str
+    conversion: str  # C2T / G2A / ""
+
+
 def _read_batch_size() -> int:
     raw = os.environ.get("METHYLGRAPHER_MOJO_READ_BATCH", "").strip()
     if not raw:
@@ -41,7 +50,31 @@ def _read_batch_size() -> int:
     return max(1, n)
 
 
-def _iter_fastq(path: str) -> Iterator[Tuple[str, str]]:
+def _parse_mg_fastq_header(name: str, body: str) -> FastqRec:
+    """Parse ``{qname}_{C2T|G2A}_{shard}_{original}``; else os falls back to body."""
+    parts = name.split("_")
+    if len(parts) >= 4 and parts[1] in ("C2T", "G2A"):
+        bare = parts[0].split(" ", 1)[0]
+        original = "_".join(parts[3:])
+        return FastqRec(bare, body, original, parts[1])
+    bare = parts[0].split(" ", 1)[0] if parts else name
+    return FastqRec(bare, body, body, "")
+
+
+def _rc_from_conversion(conversion: str, fallback: str) -> str:
+    if conversion == "C2T":
+        return "CT"
+    if conversion == "G2A":
+        return "GA"
+    return fallback
+
+
+def _pe_extra_tags(ri: int, rec: FastqRec, fallback_rc: str) -> str:
+    rc = _rc_from_conversion(rec.conversion, fallback_rc)
+    return f"ri:i:{ri}\tos:Z:{rec.original_seq}\trc:Z:{rc}"
+
+
+def _iter_fastq(path: str) -> Iterator[FastqRec]:
     """Stream FASTQ records without loading the file into memory."""
     with open(path, encoding="utf-8") as fh:
         while True:
@@ -52,29 +85,28 @@ def _iter_fastq(path: str) -> Iterator[Tuple[str, str]]:
             fh.readline()
             fh.readline()
             name = n[1:].strip() if n.startswith("@") else n.strip()
-            bare = name.split("_")[0]
-            yield bare, s
+            yield _parse_mg_fastq_header(name, s)
 
 
-def _parse_fastq(path: str) -> List[Tuple[str, str]]:
+def _parse_fastq(path: str) -> List[FastqRec]:
     """Load entire FASTQ (tests / tiny fixtures only — do not use on Buffy)."""
     return list(_iter_fastq(path))
 
 
 def _iter_fastq_batches(
     fq1: str, fq2: str = "", *, batch_size: Optional[int] = None
-) -> Iterator[List[Tuple[Tuple[str, str], Optional[Tuple[str, str]]]]]:
-    """Yield batches of ((name1, seq1), optional (name2, seq2))."""
+) -> Iterator[List[Tuple[FastqRec, Optional[FastqRec]]]]:
+    """Yield batches of (read1, optional read2)."""
     bs = batch_size if batch_size is not None else _read_batch_size()
     it1 = _iter_fastq(fq1)
     it2 = _iter_fastq(fq2) if fq2 else None
-    batch: List[Tuple[Tuple[str, str], Optional[Tuple[str, str]]]] = []
+    batch: List[Tuple[FastqRec, Optional[FastqRec]]] = []
     while True:
         try:
             r1 = next(it1)
         except StopIteration:
             break
-        r2: Optional[Tuple[str, str]] = None
+        r2: Optional[FastqRec] = None
         if it2 is not None:
             try:
                 r2 = next(it2)
@@ -534,11 +566,9 @@ def map_fastq_to_gaf(
                 with timer.stage("fastq_batch"):
                     flat_seqs: List[str] = []
                     for r1, r2 in batch:
-                        _n1, s1 = r1
-                        flat_seqs.append(s1)
+                        flat_seqs.append(r1.seq)
                         if r2 is not None:
-                            _n2, s2 = r2
-                            flat_seqs.append(s2)
+                            flat_seqs.append(r2.seq)
                 with timer.stage("seed_locate"):
                     seed_hits, seed_backend = _seed_batch_hits(
                         min_index=min_index, seqs=flat_seqs, device=dev
@@ -547,27 +577,25 @@ def map_fastq_to_gaf(
 
                 def _map_pair(item):
                     (r1, r2), si_local = item
-                    n1, s1 = r1
                     if r2 is None:
                         hits = map_one_read(
                             pack=pack,
                             min_index=min_index,
                             zipcodes=zip_index,
                             dist=dist_index,
-                            qname=n1,
-                            seq=s1,
+                            qname=r1.name,
+                            seq=r1.seq,
                             k_fallback=k,
                             seeds=seed_hits[si_local],
                         )
                         return 1, hits
-                    n2, s2 = r2
                     h1s = map_one_read(
                         pack=pack,
                         min_index=min_index,
                         zipcodes=zip_index,
                         dist=dist_index,
-                        qname=n1,
-                        seq=s1,
+                        qname=r1.name,
+                        seq=r1.seq,
                         k_fallback=k,
                         seeds=seed_hits[si_local],
                     )
@@ -576,21 +604,21 @@ def map_fastq_to_gaf(
                         min_index=min_index,
                         zipcodes=zip_index,
                         dist=dist_index,
-                        qname=n2,
-                        seq=s2,
+                        qname=r2.name,
+                        seq=r2.seq,
                         k_fallback=k,
                         seeds=seed_hits[si_local + 1],
                     )
                     h1 = h1s[0] if h1s else {
-                        "query_name": n1, "path": "*", "qlen": len(s1), "mapq": 0,
-                        "cs_tag": "cs:Z:*", "extra_tags": "",
+                        "query_name": r1.name, "path": "*", "qlen": len(r1.seq),
+                        "mapq": 0, "cs_tag": "cs:Z:*", "extra_tags": "",
                     }
                     h2 = h2s[0] if h2s else {
-                        "query_name": n2, "path": "*", "qlen": len(s2), "mapq": 0,
-                        "cs_tag": "cs:Z:*", "extra_tags": "",
+                        "query_name": r2.name, "path": "*", "qlen": len(r2.seq),
+                        "mapq": 0, "cs_tag": "cs:Z:*", "extra_tags": "",
                     }
-                    h1["extra_tags"] = f"ri:i:1\tos:Z:{s1}\trc:Z:CT"
-                    h2["extra_tags"] = f"ri:i:2\tos:Z:{s2}\trc:Z:GA"
+                    h1["extra_tags"] = _pe_extra_tags(1, r1, "CT")
+                    h2["extra_tags"] = _pe_extra_tags(2, r2, "GA")
                     return 2, [h1, h2]
 
                 work = []
