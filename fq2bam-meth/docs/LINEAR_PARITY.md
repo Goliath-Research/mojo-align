@@ -67,9 +67,17 @@ If the dense pack is missing, the first worker builds it on the fly under an
 exclusive flock on `${cache}.lock` (other workers wait, then reuse). Disable
 with `METHYLGRAPHER_LINEAR_CACHE_BUILD=0`.
 
-After the cache is complete, sync the linear pin to myQNAPcloud so new clusters
-get it in Phase 0 (`MethylPipeline/scripts/sync_genomes_to_s3.sh --only
-linear/GRCh38/ensembl-114`). See
+After the dense-v1 pack is complete, upload Mojo siblings to myQNAPcloud:
+
+```bash
+# Preferred (rclone):
+MethylPipeline/scripts/rclone_sync_mojo_linear_pack.sh --upload
+# Or full linear tree:
+MethylPipeline/scripts/sync_genomes_to_s3.sh --only linear/GRCh38/ensembl-114
+```
+
+New clusters pull them in Phase 0 via `provision_selected_genomes.sh` (directory
+`s3_sync` + rclone fallback `--download`). See
 [`reference-inventory-qnap.md`](../../../MethylPipeline/docs/deployment/reference-inventory-qnap.md).
 
 ## Run both arms + score
