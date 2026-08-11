@@ -11,6 +11,21 @@ scripts/benchmark_fq2bam_meth.sh
 scripts/benchmark_clara_fq2bam_meth.sh [R1] [R2] [REF] nvidia
 ```
 
+## Parabricks sample parity (`align.linear.parabricks` vs `align.linear.mojo`)
+
+End-to-end concordance on NVIDIA’s public `parabricks_sample` bundle (or any
+FASTQ pair), writing side-by-side product dirs:
+
+```bash
+# after extracting https://s3.amazonaws.com/parabricks.sample/parabricks_sample.tar.gz
+export PARABRICKS_SAMPLE=$PWD/parabricks_sample
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
+  --sample-dir /work/samples/parabricks_sample \
+  --device nvidia
+```
+
+See [`LINEAR_PARITY.md`](LINEAR_PARITY.md).
+
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|
 | Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | streaming batches + hash postings; seeds→extend |
