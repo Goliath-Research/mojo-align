@@ -64,6 +64,11 @@ fq2bam-meth/scripts/ensure_mojo_linear_index.sh "$REF" 15
 MojoFq2bamMeth auto-uses `${REF}.mojo_linear_k${k}/` when the ref lives under
 `/work/genomes` (override with `-cache_dir` / `METHYLGRAPHER_LINEAR_CACHE_DIR`).
 
+After the cache is complete, sync the linear pin to myQNAPcloud so new clusters
+get it in Phase 0 (`MethylPipeline/scripts/sync_genomes_to_s3.sh --only
+linear/GRCh38/ensembl-114`). See
+[`reference-inventory-qnap.md`](../../../MethylPipeline/docs/deployment/reference-inventory-qnap.md).
+
 ## Run both arms + score
 
 ```bash
