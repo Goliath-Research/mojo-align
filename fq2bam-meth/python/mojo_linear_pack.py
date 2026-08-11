@@ -142,6 +142,13 @@ def ensure_dense_pack(
             _log(f"mojo_linear_pack: pack already complete (other worker) → {cache_dir}")
             _ensure_ref_link(cache_dir, c2t_fasta)
             return cache_dir
+        # If k-mer bins exist but sequences.bin was added later, only patch that.
+        has_kmers = (cache_dir / "kmers.bin").is_file() and (cache_dir / "meta.json").is_file()
+        if has_kmers and not (cache_dir / "sequences.bin").is_file():
+            _log(f"mojo_linear_pack: writing sequences.bin into existing pack → {cache_dir}")
+            write_sequences_bin(c2t_fasta, cache_dir)
+            _ensure_ref_link(cache_dir, c2t_fasta)
+            return cache_dir
         _log(f"mojo_linear_pack: building dense-v1 k={k} → {cache_dir}")
         build_dense_pack(c2t_fasta, cache_dir, k=k)
         _ensure_ref_link(cache_dir, c2t_fasta)

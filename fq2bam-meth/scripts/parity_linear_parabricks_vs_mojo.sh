@@ -272,6 +272,10 @@ run_mojo() {
   export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
   export METHYLGRAPHER_GPU_REQUIRE="${METHYLGRAPHER_GPU_REQUIRE:-1}"
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
+  # Driver <580 needs system ptxas (same as Giraffe GH200 notes).
+  if [[ -z "${MODULAR_NVPTX_COMPILER_PATH:-}" && -x /usr/bin/ptxas ]]; then
+    export MODULAR_NVPTX_COMPILER_PATH=/usr/bin/ptxas
+  fi
   # Toy fixture uses short k; Clara sample uses default 15.
   local k_args=()
   local k_val="${METHYLGRAPHER_LINEAR_K:-15}"
