@@ -1,0 +1,62 @@
+# mojo-align primary CI (pixi pytest + Mojo help smoke).
+# Azure DevOps: New pipeline → mojo-align → /ci/azure-pipelines.yml
+# Pool: self-hosted build-arm64 (Mojo linux-aarch64).
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: build-arm64
+
+steps:
+  - checkout: self
+    fetchDepth: 1
+
+  - bash: |
+      set -euo pipefail
+      export PATH="$HOME/.pixi/bin:$PATH"
+      if ! command -v pixi >/dev/null 2>&1; then
+        curl -fsSL https://pixi.sh/install.sh | bash
+        export PATH="$HOME/.pixi/bin:$PATH"
+      fi
+      pixi --version
+      pixi install
+    displayName: Install pixi toolchain
+
+  - bash: |
+      set -euo pipefail
+      export PATH="$HOME/.pixi/bin:$PATH"
+      export PYTHONPATH="$PWD/methylgrapher:$PWD/giraffe/scripts:$PWD/giraffe/python:$PWD/fq2bam-meth/python:$PWD/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+      pixi run mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src \
+        methylgrapher/src/main.mojo help | head -40
+      ./bin/methylGrapher help | head -20
+    displayName: Mojo + CLI help smoke
+
+  - bash: |
+      set -euo pipefail
+      export PATH="$HOME/.pixi/bin:$PATH"
+      export PYTHONPATH="$PWD/methylgrapher:$PWD/giraffe/scripts:$PWD/giraffe/python:$PWD/fq2bam-meth/python:$PWD/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+      pixi run python -m pytest \
+        gpu-common/tests \
+        fq2bam-meth/tests/test_fq2bam_meth.py \
+        methylgrapher/tests/test_align_backends.py \
+        methylgrapher/tests/test_align_backends_ready.py \
+        giraffe/tests/test_giraffe_gaf_parity.py \
+        -q --tb=line
+    displayName: Pytest subset (CPU)
+
+  - bash: |
+      set -euo pipefail
+      bash scripts/stage_flat_image_tree.sh "$PWD/_flat_image"
+      test -f _flat_image/src/main.mojo
+      test -f _flat_image/engine/cli.py
+      test -f _flat_image/src/linear_mapper.mojo
+      test -f _flat_image/src/gpu_kernels.mojo
+    displayName: Stage flat image tree

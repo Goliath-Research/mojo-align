@@ -1,7 +1,7 @@
 [workspace]
-name = "methylGrapher-mojo"
+name = "mojo-align"
 version = "0.1.0"
-description = "Mojo port of methylGrapher"
+description = "Mojo align monorepo: gpu-common, fq2bam-meth, giraffe, methylgrapher"
 authors = ["David Izada Rodriguez <davidizadar@GoliathResearch.com>"]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 platforms = ["linux-aarch64"]
@@ -12,6 +12,6 @@ python = ">=3.11,<3.14"
 pytest = ">=9.1.1,<10"
 
 [tasks]
-run = "mojo src/main.mojo"
-help = "mojo src/main.mojo help"
-test = "mojo test/"
+run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo"
+help = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo help"
+test = "python -m pytest"

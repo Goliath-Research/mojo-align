@@ -1,24 +1,12 @@
 #!/usr/bin/env bash
-# bin/methylGrapher — methylGrapher-mojo launcher.
+# bin/methylGrapher — mojo-align unified launcher.
 #
-# By default runs the Python engine (engine/cli.py), the faithful 0.2.0 port
-# with the methylGrapher-mojo cutover patches (see MIGRATION_LOG.md).
-# Set METHYLGRAPHER_ENGINE=mojo to run the Mojo CLI (src/main.mojo): native
-# help / vg_check / Align / MojoGiraffe / MethylCall / MergeCpG /
-# ConversionRate; MojoFq2bamMeth always orchestrates via engine.fq2bam_meth
-# (native map kernel: src/linear_mapper.mojo) and is dual-shipped on the
-# default Python engine too. PrepareGenome / Main stay on engine.cli.
-# Set METHYLGRAPHER_MCALL_ENGINE=python to force Align/MethylCall/MergeCpG/
-# ConversionRate onto engine.cli as well.
+# By default runs the Python engine (methylgrapher/engine/cli.py), the faithful
+# 0.2.0 port with cutover patches. Set METHYLGRAPHER_ENGINE=mojo to run the Mojo
+# CLI (methylgrapher/src/main.mojo). MojoFq2bamMeth always orchestrates via
+# engine.fq2bam_meth (map kernel: fq2bam-meth/src/linear_mapper.mojo).
 #
-#   methylGrapher help
-#   methylGrapher MethylCall -work_dir ... -index_prefix ...
-#   methylGrapher MojoFq2bamMeth -fq1 ... -fq2 ... -ref ... -out_bam ...
-#   METHYLGRAPHER_ENGINE=mojo methylGrapher help
-#
-# Always runs from the repository root (regardless of the caller's cwd) and
-# through `pixi run`, so the pinned Mojo 1.0.0b2 / Python toolchain in
-# pixi.toml is used rather than any ambient system interpreter.
+# Always runs from the repository root through `pixi run`.
 
 set -euo pipefail
 
@@ -29,8 +17,19 @@ export PATH="$HOME/.pixi/bin:$PATH"
 
 cd "$REPO_ROOT"
 
+# Mojo include paths for the four packages (flat imports preserved).
+MOJO_I=(
+  -I gpu-common/src
+  -I fq2bam-meth/src
+  -I giraffe/src
+  -I methylgrapher/src
+)
+
+# Python: engine package under methylgrapher/; scripts for legacy helpers.
+export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+
 if [[ "${METHYLGRAPHER_ENGINE:-}" == "mojo" ]]; then
-    exec pixi run mojo src/main.mojo "$@"
+    exec pixi run mojo "${MOJO_I[@]}" methylgrapher/src/main.mojo "$@"
 else
     exec pixi run python -m engine.cli "$@"
 fi

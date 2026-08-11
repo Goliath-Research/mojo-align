@@ -1,0 +1,24 @@
+methylgrapher (mojo-align package)
+=================================
+
+This directory contains the methylGrapher-derived science and orchestration
+code (PrepareGenome / Align / MethylCall / MergeCpG / ConversionRate and the
+Python `engine/` port of upstream methylGrapher 0.2.0).
+
+Upstream project
+----------------
+methylGrapher — MIT License
+Copyright 2023-2025, Ting Wang Lab
+Authors / credits include Wenjin Zhang and Juan Macias
+(see engine/cli.py headers and python_reference/).
+
+Only this `methylgrapher/` package is released under the MIT License
+(see LICENSE in this directory). Sibling packages in the mojo-align
+repository (`gpu-common`, `fq2bam-meth`, `giraffe`) are Epimethyl internal
+code and do not carry an open-source license grant.
+
+Third-party tooling (not redistributed as source here)
+-----------------------------------------------------
+- Mojo / Modular MAX toolchain (Modular)
+- vg (MIT; VG team / Grafa)
+- samtools, bwa, and related bioinformatics utilities as used at runtime

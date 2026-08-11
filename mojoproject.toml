@@ -1,18 +1,16 @@
 [project]
-name = "methylGrapher-mojo"
+name = "mojo-align"
 version = "0.1.0"
-description = "Mojo port of methylGrapher: pangenome graph methylation calling"
-license = "MIT"
+description = "Mojo align monorepo (gpu-common, fq2bam-meth, giraffe, methylgrapher)"
+# Only methylgrapher/ is MIT (see methylgrapher/LICENSE). Other packages have no open-source license.
 authors = ["David Izada Rodriguez <davidizadar@GoliathResearch.com>"]
 
 [dependencies]
 # Mojo standard library is bundled with the MAX/Mojo toolchain.
-# Add third-party Magic / conda packages here when needed.
-# e.g.: numpy = ">=1.26"
 
 [tool.magic]
 channel = "https://conda.modular.com/max"
 
 [scripts]
-run = "mojo src/main.mojo"
-test = "mojo test/"
+run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo"
+test = "python -m pytest"

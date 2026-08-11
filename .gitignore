@@ -20,3 +20,4 @@ build/
 tests/data/work_dir/*.methyl
 tests/data/work_dir/*.cpg.tsv
 tests/data/work_dir/tmp/
+_flat_image/
