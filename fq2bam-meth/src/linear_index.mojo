@@ -20,7 +20,7 @@ struct LinearContig(Copyable, Movable):
         self.seq = seq
 
 
-fn _u64_le(addr: Int, idx: Int) -> UInt64:
+def _u64_le(addr: Int, idx: Int) -> UInt64:
     var base = addr + idx * 8
     var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=base)
     var v: UInt64 = 0
@@ -31,7 +31,7 @@ fn _u64_le(addr: Int, idx: Int) -> UInt64:
     return v
 
 
-fn _u32_le(addr: Int, idx: Int) -> UInt32:
+def _u32_le(addr: Int, idx: Int) -> UInt32:
     var base = addr + idx * 4
     var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=base)
     var v: UInt32 = 0
@@ -42,7 +42,7 @@ fn _u32_le(addr: Int, idx: Int) -> UInt32:
     return v
 
 
-fn _encode_kmer_u64(mer: String, k: Int) raises -> UInt64:
+def _encode_kmer_u64(mer: String, k: Int) raises -> UInt64:
     if mer.byte_length() != k:
         raise Error("kmer length mismatch")
     var v: UInt64 = 0
