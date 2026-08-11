@@ -12,9 +12,10 @@
 #   fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh [options]
 #
 # Options:
-#   --sample-dir DIR     Default: /tmp/samples/parabricks_sample
+#   --sample-dir DIR     Default: /work/samples/parabricks_sample
 #   --sample-id ID       Default: parabricks_sample
 #   --parabricks-sample DIR   Or set PARABRICKS_SAMPLE
+#   --ref FASTA          Reference (must have sibling .bwameth.c2t for Clara)
 #   --max-pairs N        Subset first N PE pairs (0 = all; default 50000)
 #   --device DEV         Mojo device (default nvidia)
 #   --image IMAGE        Clara docker image (default nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1)
@@ -38,9 +39,11 @@ export PATH="$HOME/.pixi/bin:${PATH:-}"
 SAMPLE_DIR="${SAMPLE_DIR:-/work/samples/parabricks_sample}"
 SAMPLE_ID="${SAMPLE_ID:-parabricks_sample}"
 PB_SAMPLE="${PARABRICKS_SAMPLE:-}"
+REF_OVERRIDE="${REF_OVERRIDE:-}"
 MAX_PAIRS="${MAX_PAIRS:-50000}"
 DEVICE="${DEVICE:-nvidia}"
 PB_IMAGE="${METHYL_PARABRICKS_IMAGE:-nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1}"
+FLEET_REF="${METHYL_REFERENCE_FASTA:-/work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa}"
 RUN_CLARA=1
 RUN_MOJO=1
 COMPARE=1
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --sample-dir) SAMPLE_DIR="$2"; shift 2 ;;
     --sample-id) SAMPLE_ID="$2"; shift 2 ;;
     --parabricks-sample) PB_SAMPLE="$2"; shift 2 ;;
+    --ref) REF_OVERRIDE="$2"; shift 2 ;;
     --max-pairs) MAX_PAIRS="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --image) PB_IMAGE="$2"; shift 2 ;;
@@ -60,7 +64,7 @@ while [[ $# -gt 0 ]]; do
     --compare-only) RUN_CLARA=0; RUN_MOJO=0; shift ;;
     --toy) USE_TOY=1; shift ;;
     -h|--help)
-      sed -n '2,40p' "$0"
+      sed -n '2,45p' "$0"
       exit 0
       ;;
     *)
@@ -123,16 +127,45 @@ EOF
   fi
   R1_SRC="$PB_SAMPLE/Data/sample_1.fq.gz"
   R2_SRC="$PB_SAMPLE/Data/sample_2.fq.gz"
-  REF="$PB_SAMPLE/Ref/Homo_sapiens_assembly38.fasta"
-  for f in "$R1_SRC" "$R2_SRC" "$REF"; do
+  REF="${REF_OVERRIDE:-$PB_SAMPLE/Ref/Homo_sapiens_assembly38.fasta}"
+  for f in "$R1_SRC" "$R2_SRC"; do
     [[ -f "$f" ]] || { echo "missing $f" >&2; exit 2; }
   done
 fi
+
+# Clara fq2bam_meth requires sibling ``${REF}.bwameth.c2t`` (+ bwa indexes).
+# Parabricks tutorial Ref lacks it; fleet Ensembl GRCh38 already has one.
+resolve_ref_for_clara() {
+  local cand="$1"
+  if [[ -n "$REF_OVERRIDE" ]]; then
+    cand="$REF_OVERRIDE"
+  fi
+  if [[ -f "${cand}.bwameth.c2t" ]]; then
+    echo "$cand"
+    return
+  fi
+  if [[ -f "${FLEET_REF}.bwameth.c2t" ]]; then
+    echo "NOTE: ${cand}.bwameth.c2t missing — using fleet indexed ref:" >&2
+    echo "      $FLEET_REF" >&2
+    echo "      (build assembly38 index later with ensure_bwameth_index.sh if needed)" >&2
+    echo "$FLEET_REF"
+    return
+  fi
+  echo "ERROR: no bwameth C2T index for $cand" >&2
+  echo "Build once: fq2bam-meth/scripts/ensure_bwameth_index.sh $cand" >&2
+  echo "Or pass --ref to a FASTA that already has .bwameth.c2t" >&2
+  exit 2
+}
+if [[ "$USE_TOY" -eq 0 ]]; then
+  REF="$(resolve_ref_for_clara "$REF")"
+fi
+[[ -f "$REF" ]] || { echo "missing REF $REF" >&2; exit 2; }
 
 # Materialize inputs under work/ — never write into Data/ (immutable source).
 mkdir -p "$SAMPLE_DIR/work"
 R1_SRC="$(readlink -f "$R1_SRC")"
 R2_SRC="$(readlink -f "$R2_SRC")"
+REF="$(readlink -f "$REF")"
 R1="$SAMPLE_DIR/work/${SAMPLE_ID}_R1.fastq.gz"
 R2="$SAMPLE_DIR/work/${SAMPLE_ID}_R2.fastq.gz"
 if [[ "$MAX_PAIRS" -gt 0 ]]; then
@@ -188,19 +221,39 @@ run_clara() {
       --tmp-dir "$work/tmp" \
       2>&1 | tee "$SAMPLE_DIR/$ALIGN_PB/${SAMPLE_ID}.fq2bam_meth.log"
   elif command -v docker >/dev/null 2>&1; then
-    local host_sample host_ref
+    local host_sample host_ref rel_r1 rel_r2
     host_sample="$(cd "$SAMPLE_DIR" && pwd)"
     host_ref="$(cd "$(dirname "$REF")" && pwd)"
-    docker run --rm --gpus all \
-      -v "$host_sample:/sample" \
-      -v "$host_ref:/ref:ro" \
-      "$PB_IMAGE" \
-      pbrun fq2bam_meth \
-        --ref "/ref/$(basename "$REF")" \
-        --in-fq "/sample/$(basename "$R1")" "/sample/$(basename "$R2")" \
-        --out-bam "/sample/$ALIGN_PB/${SAMPLE_ID}.bam" \
-        --tmp-dir "/sample/$ALIGN_PB/work/tmp" \
-      2>&1 | tee "$SAMPLE_DIR/$ALIGN_PB/${SAMPLE_ID}.fq2bam_meth.log"
+    # Inputs may live under sample/work/ — keep path relative to sample mount.
+    rel_r1="${R1#"$host_sample"/}"
+    rel_r2="${R2#"$host_sample"/}"
+    if [[ "$rel_r1" == "$R1" || "$rel_r2" == "$R2" ]]; then
+      # FASTQs outside sample dir — mount their parent as /fastq
+      local host_fq
+      host_fq="$(cd "$(dirname "$R1")" && pwd)"
+      docker run --rm --gpus all \
+        -v "$host_sample:/sample" \
+        -v "$host_ref:/ref:ro" \
+        -v "$host_fq:/fastq:ro" \
+        "$PB_IMAGE" \
+        pbrun fq2bam_meth \
+          --ref "/ref/$(basename "$REF")" \
+          --in-fq "/fastq/$(basename "$R1")" "/fastq/$(basename "$R2")" \
+          --out-bam "/sample/$ALIGN_PB/${SAMPLE_ID}.bam" \
+          --tmp-dir "/sample/$ALIGN_PB/work/tmp" \
+        2>&1 | tee "$SAMPLE_DIR/$ALIGN_PB/${SAMPLE_ID}.fq2bam_meth.log"
+    else
+      docker run --rm --gpus all \
+        -v "$host_sample:/sample" \
+        -v "$host_ref:/ref:ro" \
+        "$PB_IMAGE" \
+        pbrun fq2bam_meth \
+          --ref "/ref/$(basename "$REF")" \
+          --in-fq "/sample/$rel_r1" "/sample/$rel_r2" \
+          --out-bam "/sample/$ALIGN_PB/${SAMPLE_ID}.bam" \
+          --tmp-dir "/sample/$ALIGN_PB/work/tmp" \
+        2>&1 | tee "$SAMPLE_DIR/$ALIGN_PB/${SAMPLE_ID}.fq2bam_meth.log"
+    fi
   else
     echo "ERROR: neither pbrun nor docker available for Clara arm" >&2
     exit 3
