@@ -51,7 +51,7 @@ Sibling indexes (prebuild once; do not rebuild per sample):
 |---------|------|
 | `${REF}.bwameth.c2t` (+ `.bwt` …) | Clara `fq2bam_meth` |
 | `${REF}.C2T.fa` | Mojo C→T reference |
-| `${REF}.mojo_linear_k15/` | Mojo k-mer cache (`meta.txt`, `hits.tsv`, `ref.fa`) |
+| `${REF}.mojo_linear_k15/` | Mojo dense-v1 pack (`meta.json`, `kmers.bin`, `offsets.bin`, `postings.bin`, `ref.fa`) |
 
 ```bash
 # Clara (if missing)

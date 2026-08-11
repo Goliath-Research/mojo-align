@@ -281,11 +281,11 @@ run_mojo() {
     export METHYLGRAPHER_GPU_REQUIRE=0
   fi
   local fleet_cache="${REF}.mojo_linear_k${k_val}"
-  if [[ ! -f "${fleet_cache}/hits.tsv" ]]; then
-    echo "NOTE: Mojo linear cache missing at ${fleet_cache}" >&2
+  if [[ ! -f "${fleet_cache}/kmers.bin" || ! -f "${fleet_cache}/meta.json" ]]; then
+    echo "NOTE: Mojo dense-v1 pack missing at ${fleet_cache}" >&2
     echo "      Prebuild once: fq2bam-meth/scripts/ensure_mojo_linear_index.sh $REF $k_val" >&2
   else
-    echo "Using fleet Mojo linear cache: $fleet_cache"
+    echo "Using fleet Mojo dense-v1 pack: $fleet_cache"
   fi
   "$REPO_ROOT/bin/methylGrapher" MojoFq2bamMeth \
     -fq1 "$R1" -fq2 "$R2" -ref "$REF" \

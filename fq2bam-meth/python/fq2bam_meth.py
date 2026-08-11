@@ -108,7 +108,9 @@ def resolve_mojo_linear_cache_dir(
     if env:
         return Path(env)
     fleet = fleet_mojo_linear_cache_dir(reference_fasta, k)
-    if (fleet / "hits.tsv").is_file():
+    if (fleet / "kmers.bin").is_file() and (fleet / "meta.json").is_file():
+        return fleet
+    if (fleet / "hits.tsv").is_file():  # legacy text cache
         return fleet
     if _is_fleet_genome_path(reference_fasta):
         return fleet

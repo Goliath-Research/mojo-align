@@ -11,7 +11,7 @@ from dual-graph `Align` / MojoGiraffe (GAF → MethylCall).
 1. **Python orchestrator** ([`engine/fq2bam_meth.py`](../engine/fq2bam_meth.py)): directional convert (R1 C→T, R2 G→A; reference C→T), mapper select, `samtools` sort/index, Parabricks-shaped QC JSON.
 2. **Native Mojo linear mapper** ([`src/linear_mapper.mojo`](../src/linear_mapper.mojo)):
    - Streaming FASTQ batches (`METHYLGRAPHER_LINEAR_READ_BATCH`, default **16384**) — never full production FASTQ as Mojo rows
-   - Hash postings `Dict[kmer → locs]` (`linear_index`) — no `hit_table` linear scan
+   - Fleet dense-v1 mmap pack (`kmers.bin` / `offsets.bin` / `postings.bin`) via `linear_index`; in-memory Dict only for tiny fixtures
    - Optional fused BS convert (`-bs_r1 C2T` / `-bs_r2 G2A`) in the mapper
    - Portable GPU/host seeds (`linear_gpu_kernels`) **wired into** `extend_read_with_seeds` (not discarded warmup)
    - Gapless extend + PE SAM flags → SAM
@@ -65,7 +65,8 @@ bin/methylGrapher MojoFq2bamMeth \
 
 | Path | Role |
 |------|------|
-| `src/linear_index.mojo` | FASTA + hash k-mer postings / `{cache_dir}` |
+| `src/linear_index.mojo` | FASTA + dense-v1 mmap pack / `{cache_dir}` |
+| `python/mojo_linear_pack.py` | Build dense-v1 pack (numpy sort → CSR bins) |
 | `src/linear_seed.mojo` | k-mer extract / seed postings |
 | `src/linear_gpu_kernels.mojo` | DeviceContext probe + portable seed (reuses Giraffe device helpers) |
 | `src/linear_extend.mojo` | `extend_read_with_seeds` + PE SAM flags (`0x8` = mate unmapped) |
