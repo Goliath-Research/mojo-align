@@ -126,3 +126,35 @@ def test_end_to_end_bwa_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     )
     assert out_bam.is_file()
     assert result["mapper"] == "bwa"
+
+
+def test_ensure_dense_pack_builds_under_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from mojo_linear_pack import ensure_dense_pack, pack_is_complete
+
+    monkeypatch.delenv("METHYLGRAPHER_LINEAR_CACHE_BUILD", raising=False)
+    c2t = tmp_path / "ref.C2T.fa"
+    convert_fasta_c2t(FIX / "ref.fa", c2t)
+    cache = tmp_path / "ref.fa.mojo_linear_k8"
+    logs: list[str] = []
+    out = ensure_dense_pack(c2t_fasta=c2t, cache_dir=cache, k=8, log=logs.append)
+    assert out == cache
+    assert pack_is_complete(cache)
+    assert (cache / "ref.fa").exists()
+    assert Path(str(cache) + ".lock").is_file()
+    # Second call is a no-op (already complete).
+    n_before = len(logs)
+    ensure_dense_pack(c2t_fasta=c2t, cache_dir=cache, k=8, log=logs.append)
+    assert len(logs) == n_before  # no lock/build messages
+
+
+def test_ensure_dense_pack_respects_build_disable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from mojo_linear_pack import ensure_dense_pack
+
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_CACHE_BUILD", "0")
+    c2t = tmp_path / "ref.C2T.fa"
+    convert_fasta_c2t(FIX / "ref.fa", c2t)
+    cache = tmp_path / "missing.mojo_linear_k8"
+    with pytest.raises(RuntimeError, match="missing"):
+        ensure_dense_pack(c2t_fasta=c2t, cache_dir=cache, k=8)

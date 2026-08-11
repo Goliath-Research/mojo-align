@@ -63,6 +63,9 @@ fq2bam-meth/scripts/ensure_mojo_linear_index.sh "$REF" 15
 
 MojoFq2bamMeth auto-uses `${REF}.mojo_linear_k${k}/` when the ref lives under
 `/work/genomes` (override with `-cache_dir` / `METHYLGRAPHER_LINEAR_CACHE_DIR`).
+If the dense pack is missing, the first worker builds it on the fly under an
+exclusive flock on `${cache}.lock` (other workers wait, then reuse). Disable
+with `METHYLGRAPHER_LINEAR_CACHE_BUILD=0`.
 
 After the cache is complete, sync the linear pin to myQNAPcloud so new clusters
 get it in Phase 0 (`MethylPipeline/scripts/sync_genomes_to_s3.sh --only

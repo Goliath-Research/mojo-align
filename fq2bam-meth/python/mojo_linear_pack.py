@@ -13,10 +13,13 @@ k ≤ 31 (fits in uint64 with 2 bits/base). Ambiguous bases skip the window.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import sys
+import time
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +41,75 @@ def pack_is_complete(cache_dir: Path) -> bool:
         and (cache_dir / "offsets.bin").is_file()
         and (cache_dir / "postings.bin").is_file()
     )
+
+
+def _ensure_ref_link(cache_dir: Path, c2t_fasta: Path) -> None:
+    """Point ``cache_dir/ref.fa`` at the C2T FASTA (symlink preferred)."""
+    ref_link = cache_dir / "ref.fa"
+    c2t_fasta = Path(c2t_fasta)
+    if ref_link.exists() or ref_link.is_symlink():
+        return
+    try:
+        ref_link.symlink_to(c2t_fasta.resolve())
+    except OSError:
+        import shutil
+
+        shutil.copy2(c2t_fasta, ref_link)
+
+
+def ensure_dense_pack(
+    *,
+    c2t_fasta: Path,
+    cache_dir: Path,
+    k: int = 15,
+    log: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Return a complete dense-v1 pack, building under an exclusive flock if missing.
+
+    Concurrent workers serialize on ``${cache_dir}.lock``. After the lock is
+    acquired the pack is re-checked so only the first builder runs.
+    Set ``METHYLGRAPHER_LINEAR_CACHE_BUILD=0`` to fail instead of building.
+    """
+    c2t_fasta = Path(c2t_fasta)
+    cache_dir = Path(cache_dir)
+
+    def _log(msg: str) -> None:
+        if log is not None:
+            log(msg)
+        else:
+            print(msg, flush=True)
+
+    if pack_is_complete(cache_dir):
+        _ensure_ref_link(cache_dir, c2t_fasta)
+        return cache_dir
+
+    auto = os.environ.get("METHYLGRAPHER_LINEAR_CACHE_BUILD", "1").strip().lower()
+    if auto in ("0", "false", "no", "off"):
+        raise RuntimeError(
+            f"Mojo dense-v1 pack missing at {cache_dir} "
+            f"(METHYLGRAPHER_LINEAR_CACHE_BUILD={auto})"
+        )
+
+    if not c2t_fasta.is_file():
+        raise FileNotFoundError(f"C2T FASTA required to build pack: {c2t_fasta}")
+
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(str(cache_dir) + ".lock")
+    _log(f"mojo_linear_pack: waiting for lock {lock_path}")
+    t0 = time.time()
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        _log(f"mojo_linear_pack: acquired lock after {time.time() - t0:.1f}s")
+        if pack_is_complete(cache_dir):
+            _log(f"mojo_linear_pack: pack already complete (other worker) → {cache_dir}")
+            _ensure_ref_link(cache_dir, c2t_fasta)
+            return cache_dir
+        _log(f"mojo_linear_pack: building dense-v1 k={k} → {cache_dir}")
+        build_dense_pack(c2t_fasta, cache_dir, k=k)
+        _ensure_ref_link(cache_dir, c2t_fasta)
+        lock_fh.write(f"built k={k} t={time.time():.0f}\n")
+        lock_fh.flush()
+    return cache_dir
 
 
 def read_fasta_contigs(path: Path) -> List[Tuple[str, bytes]]:

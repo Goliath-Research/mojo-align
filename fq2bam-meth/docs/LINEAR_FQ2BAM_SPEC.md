@@ -57,6 +57,8 @@ bin/methylGrapher MojoFq2bamMeth \
 | `METHYLGRAPHER_ALIGN_DEVICE` | default `-device` |
 | `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` |
 | `METHYLGRAPHER_LINEAR_K` | k-mer size (default 15) |
+| `METHYLGRAPHER_LINEAR_CACHE_DIR` | override dense-v1 pack directory |
+| `METHYLGRAPHER_LINEAR_CACHE_BUILD` | `1` (default) build missing pack under flock; `0` fail if missing |
 | `METHYLGRAPHER_LINEAR_READ_BATCH` | streaming batch size (default 16384) |
 | `METHYLGRAPHER_GPU_REQUIRE` | empty/`1` fail-closes DeviceContext for nvidia/amd; explicit `1` also blocks BWA fallback; `0` allows host seeds |
 | `METHYLGRAPHER_BWA_THREADS` | threads for BWA fallback / sort |

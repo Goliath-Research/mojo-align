@@ -432,6 +432,20 @@ def run_mojo_fq2bam_meth(
             resolved_cache = resolve_mojo_linear_cache_dir(
                 reference_fasta, work, k, cache_dir=cache_dir
             )
+            # First-use fallback: build dense-v1 under flock if missing
+            # (serializes workers on the same ${REF}.mojo_linear_k${k}.lock).
+            from mojo_linear_pack import ensure_dense_pack
+
+            def _pack_log(msg: str) -> None:
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write(msg + "\n")
+
+            resolved_cache = ensure_dense_pack(
+                c2t_fasta=c2t_ref,
+                cache_dir=resolved_cache,
+                k=k,
+                log=_pack_log,
+            )
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(
                     f"c2t_ref={c2t_ref} mojo_linear_cache={resolved_cache}\n"
