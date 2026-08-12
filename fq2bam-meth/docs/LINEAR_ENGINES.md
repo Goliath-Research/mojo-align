@@ -1,25 +1,23 @@
-# Linear GPU engines: parity vs speed
+# Linear GPU engines: parity vs speed vs fm
 
-Two Mojo GPU mappers share the orchestrator, dense-v1 pack, and SAM/BAM
-consumer path. They are **not** interchangeable until the speed engine
-matches or improves quality.
+Three Mojo GPU mappers share the orchestrator and SAM/BAM consumer path.
+They are **not** interchangeable until promotion gates pass.
 
-| Engine | Env | Module | Role |
-|--------|-----|--------|------|
-| **parity** (default) | `METHYLGRAPHER_LINEAR_ENGINE=parity` | `src/linear_gpu_locate.mojo` | Frozen science path vs Clara |
-| **speed** (opt-in) | `METHYLGRAPHER_LINEAR_ENGINE=speed` | `src/linear_gpu_speed.mojo` | Wall-clock experiments; any algorithm |
+| Engine | Env | Module | Index | Role |
+|--------|-----|--------|-------|------|
+| **parity** (default) | `METHYLGRAPHER_LINEAR_ENGINE=parity` | `src/linear_gpu_locate.mojo` | dense-v1 k-mer pack | Frozen science path vs Clara |
+| **speed** (opt-in) | `METHYLGRAPHER_LINEAR_ENGINE=speed` | `src/linear_gpu_speed.mojo` | dense-v1 k-mer pack | K-mer consensus experiments |
+| **fm** (opt-in) | `METHYLGRAPHER_LINEAR_ENGINE=fm` | `src/linear_gpu_fm.mojo` | BWA `.bwt/.sa/.pac` | BWA-MEM-style FM-index path |
 
-## Why two engines
+## Why separate engines
 
-Parity exists to stay a valid Clara `fq2bam_meth` replacement: mapped-rate
-and idxstats gates, GATK-consumable BAM. Tuning that kernel for speed has
-repeatedly broken the 0.02 mapped-rate gate.
+Parity exists to stay a valid Clara `fq2bam_meth` replacement on the k-mer
+path. Speed may tune that index. **fm** is the real Clara-shaped replacement:
+GPU FM-index seed + extend on the same `bwameth.c2t` BWA index Clara uses.
 
-Speed may use any strategy (unique-seed consensus + rare/heavy vote today;
-FM-index / BWA-MEM shaped later). It does **not** become the default until
-promotion gates pass.
+None becomes the default until promotion gates pass.
 
-## Science gates (both engines, vs Clara)
+## Science gates (vs Clara)
 
 Same report as [`LINEAR_PARITY.md`](LINEAR_PARITY.md):
 
@@ -28,32 +26,41 @@ Same report as [`LINEAR_PARITY.md`](LINEAR_PARITY.md):
 | Mapped rate \|Δ\| | ≤ 0.02 |
 | Primary idxstats Spearman | ≥ 0.95 |
 
-## Promotion (speed → default)
+## Promotion (fm or speed → default)
 
-Speed may replace parity as the default **only if all** hold on the
-Parabricks sample (100k smoke **and** full sample):
+An opt-in engine may replace parity as the default **only if all** hold on
+the Parabricks sample (100k smoke **and** full sample):
 
 1. Clara gates above **pass**
 2. Mojo mapped rate **≥** frozen parity mapped rate (match or improve)
-3. Idxstats Spearman vs Clara **≥** parity’s Spearman (or still ≥ 0.95)
+3. Idxstats Spearman vs Clara **≥** 0.95
 4. BAM still GATK/Picard consumable (`@RG`, original SEQ, coordinate sort)
 
-Until then: production / bakeoff / `parity_linear_parabricks_vs_mojo.sh`
-stay on **parity**.
+Until then: production / bakeoff stay on **parity**.
 
 ## Run
 
 ```bash
-# Science default (unchanged)
+# Science default (k-mer)
 fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --skip-clara --max-pairs 100000
 
-# Speed engine (opt-in; expect quality to lag until it catches up)
-METHYLGRAPHER_LINEAR_ENGINE=speed \
+# FM-index engine (opt-in; uses ${REF}.bwameth.c2t.{bwt,sa,pac})
+METHYLGRAPHER_LINEAR_ENGINE=fm \
   fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-    --engine speed --sample-dir /tmp/parity_100k_speed --skip-clara --max-pairs 100000
+    --engine fm --sample-dir /tmp/parity_100k_fm --skip-clara --max-pairs 100000
 ```
 
-Speed-only knobs (do not change parity):
+### FM knobs (do not change parity)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `METHYLGRAPHER_FM_SEED_LEN` | 19 | Exact seed length (BWA-MEM min) |
+| `METHYLGRAPHER_FM_SEED_STRIDE` | 5 | Seed start spacing |
+| `METHYLGRAPHER_FM_MAX_OCC` | 256 | Max SA interval size to extend |
+| `METHYLGRAPHER_FM_MAX_DIFF` | 10 | Gapless/softclip NM budget |
+| `METHYLGRAPHER_FM_MAX_SOFT` | 16 | End soft-clip cap |
+
+### Speed knobs
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -66,3 +73,17 @@ Speed-only knobs (do not change parity):
 
 Parity knobs (`VOTE_OCC`, `SEED_STRIDE=3`, `MAX_OCC=16384`, …) apply only to
 the frozen engine.
+
+## 100k smoke (2026-08-12, Parabricks sample vs Clara slice)
+
+| Engine | Mapped | \|Δ\| vs Clara | Spearman | `map_wall_s` | Gate |
+|--------|--------|---------------|----------|--------------|------|
+| Clara (slice) | 99.71% | — | — | — | — |
+| parity (k-mer) | 97.83% | 0.019 | 1.00 | ~14.1 | **pass** |
+| fm (v1 exact-seed + gapless) | ~52–53% | ~0.47 | ≥0.99 | **~1.8–2.6** | fail |
+
+FM v1 is wired and fast (no 50 GiB posting walks) but **not** promotion-ready:
+needs SMEM/reseed/chain + banded affine extend (and/or host indel path) before
+default switch. Artifacts: `/tmp/parity_100k_fm/linear_parity_report.json`.
+
+Round-trip unit: `fq2bam-meth/tests/fm_roundtrip.mojo` (unique 32-mer BWT+SA).

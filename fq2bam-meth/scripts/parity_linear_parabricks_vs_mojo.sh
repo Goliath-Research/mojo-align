@@ -22,7 +22,7 @@
 #   --skip-clara         Only run Mojo (compare against existing Clara BAM)
 #   --skip-mojo          Only run Clara
 #   --compare-only       Skip both aligners; only score existing BAMs
-#   --engine parity|speed  Mojo GPU engine (default parity = science path)
+#   --engine parity|speed|fm  Mojo GPU engine (default parity = science path)
 #   --toy                Use fq2bam-meth toy fixture (no Clara sample / no pbrun)
 #
 # Layout written:
@@ -287,7 +287,7 @@ run_mojo() {
   export METHYLGRAPHER_GPU_REQUIRE="${METHYLGRAPHER_GPU_REQUIRE:-1}"
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
   export METHYLGRAPHER_LINEAR_ENGINE="${LINEAR_ENGINE:-parity}"
-  echo "Mojo GPU engine=${METHYLGRAPHER_LINEAR_ENGINE} (parity=science default; speed=opt-in)"
+  echo "Mojo GPU engine=${METHYLGRAPHER_LINEAR_ENGINE} (parity=science default; speed|fm=opt-in)"
   # Rare-kmer locate: skip ultra-repetitive C2T keys (max occ ~7.7M otherwise).
   export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-16384}"
   export METHYLGRAPHER_LINEAR_VOTE_OCC="${METHYLGRAPHER_LINEAR_VOTE_OCC:-256}"

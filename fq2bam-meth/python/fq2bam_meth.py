@@ -12,9 +12,10 @@ Mapper selection (``METHYLGRAPHER_LINEAR_MAPPER``):
 
 Mojo GPU engine (``METHYLGRAPHER_LINEAR_ENGINE``):
 
-- ``parity`` (default) — frozen science mapper (``linear_gpu_locate.mojo``)
-- ``speed`` — experimental fast mapper; not default until it matches or
-  improves Clara/parity quality gates (see ``docs/LINEAR_ENGINES.md``)
+- ``parity`` (default) — frozen k-mer science mapper (``linear_gpu_locate.mojo``)
+- ``speed`` — experimental k-mer consensus mapper
+- ``fm`` — BWA-MEM-style FM-index mapper (``linear_gpu_fm.mojo``); promote
+  only when Clara gates pass (see ``docs/LINEAR_ENGINES.md``)
 
 Device selection mirrors Giraffe: ``-device auto|cpu|nvidia|amd`` /
 ``METHYLGRAPHER_ALIGN_DEVICE``.
@@ -314,14 +315,16 @@ def resolve_linear_mapper(device: str) -> str:
 
 
 def resolve_linear_engine() -> str:
-    """Return ``parity`` or ``speed``. Default is the frozen science engine."""
+    """Return ``parity``, ``speed``, or ``fm``. Default is frozen science."""
     raw = os.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "").strip().lower()
     if raw in {"", "parity", "science", "default"}:
         return "parity"
     if raw in {"speed", "fast"}:
         return "speed"
+    if raw in {"fm", "bwa-mem", "bwamem"}:
+        return "fm"
     raise RuntimeError(
-        "METHYLGRAPHER_LINEAR_ENGINE must be 'parity' or 'speed' "
+        "METHYLGRAPHER_LINEAR_ENGINE must be 'parity', 'speed', or 'fm' "
         f"(got {raw!r})"
     )
 
@@ -501,27 +504,28 @@ def run_mojo_fq2bam_meth(
     if mapper == "mojo":
         try:
             out_sam = work / "aligned.sam"
+            eng = resolve_linear_engine()
             resolved_cache = resolve_mojo_linear_cache_dir(
                 reference_fasta, work, k, cache_dir=cache_dir
             )
-            # First-use fallback: build dense-v1 under flock if missing
-            # (serializes workers on the same ${REF}.mojo_linear_k${k}.lock).
-            from mojo_linear_pack import ensure_dense_pack
+            # FM engine uses BWA .bwt/.sa/.pac; k-mer engines need dense-v1.
+            if eng != "fm":
+                from mojo_linear_pack import ensure_dense_pack
 
-            def _pack_log(msg: str) -> None:
-                with log.open("a", encoding="utf-8") as handle:
-                    handle.write(msg + "\n")
+                def _pack_log(msg: str) -> None:
+                    with log.open("a", encoding="utf-8") as handle:
+                        handle.write(msg + "\n")
 
-            resolved_cache = ensure_dense_pack(
-                c2t_fasta=c2t_ref,
-                cache_dir=resolved_cache,
-                k=k,
-                log=_pack_log,
-            )
+                resolved_cache = ensure_dense_pack(
+                    c2t_fasta=c2t_ref,
+                    cache_dir=resolved_cache,
+                    k=k,
+                    log=_pack_log,
+                )
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(
                     f"c2t_ref={c2t_ref} mojo_linear_cache={resolved_cache} "
-                    f"bs_fused=C2T/G2A fq1={fq1} fq2={fq2}\n"
+                    f"linear_engine={eng} bs_fused=C2T/G2A fq1={fq1} fq2={fq2}\n"
                 )
             run_mojo_linear_map(
                 c2t_ref=c2t_ref,

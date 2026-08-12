@@ -3,7 +3,8 @@
 # Streaming batches — never materializes full production FASTQ as Mojo rows.
 # GPU engines (METHYLGRAPHER_LINEAR_ENGINE):
 #   parity (default) — frozen science path in linear_gpu_locate.mojo
-#   speed            — opt-in wall-clock path in linear_gpu_speed.mojo
+#   speed            — opt-in k-mer consensus path in linear_gpu_speed.mojo
+#   fm               — opt-in BWA-MEM-style FM-index path in linear_gpu_fm.mojo
 # GPU seeds feed extend (not discarded warmup) on the CPU/portable fallback.
 
 from std.collections import List
@@ -11,6 +12,7 @@ from std.python import Python, PythonObject
 from std.sys import argv as sys_argv, exit
 
 from linear_extend import extend_read, extend_read_with_seeds, hit_to_sam_line, pair_hits
+from linear_gpu_fm import map_fastq_fm_gpu
 from linear_gpu_kernels import seed_kmers_portable
 from linear_gpu_locate import map_fastq_dense_gpu_locate
 from linear_gpu_speed import map_fastq_dense_gpu_speed
@@ -133,6 +135,32 @@ def map_fastq_to_sam(
     bs_r2: String = "",
     build_cache_only: Bool = False,
 ) raises -> Int:
+    var os_mod = Python.import_module("os")
+    var engine = String(
+        os_mod.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "parity")
+    ).lower()
+    var gpu_locate = String(
+        os_mod.environ.get("METHYLGRAPHER_LINEAR_GPU_LOCATE", "1")
+    ).lower()
+    var gpu_locate_on = (
+        gpu_locate == ""
+        or gpu_locate == "1"
+        or gpu_locate == "true"
+        or gpu_locate == "yes"
+    )
+    var dev_l = device.lower()
+    # FM engine uses BWA .bwt/.sa/.pac — skip dense-v1 k-mer pack entirely.
+    if (
+        (engine == "fm" or engine == "bwa-mem" or engine == "bwamem")
+        and gpu_locate_on
+        and (dev_l == "nvidia" or dev_l == "amd" or dev_l == "auto")
+        and (not build_cache_only)
+    ):
+        print("MojoLinear engine=fm (opt-in FM-index / BWA-MEM-style)")
+        return map_fastq_fm_gpu(
+            ref_fasta, fq1, out_sam, device, fq2, bs_r1, bs_r2
+        )
+
     var index = LinearIndex(k)
     var loaded = False
     if cache_dir.byte_length() > 0:
@@ -160,23 +188,11 @@ def map_fastq_to_sam(
         print("MojoLinear cache ready -> ", cache_dir)
         return 0
 
-    # Dense GRCh38 + NVIDIA/AMD: one-session GPU locate (no String k-mer path).
-    var os_mod = Python.import_module("os")
-    var gpu_locate = String(
-        os_mod.environ.get("METHYLGRAPHER_LINEAR_GPU_LOCATE", "1")
-    ).lower()
-    var gpu_locate_on = (
-        gpu_locate == ""
-        or gpu_locate == "1"
-        or gpu_locate == "true"
-        or gpu_locate == "yes"
-    )
-    if index.dense and gpu_locate_on:
-        var dev_l = device.lower()
-        if dev_l == "nvidia" or dev_l == "amd" or dev_l == "auto":
-            var engine = String(
-                os_mod.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "parity")
-            ).lower()
+    # Dense k-mer GPU engines on NVIDIA/AMD.
+    if gpu_locate_on and (
+        dev_l == "nvidia" or dev_l == "amd" or dev_l == "auto"
+    ):
+        if index.dense:
             if engine == "speed" or engine == "fast":
                 print("MojoLinear engine=speed (opt-in; not the science default)")
                 return map_fastq_dense_gpu_speed(

@@ -54,7 +54,7 @@ bin/methylGrapher MojoFq2bamMeth \
 | Variable | Effect |
 |----------|--------|
 | `METHYLGRAPHER_LINEAR_MAPPER` | `mojo` (default) \| `bwa` \| `auto` |
-| `METHYLGRAPHER_LINEAR_ENGINE` | `parity` (default, science) \| `speed` (opt-in; see [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
+| `METHYLGRAPHER_LINEAR_ENGINE` | `parity` (default) \| `speed` \| `fm` (see [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
 | `METHYLGRAPHER_ALIGN_DEVICE` | default `-device` |
 | `METHYLGRAPHER_AMDGPU_ARCH` | e.g. `gfx942` |
 | `METHYLGRAPHER_LINEAR_K` | k-mer size (default 15) |
@@ -74,8 +74,10 @@ bin/methylGrapher MojoFq2bamMeth \
 | `src/linear_gpu_kernels.mojo` | DeviceContext probe + portable seed (reuses Giraffe device helpers) |
 | `src/linear_extend.mojo` | `extend_read_with_seeds` + PE SAM flags (`0x8` = mate unmapped) |
 | `src/linear_gpu_locate.mojo` | **Parity** GPU engine (frozen science: locate + vote + extend) |
-| `src/linear_gpu_speed.mojo` | **Speed** GPU engine (opt-in; promotion rules in [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
-| `src/linear_mapper.mojo` | streaming map → SAM (`-ref -fq1 -out_sam …`); dispatches parity vs speed |
+| `src/linear_gpu_speed.mojo` | **Speed** GPU engine (opt-in k-mer consensus) |
+| `src/linear_fm_index.mojo` | BWA 0.7 FM-index mmap (`.bwt/.sa/.pac/.ann`) |
+| `src/linear_gpu_fm.mojo` | **FM** GPU engine (BWA-MEM-style; promote per [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
+| `src/linear_mapper.mojo` | streaming map → SAM; dispatches parity / speed / fm |
 | `engine/fq2bam_meth.py` | convert, invoke Mojo, BWA fallback, samtools, QC |
 
 ## Performance gates

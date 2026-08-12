@@ -551,7 +551,7 @@ def map_fastq_dense_gpu_speed(
                                     best_sr = sr
                             if best_cost == 0:
                                 break
-                            if adj == 0 and (nm > budget or alen < 32):
+                            if adj == 0 and (nm > budget or alen < 24):
                                 if btry + qlen + 1 <= clen:
                                     var g = 0
                                     while g <= qlen:

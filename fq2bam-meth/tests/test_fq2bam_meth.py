@@ -58,8 +58,12 @@ def test_resolve_linear_engine_default_is_parity(monkeypatch: pytest.MonkeyPatch
     assert resolve_linear_engine() == "speed"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "fast")
     assert resolve_linear_engine() == "speed"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "fm")
+    assert resolve_linear_engine() == "fm"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "bwa-mem")
+    assert resolve_linear_engine() == "fm"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "vote")
-    with pytest.raises(RuntimeError, match="parity.*speed"):
+    with pytest.raises(RuntimeError, match="parity.*speed.*fm"):
         resolve_linear_engine()
 
 
