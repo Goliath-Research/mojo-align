@@ -11,6 +11,7 @@ import pytest
 from engine.fq2bam_meth import (
     convert_fasta_c2t,
     convert_fastq,
+    resolve_linear_engine,
     resolve_linear_mapper,
     run_mojo_fq2bam_meth,
     write_parabricks_shaped_metrics,
@@ -46,6 +47,20 @@ def test_resolve_linear_mapper_default(monkeypatch: pytest.MonkeyPatch):
     assert resolve_linear_mapper("auto") == "mojo"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_MAPPER", "bwa")
     assert resolve_linear_mapper("cpu") == "bwa"
+
+
+def test_resolve_linear_engine_default_is_parity(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("METHYLGRAPHER_LINEAR_ENGINE", raising=False)
+    assert resolve_linear_engine() == "parity"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "science")
+    assert resolve_linear_engine() == "parity"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "speed")
+    assert resolve_linear_engine() == "speed"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "fast")
+    assert resolve_linear_engine() == "speed"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "vote")
+    with pytest.raises(RuntimeError, match="parity.*speed"):
+        resolve_linear_engine()
 
 
 def test_metrics_marks_placeholders(tmp_path: Path):

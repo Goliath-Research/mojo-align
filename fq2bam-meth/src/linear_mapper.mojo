@@ -1,7 +1,10 @@
 # End-to-end Mojo linear WGBS mapper (C2T FASTA + converted FASTQ -> SAM).
 #
 # Streaming batches — never materializes full production FASTQ as Mojo rows.
-# GPU seeds feed extend (not discarded warmup).
+# GPU engines (METHYLGRAPHER_LINEAR_ENGINE):
+#   parity (default) — frozen science path in linear_gpu_locate.mojo
+#   speed            — opt-in wall-clock path in linear_gpu_speed.mojo
+# GPU seeds feed extend (not discarded warmup) on the CPU/portable fallback.
 
 from std.collections import List
 from std.python import Python, PythonObject
@@ -10,6 +13,7 @@ from std.sys import argv as sys_argv, exit
 from linear_extend import extend_read, extend_read_with_seeds, hit_to_sam_line, pair_hits
 from linear_gpu_kernels import seed_kmers_portable
 from linear_gpu_locate import map_fastq_dense_gpu_locate
+from linear_gpu_speed import map_fastq_dense_gpu_speed
 from linear_index import LinearIndex
 from utility import get_kv_value, open_text_write
 
@@ -170,6 +174,15 @@ def map_fastq_to_sam(
     if index.dense and gpu_locate_on:
         var dev_l = device.lower()
         if dev_l == "nvidia" or dev_l == "amd" or dev_l == "auto":
+            var engine = String(
+                os_mod.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "parity")
+            ).lower()
+            if engine == "speed" or engine == "fast":
+                print("MojoLinear engine=speed (opt-in; not the science default)")
+                return map_fastq_dense_gpu_speed(
+                    index, fq1, out_sam, device, fq2, bs_r1, bs_r2
+                )
+            print("MojoLinear engine=parity (science default)")
             return map_fastq_dense_gpu_locate(
                 index, fq1, out_sam, device, fq2, bs_r1, bs_r2
             )

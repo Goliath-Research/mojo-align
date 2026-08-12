@@ -1,4 +1,8 @@
+# PARITY ENGINE (frozen science path). Default METHYLGRAPHER_LINEAR_ENGINE=parity.
+#
 # Full-GPU dense-v1 linear WGBS map (DeviceContext: NVIDIA cuda / AMD hip).
+# Do not retune vote/KEEP/occ knobs here for wall-clock — that belongs in
+# linear_gpu_speed.mojo. Bugfixes that preserve mapped-rate / idxstats only.
 #
 # Resident on device: kmers + offsets + postings + sequences + contig_offsets.
 # Per batch: 2-bit encode → locate → vote → mismatch/softclip/indel extend.
@@ -561,12 +565,188 @@ def map_fastq_dense_gpu_locate(
                 rc_codes[base + j] = r
                 j += 1
 
+        def rc_codes_compact_kernel(
+            codes: UnsafePointer[UInt8, MutAnyOrigin],
+            rc_codes: UnsafePointer[UInt8, MutAnyOrigin],
+            read_lens: UnsafePointer[UInt32, MutAnyOrigin],
+            n_active: Int,
+            rid_map: UnsafePointer[Int32, MutAnyOrigin],
+            max_len: Int,
+        ):
+            """RC only need_rc reads (same layout as full rc_codes_kernel)."""
+            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if tid >= n_active:
+                return
+            var rid = Int(rid_map[tid])
+            var L = Int(read_lens[rid])
+            var base = rid * max_len
+            var i = 0
+            while i < max_len:
+                rc_codes[base + i] = 255
+                i += 1
+            var j = 0
+            while j < L:
+                var c = codes[base + (L - 1 - j)]
+                var r: UInt8 = 255
+                if c <= 3:
+                    r = c ^ 3
+                rc_codes[base + j] = r
+                j += 1
+
+        def encode_strided_compact_kernel(
+            codes: UnsafePointer[UInt8, MutAnyOrigin],
+            keys: UnsafePointer[UInt64, MutAnyOrigin],
+            q_offs: UnsafePointer[UInt32, MutAnyOrigin],
+            read_lens: UnsafePointer[UInt32, MutAnyOrigin],
+            n_active: Int,
+            rid_map: UnsafePointer[Int32, MutAnyOrigin],
+            max_len: Int,
+            k_len: Int,
+            seed_stride: Int,
+            slots_per_read: Int,
+        ):
+            """Encode seeds for compacted rid_map; writes into full slot layout."""
+            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var n_slots = n_active * slots_per_read
+            if idx >= n_slots:
+                return
+            var ai = idx // slots_per_read
+            var slot = idx % slots_per_read
+            var rid = Int(rid_map[ai])
+            var sidx = rid * slots_per_read + slot
+            var q_off = slot * seed_stride
+            var L = Int(read_lens[rid])
+            keys[sidx] = UInt64(0xFFFFFFFFFFFFFFFF)
+            q_offs[sidx] = UInt32(q_off)
+            if q_off + k_len > L:
+                return
+            var base = rid * max_len + q_off
+            var key: UInt64 = 0
+            var j = 0
+            while j < k_len:
+                var c = codes[base + j]
+                if c > 3:
+                    return
+                key = (key << 2) | UInt64(c)
+                j += 1
+            keys[sidx] = key
+
+        def locate_bsearch_compact_kernel(
+            keys: UnsafePointer[UInt64, MutAnyOrigin],
+            kmers: UnsafePointer[UInt64, MutAnyOrigin],
+            offsets: UnsafePointer[UInt64, MutAnyOrigin],
+            out_start: UnsafePointer[UInt64, MutAnyOrigin],
+            out_end: UnsafePointer[UInt64, MutAnyOrigin],
+            n_active: Int,
+            rid_map: UnsafePointer[Int32, MutAnyOrigin],
+            slots_per_read: Int,
+            n_table: Int,
+            max_occ: Int,
+        ):
+            """Binary-search locate for compacted rid_map slots only."""
+            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var n_slots = n_active * slots_per_read
+            if idx >= n_slots:
+                return
+            var ai = idx // slots_per_read
+            var slot = idx % slots_per_read
+            var rid = Int(rid_map[ai])
+            var sidx = rid * slots_per_read + slot
+            out_start[sidx] = 0
+            out_end[sidx] = 0
+            var key = keys[sidx]
+            if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
+                return
+            var lo = 0
+            var hi = n_table
+            while lo < hi:
+                var mid = (lo + hi) // 2
+                var mk = kmers[mid]
+                if mk < key:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo >= n_table:
+                return
+            if kmers[lo] != key:
+                return
+            var start = offsets[lo]
+            var end = offsets[lo + 1]
+            var occ = Int(end - start)
+            if occ <= 0 or occ > max_occ:
+                return
+            out_start[sidx] = start
+            out_end[sidx] = end
+
+        def locate_interp_compact_kernel(
+            keys: UnsafePointer[UInt64, MutAnyOrigin],
+            kmers: UnsafePointer[UInt64, MutAnyOrigin],
+            offsets: UnsafePointer[UInt64, MutAnyOrigin],
+            out_start: UnsafePointer[UInt64, MutAnyOrigin],
+            out_end: UnsafePointer[UInt64, MutAnyOrigin],
+            n_active: Int,
+            rid_map: UnsafePointer[Int32, MutAnyOrigin],
+            slots_per_read: Int,
+            n_table: Int,
+            max_occ: Int,
+        ):
+            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var n_slots = n_active * slots_per_read
+            if idx >= n_slots:
+                return
+            var ai = idx // slots_per_read
+            var slot = idx % slots_per_read
+            var rid = Int(rid_map[ai])
+            var sidx = rid * slots_per_read + slot
+            out_start[sidx] = 0
+            out_end[sidx] = 0
+            var key = keys[sidx]
+            if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
+                return
+            var lo = 0
+            var hi = n_table - 1
+            var steps = 0
+            while lo <= hi and key >= kmers[lo] and key <= kmers[hi] and steps < 64:
+                steps += 1
+                if kmers[hi] == kmers[lo]:
+                    if kmers[lo] == key:
+                        hi = lo
+                        break
+                    return
+                var span = kmers[hi] - kmers[lo]
+                var mid = lo + Int(((key - kmers[lo]) * UInt64(hi - lo)) // span)
+                if mid < lo:
+                    mid = lo
+                if mid > hi:
+                    mid = hi
+                var mk = kmers[mid]
+                if mk == key:
+                    lo = mid
+                    hi = mid
+                    break
+                if mk < key:
+                    lo = mid + 1
+                else:
+                    if mid == 0:
+                        return
+                    hi = mid - 1
+            if lo > hi or lo >= n_table or kmers[lo] != key:
+                return
+            var start = offsets[lo]
+            var end = offsets[lo + 1]
+            var occ = Int(end - start)
+            if occ <= 0 or occ > max_occ:
+                return
+            out_start[sidx] = start
+            out_end[sidx] = end
+
         def vote_extend_kernel(
             occ_start: UnsafePointer[UInt64, MutAnyOrigin],
             occ_end: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
             postings: UnsafePointer[UInt32, MutAnyOrigin],
             n_postings: Int,
+            # Packed 2-bit ref codes (0..3 / 255), not ASCII.
             sequences: UnsafePointer[UInt8, MutAnyOrigin],
             contig_off: UnsafePointer[UInt64, MutAnyOrigin],
             n_contigs: Int,
@@ -579,12 +759,15 @@ def map_fastq_dense_gpu_locate(
             max_soft: Int,
             max_indel: Int,
             vote_occ: Int,
-            # 0 = fast (vote + low-occ rescue); 1 = high-occ exact for unmapped only.
+            # 0 = serial vote + rescue; 1 = high-occ (legacy); 2 = merge warp votes + extend.
             pass_mode: Int,
             # When n_active >= 0, threads map through rid_map (compacted unmapped).
             # When n_active < 0, thread i handles read i (full batch).
             n_active: Int,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
+            lane_keys: UnsafePointer[UInt64, MutAnyOrigin],
+            lane_ns: UnsafePointer[Int32, MutAnyOrigin],
+            lane_ncand: UnsafePointer[Int32, MutAnyOrigin],
             strand_flag: Int32,
             out_cid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
@@ -669,8 +852,50 @@ def map_fastq_dense_gpu_locate(
             if vote_cap < 1:
                 vote_cap = 256
 
-            # Pass 0: rare-seed vote. Pass 1: skip (high-occ path only).
-            if pass_mode == 0:
+            # Pass 2: merge per-lane warp votes. Pass 0: serial vote (fallback).
+            # Pass 1: skip (high-occ path only).
+            if pass_mode == 2:
+                comptime WARP = 32
+                comptime TOP_LANE = 32
+                comptime EMPTY = UInt64(0xFFFFFFFFFFFFFFFF)
+                var ln = 0
+                while ln < WARP:
+                    var nc = Int(lane_ncand[rid * WARP + ln])
+                    var base = (rid * WARP + ln) * TOP_LANE
+                    var j = 0
+                    while j < nc and j < TOP_LANE:
+                        var vk = lane_keys[base + j]
+                        var vn = lane_ns[base + j]
+                        if vk != EMPTY and vn > 0:
+                            var found = -1
+                            var ci = 0
+                            while ci < n_cand:
+                                if cand_key[ci] == vk:
+                                    found = ci
+                                    break
+                                ci += 1
+                            if found >= 0:
+                                cand_n[found] = cand_n[found] + vn
+                            elif n_cand < TOP:
+                                cand_key[n_cand] = vk
+                                cand_n[n_cand] = vn
+                                n_cand += 1
+                            else:
+                                var min_i = 0
+                                var min_n = cand_n[0]
+                                var zj = 1
+                                while zj < TOP:
+                                    if cand_n[zj] < min_n:
+                                        min_n = cand_n[zj]
+                                        min_i = zj
+                                    zj += 1
+                                if vn > min_n:
+                                    cand_key[min_i] = vk
+                                    cand_n[min_i] = vn
+                        j += 1
+                    ln += 1
+            elif pass_mode == 0:
+                var last_i = -1
                 var oi = 0
                 while oi < n_ord:
                     var occ_v = Int(ord_occ[oi])
@@ -690,17 +915,22 @@ def map_fastq_dense_gpu_locate(
                             var start0 = pos - q_off
                             var vk = (UInt64(cid) << 32) | UInt64(start0)
                             var found = -1
-                            var ci = 0
-                            while ci < n_cand:
-                                if cand_key[ci] == vk:
-                                    found = ci
-                                    break
-                                ci += 1
+                            if last_i >= 0 and cand_key[last_i] == vk:
+                                found = last_i
+                            else:
+                                var ci = 0
+                                while ci < n_cand:
+                                    if cand_key[ci] == vk:
+                                        found = ci
+                                        break
+                                    ci += 1
                             if found >= 0:
                                 cand_n[found] = cand_n[found] + 1
+                                last_i = found
                             elif n_cand < TOP:
                                 cand_key[n_cand] = vk
                                 cand_n[n_cand] = 1
+                                last_i = n_cand
                                 n_cand += 1
                             else:
                                 var min_i = 0
@@ -714,7 +944,26 @@ def map_fastq_dense_gpu_locate(
                                 if min_n <= 1:
                                     cand_key[min_i] = vk
                                     cand_n[min_i] = 1
+                                    last_i = min_i
                         pi += 1
+                    # Early-stop vote once a locus has clear multi-seed support.
+                    # Keeps mapped-rate gate; avoids scanning every low-occ seed.
+                    if n_cand > 0 and oi + 1 < n_ord:
+                        var b1 = 0
+                        var b2 = 0
+                        var zi = 0
+                        while zi < n_cand:
+                            var zv = Int(cand_n[zi])
+                            if zv > b1:
+                                b2 = b1
+                                b1 = zv
+                            elif zv > b2:
+                                b2 = zv
+                            zi += 1
+                        # Require a clear plurality (margin ≥2) so full-sample
+                        # mapped-rate stays inside the 0.02 gate with headroom.
+                        if b1 >= 4 and b1 >= b2 + 2:
+                            break
                     oi += 1
 
             # Select up to KEEP highest-vote candidates.
@@ -722,7 +971,7 @@ def map_fastq_dense_gpu_locate(
             var pick_n = InlineArray[Int32, KEEP](fill=Int32(0))
             var n_pick = 0
             var ci2 = 0
-            while pass_mode == 0 and ci2 < n_cand:
+            while (pass_mode == 0 or pass_mode == 2) and ci2 < n_cand:
                 var votes = cand_n[ci2]
                 var inserted = False
                 var p = 0
@@ -779,6 +1028,8 @@ def map_fastq_dense_gpu_locate(
             var best_iat = 0
             var best_ilen = 0
 
+            # Adj order: 0 first, then ±1, ±2, … so exact/vote hits exit
+            # before paying for shift_cap×KEEP gapless scans.
             var pk = 0
             while pk < n_pick and n_cand > 0:
                 var ix = Int(pick_i[pk])
@@ -791,28 +1042,47 @@ def map_fastq_dense_gpu_locate(
                     var off1 = Int(contig_off[bcid + 1])
                     var clen = off1 - off0
 
-                    var adj = -shift_cap
-                    while adj <= shift_cap:
+                    var adj_i = 0
+                    while adj_i <= shift_cap * 2:
+                        var adj = 0
+                        if adj_i > 0:
+                            var mag = (adj_i + 1) // 2
+                            if (adj_i & 1) == 1:
+                                adj = -mag
+                            else:
+                                adj = mag
                         var bstart = bstart0 + adj
                         if bstart < 0 or bstart + qlen > clen:
-                            adj += 1
+                            adj_i += 1
                             continue
                         var ref_base = off0 + bstart
 
-                        # Gapless + end soft-clip.
+                        # Interior probes: if more mismatches than budget+indel,
+                        # gapless/softclip/single-indel cannot accept this adj.
+                        var probe_nm = 0
+                        var pkp = 1
+                        while pkp <= 6:
+                            var jp = (pkp * (qlen - 1)) // 7
+                            if jp < clip_cap:
+                                jp = clip_cap
+                            if jp > qlen - 1 - clip_cap:
+                                jp = qlen - 1 - clip_cap
+                            if jp >= 0 and jp < qlen:
+                                var rcp = sequences[ref_base + jp]
+                                var qcp = codes[q_base + jp]
+                                if rcp > 3 or qcp > 3 or rcp != qcp:
+                                    probe_nm += 1
+                            pkp += 1
+                        if probe_nm > budget + indel_cap:
+                            adj_i += 1
+                            continue
+
+                        # Gapless + end soft-clip. Early-abort once NM exceeds
+                        # budget (softclip path still runs and re-scores).
                         var nm_all = 0
                         var j = 0
-                        while j < qlen:
-                            var rb = sequences[ref_base + j]
-                            var rc: UInt8 = 255
-                            if rb == 65 or rb == 97:
-                                rc = 0
-                            elif rb == 67 or rb == 99:
-                                rc = 1
-                            elif rb == 71 or rb == 103:
-                                rc = 2
-                            elif rb == 84 or rb == 116:
-                                rc = 3
+                        while j < qlen and nm_all <= budget:
+                            var rc = sequences[ref_base + j]
                             var qc = codes[q_base + j]
                             if rc > 3 or qc > 3 or rc != qc:
                                 nm_all += 1
@@ -823,16 +1093,7 @@ def map_fastq_dense_gpu_locate(
                         var nm = nm_all
                         if nm_all > budget:
                             while sl < clip_cap:
-                                var rb0 = sequences[ref_base + sl]
-                                var rc0: UInt8 = 255
-                                if rb0 == 65 or rb0 == 97:
-                                    rc0 = 0
-                                elif rb0 == 67 or rb0 == 99:
-                                    rc0 = 1
-                                elif rb0 == 71 or rb0 == 103:
-                                    rc0 = 2
-                                elif rb0 == 84 or rb0 == 116:
-                                    rc0 = 3
+                                var rc0 = sequences[ref_base + sl]
                                 var qc0 = codes[q_base + sl]
                                 if rc0 <= 3 and qc0 <= 3 and rc0 == qc0:
                                     break
@@ -841,33 +1102,15 @@ def map_fastq_dense_gpu_locate(
                                 var jr = qlen - 1 - sr
                                 if jr <= sl:
                                     break
-                                var rb1 = sequences[ref_base + jr]
-                                var rc1: UInt8 = 255
-                                if rb1 == 65 or rb1 == 97:
-                                    rc1 = 0
-                                elif rb1 == 67 or rb1 == 99:
-                                    rc1 = 1
-                                elif rb1 == 71 or rb1 == 103:
-                                    rc1 = 2
-                                elif rb1 == 84 or rb1 == 116:
-                                    rc1 = 3
+                                var rc1 = sequences[ref_base + jr]
                                 var qc1 = codes[q_base + jr]
                                 if rc1 <= 3 and qc1 <= 3 and rc1 == qc1:
                                     break
                                 sr += 1
                             nm = 0
                             var jm = sl
-                            while jm < qlen - sr:
-                                var rbm = sequences[ref_base + jm]
-                                var rcm: UInt8 = 255
-                                if rbm == 65 or rbm == 97:
-                                    rcm = 0
-                                elif rbm == 67 or rbm == 99:
-                                    rcm = 1
-                                elif rbm == 71 or rbm == 103:
-                                    rcm = 2
-                                elif rbm == 84 or rbm == 116:
-                                    rcm = 3
+                            while jm < qlen - sr and nm <= budget:
+                                var rcm = sequences[ref_base + jm]
                                 var qcm = codes[q_base + jm]
                                 if rcm > 3 or qcm > 3 or rcm != qcm:
                                     nm += 1
@@ -891,7 +1134,9 @@ def map_fastq_dense_gpu_locate(
                                 best_ilen = 0
 
                         # Single indel only when this start fails gapless/softclip.
-                        # Restrict to adj==0 (voted locus) to keep kernel latency sane.
+                        # Restrict to adj==0 and a coarse g grid (step 4) — full
+                        # 0..qlen scan was O(qlen²) and dominated pass-0 latency;
+                        # seed-rescue still covers seed±8 for unmapped reads.
                         if (
                             indel_cap > 0
                             and adj == 0
@@ -906,33 +1151,13 @@ def map_fastq_dense_gpu_locate(
                                         var nm_d = dlen
                                         var t = 0
                                         while t < g and nm_d <= budget:
-                                            var rbd = sequences[ref_base + t]
-                                            var rcd: UInt8 = 255
-                                            if rbd == 65 or rbd == 97:
-                                                rcd = 0
-                                            elif rbd == 67 or rbd == 99:
-                                                rcd = 1
-                                            elif rbd == 71 or rbd == 103:
-                                                rcd = 2
-                                            elif rbd == 84 or rbd == 116:
-                                                rcd = 3
+                                            var rcd = sequences[ref_base + t]
                                             var qcd = codes[q_base + t]
                                             if rcd > 3 or qcd > 3 or rcd != qcd:
                                                 nm_d += 1
                                             t += 1
                                         while t < qlen and nm_d <= budget:
-                                            var rbd2 = sequences[
-                                                ref_base + t + dlen
-                                            ]
-                                            var rcd2: UInt8 = 255
-                                            if rbd2 == 65 or rbd2 == 97:
-                                                rcd2 = 0
-                                            elif rbd2 == 67 or rbd2 == 99:
-                                                rcd2 = 1
-                                            elif rbd2 == 71 or rbd2 == 103:
-                                                rcd2 = 2
-                                            elif rbd2 == 84 or rbd2 == 116:
-                                                rcd2 = 3
+                                            var rcd2 = sequences[ref_base + t + dlen]
                                             var qcd2 = codes[q_base + t]
                                             if (
                                                 rcd2 > 3
@@ -957,7 +1182,7 @@ def map_fastq_dense_gpu_locate(
                                             best_iop = 2
                                             best_iat = g
                                             best_ilen = dlen
-                                        g += 1
+                                        g += 4
 
                                 # Insertion of dlen query bases after offset g.
                                 if qlen > dlen and bstart + (qlen - dlen) <= clen:
@@ -966,16 +1191,7 @@ def map_fastq_dense_gpu_locate(
                                         var nm_i = dlen
                                         var ti = 0
                                         while ti < gi and nm_i <= budget:
-                                            var rbi = sequences[ref_base + ti]
-                                            var rci: UInt8 = 255
-                                            if rbi == 65 or rbi == 97:
-                                                rci = 0
-                                            elif rbi == 67 or rbi == 99:
-                                                rci = 1
-                                            elif rbi == 71 or rbi == 103:
-                                                rci = 2
-                                            elif rbi == 84 or rbi == 116:
-                                                rci = 3
+                                            var rci = sequences[ref_base + ti]
                                             var qci = codes[q_base + ti]
                                             if rci > 3 or qci > 3 or rci != qci:
                                                 nm_i += 1
@@ -983,16 +1199,7 @@ def map_fastq_dense_gpu_locate(
                                         var tj = gi + dlen
                                         var rj = gi
                                         while tj < qlen and nm_i <= budget:
-                                            var rbi2 = sequences[ref_base + rj]
-                                            var rci2: UInt8 = 255
-                                            if rbi2 == 65 or rbi2 == 97:
-                                                rci2 = 0
-                                            elif rbi2 == 67 or rbi2 == 99:
-                                                rci2 = 1
-                                            elif rbi2 == 71 or rbi2 == 103:
-                                                rci2 = 2
-                                            elif rbi2 == 84 or rbi2 == 116:
-                                                rci2 = 3
+                                            var rci2 = sequences[ref_base + rj]
                                             var qci2 = codes[q_base + tj]
                                             if (
                                                 rci2 > 3
@@ -1018,22 +1225,22 @@ def map_fastq_dense_gpu_locate(
                                             best_iop = 1
                                             best_iat = gi
                                             best_ilen = dlen
-                                        gi += 1
+                                        gi += 4
                                 dlen += 1
 
-                        # Exact hit — stop searching further adj / candidates.
                         if best_cost == 0:
                             break
-                        adj += 1
+                        adj_i += 1
 
                     if best_cost == 0:
                         break
                 pk += 1
 
             # Seed-rescue from rarest seeds.
-            # Pass 0: low-occ gapless/softclip/indel only.
+            # Pass 0: only when vote/KEEP left the read unmapped (already-mapped
+            # imperfect hits keep their vote locus — re-rescue was a major cost).
             # Pass 1: high-occ exact tally for still-unmapped reads.
-            if pass_mode == 1 or best_cid < 0 or best_cost > 0:
+            if pass_mode == 1 or best_cid < 0:
                 comptime HX = 48
                 var hx_key = InlineArray[UInt64, HX](fill=UInt64(0xFFFFFFFFFFFFFFFF))
                 var hx_n = InlineArray[Int32, HX](fill=Int32(0))
@@ -1085,16 +1292,7 @@ def map_fastq_dense_gpu_locate(
                                     var nm_h = 0
                                     var jh = 0
                                     while jh < qlen and nm_h == 0:
-                                        var rbh = sequences[ref_h + jh]
-                                        var rch: UInt8 = 255
-                                        if rbh == 65 or rbh == 97:
-                                            rch = 0
-                                        elif rbh == 67 or rbh == 99:
-                                            rch = 1
-                                        elif rbh == 71 or rbh == 103:
-                                            rch = 2
-                                        elif rbh == 84 or rbh == 116:
-                                            rch = 3
+                                        var rch = sequences[ref_h + jh]
                                         var qch = codes[q_base + jh]
                                         if rch > 3 or qch > 3 or rch != qch:
                                             nm_h = 1
@@ -1159,16 +1357,7 @@ def map_fastq_dense_gpu_locate(
                                 var nm_r = 0
                                 var jr = 0
                                 while jr < qlen and nm_r <= budget:
-                                    var rb = sequences[ref_r + jr]
-                                    var rc: UInt8 = 255
-                                    if rb == 65 or rb == 97:
-                                        rc = 0
-                                    elif rb == 67 or rb == 99:
-                                        rc = 1
-                                    elif rb == 71 or rb == 103:
-                                        rc = 2
-                                    elif rb == 84 or rb == 116:
-                                        rc = 3
+                                    var rc = sequences[ref_r + jr]
                                     var qc = codes[q_base + jr]
                                     if rc > 3 or qc > 3 or rc != qc:
                                         nm_r += 1
@@ -1184,16 +1373,7 @@ def map_fastq_dense_gpu_locate(
 
                                 if nm_r > budget and clip_cap > 0:
                                     while sl_r < clip_cap:
-                                        var rb0 = sequences[ref_r + sl_r]
-                                        var rc0: UInt8 = 255
-                                        if rb0 == 65 or rb0 == 97:
-                                            rc0 = 0
-                                        elif rb0 == 67 or rb0 == 99:
-                                            rc0 = 1
-                                        elif rb0 == 71 or rb0 == 103:
-                                            rc0 = 2
-                                        elif rb0 == 84 or rb0 == 116:
-                                            rc0 = 3
+                                        var rc0 = sequences[ref_r + sl_r]
                                         var qc0 = codes[q_base + sl_r]
                                         if rc0 <= 3 and qc0 <= 3 and rc0 == qc0:
                                             break
@@ -1202,33 +1382,15 @@ def map_fastq_dense_gpu_locate(
                                         var jrr = qlen - 1 - sr_r
                                         if jrr <= sl_r:
                                             break
-                                        var rb1 = sequences[ref_r + jrr]
-                                        var rc1: UInt8 = 255
-                                        if rb1 == 65 or rb1 == 97:
-                                            rc1 = 0
-                                        elif rb1 == 67 or rb1 == 99:
-                                            rc1 = 1
-                                        elif rb1 == 71 or rb1 == 103:
-                                            rc1 = 2
-                                        elif rb1 == 84 or rb1 == 116:
-                                            rc1 = 3
+                                        var rc1 = sequences[ref_r + jrr]
                                         var qc1 = codes[q_base + jrr]
                                         if rc1 <= 3 and qc1 <= 3 and rc1 == qc1:
                                             break
                                         sr_r += 1
                                     cost_r = 0
                                     var jm = sl_r
-                                    while jm < qlen - sr_r:
-                                        var rbm = sequences[ref_r + jm]
-                                        var rcm: UInt8 = 255
-                                        if rbm == 65 or rbm == 97:
-                                            rcm = 0
-                                        elif rbm == 67 or rbm == 99:
-                                            rcm = 1
-                                        elif rbm == 71 or rbm == 103:
-                                            rcm = 2
-                                        elif rbm == 84 or rbm == 116:
-                                            rcm = 3
+                                    while jm < qlen - sr_r and cost_r <= budget:
+                                        var rcm = sequences[ref_r + jm]
                                         var qcm = codes[q_base + jm]
                                         if rcm > 3 or qcm > 3 or rcm != qcm:
                                             cost_r += 1
@@ -1257,22 +1419,7 @@ def map_fastq_dense_gpu_locate(
                                                 var nm_d = dlen
                                                 var t = 0
                                                 while t < gg and nm_d <= budget:
-                                                    var rbd = sequences[
-                                                        ref_r + t
-                                                    ]
-                                                    var rcd: UInt8 = 255
-                                                    if rbd == 65 or rbd == 97:
-                                                        rcd = 0
-                                                    elif rbd == 67 or rbd == 99:
-                                                        rcd = 1
-                                                    elif (
-                                                        rbd == 71 or rbd == 103
-                                                    ):
-                                                        rcd = 2
-                                                    elif (
-                                                        rbd == 84 or rbd == 116
-                                                    ):
-                                                        rcd = 3
+                                                    var rcd = sequences[ref_r + t]
                                                     var qcd = codes[q_base + t]
                                                     if (
                                                         rcd > 3
@@ -1282,26 +1429,7 @@ def map_fastq_dense_gpu_locate(
                                                         nm_d += 1
                                                     t += 1
                                                 while t < qlen and nm_d <= budget:
-                                                    var rbd2 = sequences[
-                                                        ref_r + t + dlen
-                                                    ]
-                                                    var rcd2: UInt8 = 255
-                                                    if rbd2 == 65 or rbd2 == 97:
-                                                        rcd2 = 0
-                                                    elif (
-                                                        rbd2 == 67 or rbd2 == 99
-                                                    ):
-                                                        rcd2 = 1
-                                                    elif (
-                                                        rbd2 == 71
-                                                        or rbd2 == 103
-                                                    ):
-                                                        rcd2 = 2
-                                                    elif (
-                                                        rbd2 == 84
-                                                        or rbd2 == 116
-                                                    ):
-                                                        rcd2 = 3
+                                                    var rcd2 = sequences[ref_r + t + dlen]
                                                     var qcd2 = codes[q_base + t]
                                                     if (
                                                         rcd2 > 3
@@ -1338,22 +1466,7 @@ def map_fastq_dense_gpu_locate(
                                                 var nm_i = dlen
                                                 var ti = 0
                                                 while ti < gi and nm_i <= budget:
-                                                    var rbi = sequences[
-                                                        ref_r + ti
-                                                    ]
-                                                    var rci: UInt8 = 255
-                                                    if rbi == 65 or rbi == 97:
-                                                        rci = 0
-                                                    elif rbi == 67 or rbi == 99:
-                                                        rci = 1
-                                                    elif (
-                                                        rbi == 71 or rbi == 103
-                                                    ):
-                                                        rci = 2
-                                                    elif (
-                                                        rbi == 84 or rbi == 116
-                                                    ):
-                                                        rci = 3
+                                                    var rci = sequences[ref_r + ti]
                                                     var qci = codes[q_base + ti]
                                                     if (
                                                         rci > 3
@@ -1367,26 +1480,7 @@ def map_fastq_dense_gpu_locate(
                                                 while (
                                                     tj < qlen and nm_i <= budget
                                                 ):
-                                                    var rbi2 = sequences[
-                                                        ref_r + rj
-                                                    ]
-                                                    var rci2: UInt8 = 255
-                                                    if rbi2 == 65 or rbi2 == 97:
-                                                        rci2 = 0
-                                                    elif (
-                                                        rbi2 == 67 or rbi2 == 99
-                                                    ):
-                                                        rci2 = 1
-                                                    elif (
-                                                        rbi2 == 71
-                                                        or rbi2 == 103
-                                                    ):
-                                                        rci2 = 2
-                                                    elif (
-                                                        rbi2 == 84
-                                                        or rbi2 == 116
-                                                    ):
-                                                        rci2 = 3
+                                                    var rci2 = sequences[ref_r + rj]
                                                     var qci2 = codes[
                                                         q_base + tj
                                                     ]
@@ -1527,8 +1621,14 @@ def map_fastq_dense_gpu_locate(
         ):
             raise Error("MojoLinear GPU-full: mmap smaller than expected tables")
 
+        # +seq_bytes for packed 2-bit ref codes used by vote/extend.
         var science = (
-            kmers_bytes + offsets_bytes + postings_bytes + seq_bytes + coff_bytes
+            kmers_bytes
+            + offsets_bytes
+            + postings_bytes
+            + seq_bytes
+            + seq_bytes
+            + coff_bytes
         )
         _require_hbm(science, resolved)
         print(
@@ -1585,6 +1685,16 @@ def map_fastq_dense_gpu_locate(
             coff_bytes,
             "contig_offsets",
         )
+        # Pack reference ASCII→2-bit once; vote/extend compares codes not ACGT.
+        var dev_ref_codes = ctx.enqueue_create_buffer[DType.uint8](seq_bytes)
+        ctx.enqueue_function[pack_bases_kernel](
+            dev_seq.unsafe_ptr(),
+            dev_ref_codes.unsafe_ptr(),
+            seq_bytes,
+            grid_dim=(seq_bytes + 255) // 256,
+            block_dim=256,
+        )
+        ctx.synchronize()
         print("MojoLinear GPU-full index resident ok")
         var t_upload1 = time_mod.perf_counter()
         print(
@@ -1616,6 +1726,9 @@ def map_fastq_dense_gpu_locate(
         # Majority-vote only uses seeds at or below vote_occ; higher-occ seeds
         # from locate are exact-only rescue candidates.
         var vote_occ = _env_int("METHYLGRAPHER_LINEAR_VOTE_OCC", 256)
+        # Fast pass-0 cap: most reads map from rare seeds. Full vote_occ runs
+        # only on the compacted unmapped set (recovers medium-occ inexact hits).
+        var vote_fast = _env_int("METHYLGRAPHER_LINEAR_VOTE_OCC_FAST", vote_occ)
         # ~4% mismatches + end soft-clip — closes most of the exact-only map gap.
         var max_diff = _env_int("METHYLGRAPHER_LINEAR_MAX_DIFF", 6)
         var max_soft = _env_int("METHYLGRAPHER_LINEAR_MAX_SOFT", 8)
@@ -1626,10 +1739,23 @@ def map_fastq_dense_gpu_locate(
         # for experiments.
         var rc_raw = _env_str("METHYLGRAPHER_LINEAR_RC", "1").lower()
         var do_rc = not (rc_raw == "0" or rc_raw == "false" or rc_raw == "no")
+        var prof_raw = _env_str("METHYLGRAPHER_LINEAR_PROFILE", "0").lower()
+        var do_profile = (
+            prof_raw == "1" or prof_raw == "true" or prof_raw == "yes"
+        )
         var n_mapped = 0
         var n_reads = 0
         var n_batches = 0
         comptime BLOCK = 256
+        # Profile accumulators (seconds); only updated when do_profile.
+        var t_fw_loc = time_mod.perf_counter() * 0.0
+        var t_fw_v0 = time_mod.perf_counter() * 0.0
+        var t_fw_v1 = time_mod.perf_counter() * 0.0
+        var t_rc_loc = time_mod.perf_counter() * 0.0
+        var t_rc_v0 = time_mod.perf_counter() * 0.0
+        var t_rc_v1 = time_mod.perf_counter() * 0.0
+        var t_d2h = time_mod.perf_counter() * 0.0
+        var t_emit = time_mod.perf_counter() * 0.0
 
         print(
             "MojoLinear GPU-full map start batch=",
@@ -1640,6 +1766,8 @@ def map_fastq_dense_gpu_locate(
             max_occ,
             " vote_occ=",
             vote_occ,
+            " vote_fast=",
+            vote_fast,
             " max_diff=",
             max_diff,
             " max_soft=",
@@ -1651,6 +1779,10 @@ def map_fastq_dense_gpu_locate(
             " paired=",
             paired,
             " prefetch_overlap=1",
+            " rc_compact=1",
+            " skip_rc_if_fw=0",
+            " profile=",
+            do_profile,
         )
         var t_map0 = time_mod.perf_counter()
 
@@ -1670,6 +1802,30 @@ def map_fastq_dense_gpu_locate(
         var n_slots = 0
         var n_bases = 0
         var need_pack = True
+        # Deferred SAM emit: format previous batch while current pass-0 runs.
+        var pend_emit = False
+        var pend_b1 = List[FastqRec]()
+        var pend_b2 = List[FastqRec]()
+        var pend_cid_f = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var pend_pos_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_mapq_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_flag_f = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var pend_sl_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_sr_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_nm_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_iop_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_iat_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_ilen_f = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_cid_r = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var pend_pos_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_mapq_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_flag_r = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var pend_sl_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_sr_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_nm_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_iop_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_iat_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var pend_ilen_r = ctx.enqueue_create_host_buffer[DType.uint32](1)
 
         while len(batch1) > 0:
             if need_pack:
@@ -1772,6 +1928,10 @@ def map_fastq_dense_gpu_locate(
             var grid_r = (n_seq + BLOCK - 1) // BLOCK
 
             # Forward strand
+            var tp0 = time_mod.perf_counter()
+            if do_profile:
+                ctx.synchronize()
+                tp0 = time_mod.perf_counter()
             ctx.enqueue_function[encode_strided_kernel](
                 dev_codes.unsafe_ptr(),
                 dev_keys.unsafe_ptr(),
@@ -1811,20 +1971,28 @@ def map_fastq_dense_gpu_locate(
                     grid_dim=grid_s,
                     block_dim=BLOCK,
                 )
+            if do_profile:
+                ctx.synchronize()
+                t_fw_loc += time_mod.perf_counter() - tp0
+                tp0 = time_mod.perf_counter()
             # Dummy rid_map for full-batch (n_active < 0) launches.
             var host_rid_dummy = ctx.enqueue_create_host_buffer[DType.int32](1)
             host_rid_dummy[0] = Int32(0)
             var dev_rid_dummy = ctx.enqueue_create_buffer[DType.int32](1)
             ctx.enqueue_copy(src_buf=host_rid_dummy, dst_buf=dev_rid_dummy)
 
-            # Pass 0 FW: vote + low-occ rescue (fast path, full batch).
+            var dummy_lane_key = ctx.enqueue_create_buffer[DType.uint64](1)
+            var dummy_lane_n = ctx.enqueue_create_buffer[DType.int32](1)
+            var dummy_lane_nc = ctx.enqueue_create_buffer[DType.int32](1)
+
+            # Pass 0 FW: rare-seed vote (vote_fast). Medium-occ vote is compacted.
             ctx.enqueue_function[vote_extend_kernel](
                 dev_start.unsafe_ptr(),
                 dev_end.unsafe_ptr(),
                 dev_qoff.unsafe_ptr(),
                 dev_postings.unsafe_ptr(),
                 n_post,
-                dev_seq.unsafe_ptr(),
+                dev_ref_codes.unsafe_ptr(),
                 dev_coff.unsafe_ptr(),
                 n_contigs,
                 dev_codes.unsafe_ptr(),
@@ -1835,10 +2003,13 @@ def map_fastq_dense_gpu_locate(
                 max_diff,
                 max_soft,
                 max_indel,
-                vote_occ,
+                vote_fast,
                 0,
                 -1,
                 dev_rid_dummy.unsafe_ptr(),
+                dummy_lane_key.unsafe_ptr(),
+                dummy_lane_n.unsafe_ptr(),
+                dummy_lane_nc.unsafe_ptr(),
                 Int32(0),
                 dev_cid_f.unsafe_ptr(),
                 dev_pos_f.unsafe_ptr(),
@@ -1916,6 +2087,125 @@ def map_fastq_dense_gpu_locate(
                     nsi += 1
                 next_ready = True
 
+            # Overlap: emit previous batch SAM while this batch's pass-0 runs.
+            if pend_emit:
+                var pn1 = len(pend_b1)
+                var pj = 0
+                while pj < pn1:
+                    var use_rc = False
+                    var f_cid = Int(pend_cid_f[pj])
+                    var r_cid = Int(pend_cid_r[pj])
+                    if f_cid < 0 and r_cid >= 0:
+                        use_rc = True
+                    elif f_cid >= 0 and r_cid >= 0:
+                        var fnm = Int(pend_nm_f[pj])
+                        var rnm = Int(pend_nm_r[pj])
+                        if rnm < fnm or (
+                            rnm == fnm
+                            and Int(pend_mapq_r[pj]) > Int(pend_mapq_f[pj])
+                        ):
+                            use_rc = True
+                    var h1: LinearHit
+                    if use_rc:
+                        h1 = _hit_from_gpu(
+                            index,
+                            pend_b1[pj].name,
+                            pend_b1[pj].seq,
+                            pend_b1[pj].original_seq,
+                            r_cid,
+                            Int(pend_pos_r[pj]),
+                            Int(pend_mapq_r[pj]),
+                            Int(pend_flag_r[pj]),
+                            Int(pend_sl_r[pj]),
+                            Int(pend_sr_r[pj]),
+                            Int(pend_iop_r[pj]),
+                            Int(pend_iat_r[pj]),
+                            Int(pend_ilen_r[pj]),
+                        )
+                    else:
+                        h1 = _hit_from_gpu(
+                            index,
+                            pend_b1[pj].name,
+                            pend_b1[pj].seq,
+                            pend_b1[pj].original_seq,
+                            f_cid,
+                            Int(pend_pos_f[pj]),
+                            Int(pend_mapq_f[pj]),
+                            Int(pend_flag_f[pj]),
+                            Int(pend_sl_f[pj]),
+                            Int(pend_sr_f[pj]),
+                            Int(pend_iop_f[pj]),
+                            Int(pend_iat_f[pj]),
+                            Int(pend_ilen_f[pj]),
+                        )
+                    h1.qual = pend_b1[pj].qual
+                    if not paired:
+                        if h1.contig != "*":
+                            n_mapped += 1
+                        fh.write(_sam_with_rg(h1) + "\n")
+                        n_reads += 1
+                    else:
+                        var r2i = pn1 + pj
+                        var use_rc2 = False
+                        var f2 = Int(pend_cid_f[r2i])
+                        var r2 = Int(pend_cid_r[r2i])
+                        if f2 < 0 and r2 >= 0:
+                            use_rc2 = True
+                        elif f2 >= 0 and r2 >= 0:
+                            var fnm2 = Int(pend_nm_f[r2i])
+                            var rnm2 = Int(pend_nm_r[r2i])
+                            if rnm2 < fnm2 or (
+                                rnm2 == fnm2
+                                and Int(pend_mapq_r[r2i]) > Int(pend_mapq_f[r2i])
+                            ):
+                                use_rc2 = True
+                        var h2: LinearHit
+                        if use_rc2:
+                            h2 = _hit_from_gpu(
+                                index,
+                                pend_b2[pj].name,
+                                pend_b2[pj].seq,
+                                pend_b2[pj].original_seq,
+                                r2,
+                                Int(pend_pos_r[r2i]),
+                                Int(pend_mapq_r[r2i]),
+                                Int(pend_flag_r[r2i]),
+                                Int(pend_sl_r[r2i]),
+                                Int(pend_sr_r[r2i]),
+                                Int(pend_iop_r[r2i]),
+                                Int(pend_iat_r[r2i]),
+                                Int(pend_ilen_r[r2i]),
+                            )
+                        else:
+                            h2 = _hit_from_gpu(
+                                index,
+                                pend_b2[pj].name,
+                                pend_b2[pj].seq,
+                                pend_b2[pj].original_seq,
+                                f2,
+                                Int(pend_pos_f[r2i]),
+                                Int(pend_mapq_f[r2i]),
+                                Int(pend_flag_f[r2i]),
+                                Int(pend_sl_f[r2i]),
+                                Int(pend_sr_f[r2i]),
+                                Int(pend_iop_f[r2i]),
+                                Int(pend_iat_f[r2i]),
+                                Int(pend_ilen_f[r2i]),
+                            )
+                        h2.qual = pend_b2[pj].qual
+                        var paired_hits = pair_hits(h1, h2)
+                        var p1 = paired_hits.r1.copy()
+                        var p2 = paired_hits.r2.copy()
+                        if p1.contig != "*":
+                            n_mapped += 1
+                        if p2.contig != "*":
+                            n_mapped += 1
+                        fh.write(_sam_with_rg(p1) + "\n")
+                        fh.write(_sam_with_rg(p2) + "\n")
+                        n_reads += 2
+                    pj += 1
+                pend_emit = False
+
             # Compact still-unmapped → Pass 1 high-occ (avoids warp divergence).
             # Pull cid+nm together so RC can reuse this snapshot when pass-1 is a no-op
             # (saves a second host sync on most batches).
@@ -1924,6 +2214,9 @@ def map_fastq_dense_gpu_locate(
             ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_fw)
             ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_fw)
             ctx.synchronize()
+            if do_profile:
+                t_fw_v0 += time_mod.perf_counter() - tp0
+                tp0 = time_mod.perf_counter()
             var n_unmap_f = 0
             var ui = 0
             while ui < n_seq:
@@ -1945,42 +2238,108 @@ def map_fastq_dense_gpu_locate(
                 var dev_rid_f = ctx.enqueue_create_buffer[DType.int32](n_unmap_f)
                 ctx.enqueue_copy(src_buf=host_rid_f, dst_buf=dev_rid_f)
                 var grid_u = (n_unmap_f + BLOCK - 1) // BLOCK
-                ctx.enqueue_function[vote_extend_kernel](
-                    dev_start.unsafe_ptr(),
-                    dev_end.unsafe_ptr(),
-                    dev_qoff.unsafe_ptr(),
-                    dev_postings.unsafe_ptr(),
-                    n_post,
-                    dev_seq.unsafe_ptr(),
-                    dev_coff.unsafe_ptr(),
-                    n_contigs,
-                    dev_codes.unsafe_ptr(),
-                    dev_lens.unsafe_ptr(),
-                    max_len,
-                    slots_per,
-                    n_seq,
-                    max_diff,
-                    max_soft,
-                    max_indel,
-                    vote_occ,
-                    1,
-                    n_unmap_f,
-                    dev_rid_f.unsafe_ptr(),
-                    Int32(0),
-                    dev_cid_f.unsafe_ptr(),
-                    dev_pos_f.unsafe_ptr(),
-                    dev_mapq_f.unsafe_ptr(),
-                    dev_flag_f.unsafe_ptr(),
-                    dev_sl_f.unsafe_ptr(),
-                    dev_sr_f.unsafe_ptr(),
-                    dev_nm_f.unsafe_ptr(),
-                    dev_iop_f.unsafe_ptr(),
-                    dev_iat_f.unsafe_ptr(),
-                    dev_ilen_f.unsafe_ptr(),
-                    grid_dim=grid_u,
-                    block_dim=BLOCK,
-                )
+                if vote_fast < vote_occ:
+                    ctx.enqueue_function[vote_extend_kernel](
+                        dev_start.unsafe_ptr(),
+                        dev_end.unsafe_ptr(),
+                        dev_qoff.unsafe_ptr(),
+                        dev_postings.unsafe_ptr(),
+                        n_post,
+                        dev_ref_codes.unsafe_ptr(),
+                        dev_coff.unsafe_ptr(),
+                        n_contigs,
+                        dev_codes.unsafe_ptr(),
+                        dev_lens.unsafe_ptr(),
+                        max_len,
+                        slots_per,
+                        n_seq,
+                        max_diff,
+                        max_soft,
+                        max_indel,
+                        vote_occ,
+                        0,
+                        n_unmap_f,
+                        dev_rid_f.unsafe_ptr(),
+                        dummy_lane_key.unsafe_ptr(),
+                        dummy_lane_n.unsafe_ptr(),
+                        dummy_lane_nc.unsafe_ptr(),
+                        Int32(0),
+                        dev_cid_f.unsafe_ptr(),
+                        dev_pos_f.unsafe_ptr(),
+                        dev_mapq_f.unsafe_ptr(),
+                        dev_flag_f.unsafe_ptr(),
+                        dev_sl_f.unsafe_ptr(),
+                        dev_sr_f.unsafe_ptr(),
+                        dev_nm_f.unsafe_ptr(),
+                        dev_iop_f.unsafe_ptr(),
+                        dev_iat_f.unsafe_ptr(),
+                        dev_ilen_f.unsafe_ptr(),
+                        grid_dim=grid_u,
+                        block_dim=BLOCK,
+                    )
+                    ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_fw)
+                    ctx.synchronize()
+                    n_unmap_f = 0
+                    ui = 0
+                    while ui < n_seq:
+                        if Int(host_cid_fw[ui]) < 0:
+                            n_unmap_f += 1
+                        ui += 1
+                    if n_unmap_f > 0:
+                        w = 0
+                        ui = 0
+                        while ui < n_seq:
+                            if Int(host_cid_fw[ui]) < 0:
+                                host_rid_f[w] = Int32(ui)
+                                w += 1
+                            ui += 1
+                        ctx.enqueue_copy(src_buf=host_rid_f, dst_buf=dev_rid_f)
+                        grid_u = (n_unmap_f + BLOCK - 1) // BLOCK
+                if n_unmap_f > 0:
+                    ctx.enqueue_function[vote_extend_kernel](
+                        dev_start.unsafe_ptr(),
+                        dev_end.unsafe_ptr(),
+                        dev_qoff.unsafe_ptr(),
+                        dev_postings.unsafe_ptr(),
+                        n_post,
+                        dev_ref_codes.unsafe_ptr(),
+                        dev_coff.unsafe_ptr(),
+                        n_contigs,
+                        dev_codes.unsafe_ptr(),
+                        dev_lens.unsafe_ptr(),
+                        max_len,
+                        slots_per,
+                        n_seq,
+                        max_diff,
+                        max_soft,
+                        max_indel,
+                        vote_occ,
+                        1,
+                        n_unmap_f,
+                        dev_rid_f.unsafe_ptr(),
+                        dummy_lane_key.unsafe_ptr(),
+                        dummy_lane_n.unsafe_ptr(),
+                        dummy_lane_nc.unsafe_ptr(),
+                        Int32(0),
+                        dev_cid_f.unsafe_ptr(),
+                        dev_pos_f.unsafe_ptr(),
+                        dev_mapq_f.unsafe_ptr(),
+                        dev_flag_f.unsafe_ptr(),
+                        dev_sl_f.unsafe_ptr(),
+                        dev_sr_f.unsafe_ptr(),
+                        dev_nm_f.unsafe_ptr(),
+                        dev_iop_f.unsafe_ptr(),
+                        dev_iat_f.unsafe_ptr(),
+                        dev_ilen_f.unsafe_ptr(),
+                        grid_dim=grid_u,
+                        block_dim=BLOCK,
+                    )
                 ran_pass1_f = True
+            if do_profile:
+                if ran_pass1_f:
+                    ctx.synchronize()
+                t_fw_v1 += time_mod.perf_counter() - tp0
+                tp0 = time_mod.perf_counter()
 
             if do_rc:
                 # Refresh FW hits only if pass-1 may have filled some unmapped.
@@ -2029,65 +2388,77 @@ def map_fastq_dense_gpu_locate(
                     )
                     ctx.enqueue_copy(src_buf=host_rid_rc, dst_buf=dev_rid_rc)
                     var grid_rc = (n_need_rc + BLOCK - 1) // BLOCK
+                    var n_rc_slots = n_need_rc * slots_per
+                    var grid_rc_s = (n_rc_slots + BLOCK - 1) // BLOCK
 
-                    # Reverse strand locate still full-batch (slot layout); extend
-                    # runs only on need_rc via rid_map.
-                    ctx.enqueue_function[rc_codes_kernel](
+                    # Compact RC encode+locate+extend to need_rc only (same
+                    # dense slot layout; skipped exact-FW reads untouched).
+                    ctx.enqueue_function[rc_codes_compact_kernel](
                         dev_codes.unsafe_ptr(),
                         dev_rc.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        n_seq,
+                        n_need_rc,
+                        dev_rid_rc.unsafe_ptr(),
                         max_len,
-                        grid_dim=grid_r,
+                        grid_dim=grid_rc,
                         block_dim=BLOCK,
                     )
-                    ctx.enqueue_function[encode_strided_kernel](
+                    ctx.enqueue_function[encode_strided_compact_kernel](
                         dev_rc.unsafe_ptr(),
                         dev_keys.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        n_seq,
+                        n_need_rc,
+                        dev_rid_rc.unsafe_ptr(),
                         max_len,
                         k_len,
                         seed_stride,
                         slots_per,
-                        grid_dim=grid_s,
+                        grid_dim=grid_rc_s,
                         block_dim=BLOCK,
                     )
                     if use_interp:
-                        ctx.enqueue_function[locate_interp_kernel](
+                        ctx.enqueue_function[locate_interp_compact_kernel](
                             dev_keys.unsafe_ptr(),
                             dev_kmers.unsafe_ptr(),
                             dev_offsets.unsafe_ptr(),
                             dev_start.unsafe_ptr(),
                             dev_end.unsafe_ptr(),
-                            n_slots,
+                            n_need_rc,
+                            dev_rid_rc.unsafe_ptr(),
+                            slots_per,
                             n_table,
                             max_occ,
-                            grid_dim=grid_s,
+                            grid_dim=grid_rc_s,
                             block_dim=BLOCK,
                         )
                     else:
-                        ctx.enqueue_function[locate_bsearch_kernel](
+                        ctx.enqueue_function[locate_bsearch_compact_kernel](
                             dev_keys.unsafe_ptr(),
                             dev_kmers.unsafe_ptr(),
                             dev_offsets.unsafe_ptr(),
                             dev_start.unsafe_ptr(),
                             dev_end.unsafe_ptr(),
-                            n_slots,
+                            n_need_rc,
+                            dev_rid_rc.unsafe_ptr(),
+                            slots_per,
                             n_table,
                             max_occ,
-                            grid_dim=grid_s,
+                            grid_dim=grid_rc_s,
                             block_dim=BLOCK,
                         )
-                    # Pass 0 RC on need_rc only.
+                    if do_profile:
+                        ctx.synchronize()
+                        t_rc_loc += time_mod.perf_counter() - tp0
+                        tp0 = time_mod.perf_counter()
+                    # Pass 0 RC: rare-seed vote (vote_fast) on need_rc.
                     ctx.enqueue_function[vote_extend_kernel](
                         dev_start.unsafe_ptr(),
                         dev_end.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_postings.unsafe_ptr(),
                         n_post,
-                        dev_seq.unsafe_ptr(),
+                        dev_ref_codes.unsafe_ptr(),
                         dev_coff.unsafe_ptr(),
                         n_contigs,
                         dev_rc.unsafe_ptr(),
@@ -2098,10 +2469,13 @@ def map_fastq_dense_gpu_locate(
                         max_diff,
                         max_soft,
                         max_indel,
-                        vote_occ,
+                        vote_fast,
                         0,
                         n_need_rc,
                         dev_rid_rc.unsafe_ptr(),
+                        dummy_lane_key.unsafe_ptr(),
+                        dummy_lane_n.unsafe_ptr(),
+                        dummy_lane_nc.unsafe_ptr(),
                         Int32(16),
                         dev_cid_r.unsafe_ptr(),
                         dev_pos_r.unsafe_ptr(),
@@ -2124,6 +2498,9 @@ def map_fastq_dense_gpu_locate(
                         src_buf=dev_cid_r, dst_buf=host_cid_r_compact
                     )
                     ctx.synchronize()
+                    if do_profile:
+                        t_rc_v0 += time_mod.perf_counter() - tp0
+                        tp0 = time_mod.perf_counter()
                     var n_unmap_r = 0
                     var uir = 0
                     while uir < n_need_rc:
@@ -2148,41 +2525,112 @@ def map_fastq_dense_gpu_locate(
                         )
                         ctx.enqueue_copy(src_buf=host_rid_r, dst_buf=dev_rid_r)
                         var grid_ur = (n_unmap_r + BLOCK - 1) // BLOCK
-                        ctx.enqueue_function[vote_extend_kernel](
-                            dev_start.unsafe_ptr(),
-                            dev_end.unsafe_ptr(),
-                            dev_qoff.unsafe_ptr(),
-                            dev_postings.unsafe_ptr(),
-                            n_post,
-                            dev_seq.unsafe_ptr(),
-                            dev_coff.unsafe_ptr(),
-                            n_contigs,
-                            dev_rc.unsafe_ptr(),
-                            dev_lens.unsafe_ptr(),
-                            max_len,
-                            slots_per,
-                            n_seq,
-                            max_diff,
-                            max_soft,
-                            max_indel,
-                            vote_occ,
-                            1,
-                            n_unmap_r,
-                            dev_rid_r.unsafe_ptr(),
-                            Int32(16),
-                            dev_cid_r.unsafe_ptr(),
-                            dev_pos_r.unsafe_ptr(),
-                            dev_mapq_r.unsafe_ptr(),
-                            dev_flag_r.unsafe_ptr(),
-                            dev_sl_r.unsafe_ptr(),
-                            dev_sr_r.unsafe_ptr(),
-                            dev_nm_r.unsafe_ptr(),
-                            dev_iop_r.unsafe_ptr(),
-                            dev_iat_r.unsafe_ptr(),
-                            dev_ilen_r.unsafe_ptr(),
-                            grid_dim=grid_ur,
-                            block_dim=BLOCK,
-                        )
+                        if vote_fast < vote_occ:
+                            ctx.enqueue_function[vote_extend_kernel](
+                                dev_start.unsafe_ptr(),
+                                dev_end.unsafe_ptr(),
+                                dev_qoff.unsafe_ptr(),
+                                dev_postings.unsafe_ptr(),
+                                n_post,
+                                dev_ref_codes.unsafe_ptr(),
+                                dev_coff.unsafe_ptr(),
+                                n_contigs,
+                                dev_rc.unsafe_ptr(),
+                                dev_lens.unsafe_ptr(),
+                                max_len,
+                                slots_per,
+                                n_seq,
+                                max_diff,
+                                max_soft,
+                                max_indel,
+                                vote_occ,
+                                0,
+                                n_unmap_r,
+                                dev_rid_r.unsafe_ptr(),
+                                dummy_lane_key.unsafe_ptr(),
+                                dummy_lane_n.unsafe_ptr(),
+                                dummy_lane_nc.unsafe_ptr(),
+                                Int32(16),
+                                dev_cid_r.unsafe_ptr(),
+                                dev_pos_r.unsafe_ptr(),
+                                dev_mapq_r.unsafe_ptr(),
+                                dev_flag_r.unsafe_ptr(),
+                                dev_sl_r.unsafe_ptr(),
+                                dev_sr_r.unsafe_ptr(),
+                                dev_nm_r.unsafe_ptr(),
+                                dev_iop_r.unsafe_ptr(),
+                                dev_iat_r.unsafe_ptr(),
+                                dev_ilen_r.unsafe_ptr(),
+                                grid_dim=grid_ur,
+                                block_dim=BLOCK,
+                            )
+                            ctx.enqueue_copy(
+                                src_buf=dev_cid_r, dst_buf=host_cid_r_compact
+                            )
+                            ctx.synchronize()
+                            n_unmap_r = 0
+                            uir = 0
+                            while uir < n_need_rc:
+                                var rr3 = Int(host_rid_rc[uir])
+                                if Int(host_cid_r_compact[rr3]) < 0:
+                                    n_unmap_r += 1
+                                uir += 1
+                            if n_unmap_r > 0:
+                                wr = 0
+                                uir = 0
+                                while uir < n_need_rc:
+                                    var rr4 = Int(host_rid_rc[uir])
+                                    if Int(host_cid_r_compact[rr4]) < 0:
+                                        host_rid_r[wr] = Int32(rr4)
+                                        wr += 1
+                                    uir += 1
+                                ctx.enqueue_copy(
+                                    src_buf=host_rid_r, dst_buf=dev_rid_r
+                                )
+                                grid_ur = (n_unmap_r + BLOCK - 1) // BLOCK
+                        if n_unmap_r > 0:
+                            ctx.enqueue_function[vote_extend_kernel](
+                                dev_start.unsafe_ptr(),
+                                dev_end.unsafe_ptr(),
+                                dev_qoff.unsafe_ptr(),
+                                dev_postings.unsafe_ptr(),
+                                n_post,
+                                dev_ref_codes.unsafe_ptr(),
+                                dev_coff.unsafe_ptr(),
+                                n_contigs,
+                                dev_rc.unsafe_ptr(),
+                                dev_lens.unsafe_ptr(),
+                                max_len,
+                                slots_per,
+                                n_seq,
+                                max_diff,
+                                max_soft,
+                                max_indel,
+                                vote_occ,
+                                1,
+                                n_unmap_r,
+                                dev_rid_r.unsafe_ptr(),
+                                dummy_lane_key.unsafe_ptr(),
+                                dummy_lane_n.unsafe_ptr(),
+                                dummy_lane_nc.unsafe_ptr(),
+                                Int32(16),
+                                dev_cid_r.unsafe_ptr(),
+                                dev_pos_r.unsafe_ptr(),
+                                dev_mapq_r.unsafe_ptr(),
+                                dev_flag_r.unsafe_ptr(),
+                                dev_sl_r.unsafe_ptr(),
+                                dev_sr_r.unsafe_ptr(),
+                                dev_nm_r.unsafe_ptr(),
+                                dev_iop_r.unsafe_ptr(),
+                                dev_iat_r.unsafe_ptr(),
+                                dev_ilen_r.unsafe_ptr(),
+                                grid_dim=grid_ur,
+                                block_dim=BLOCK,
+                            )
+                    if do_profile:
+                        ctx.synchronize()
+                        t_rc_v1 += time_mod.perf_counter() - tp0
+                        tp0 = time_mod.perf_counter()
             else:
                 # Mark RC outputs unmapped so host merge keeps FW hits.
                 var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
@@ -2194,6 +2642,8 @@ def map_fastq_dense_gpu_locate(
                     zi += 1
                 ctx.enqueue_copy(src_buf=host_cid_r_init, dst_buf=dev_cid_r)
 
+            if do_profile:
+                tp0 = time_mod.perf_counter()
             var host_cid_f = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
             var host_pos_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_mapq_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
@@ -2235,132 +2685,44 @@ def map_fastq_dense_gpu_locate(
             ctx.enqueue_copy(src_buf=dev_iat_r, dst_buf=host_iat_r)
             ctx.enqueue_copy(src_buf=dev_ilen_r, dst_buf=host_ilen_r)
             ctx.synchronize()
+            if do_profile:
+                t_d2h += time_mod.perf_counter() - tp0
 
-            var n1 = len(batch1)
-            var j = 0
-            while j < n1:
-                # Prefer lower NM, then higher mapq; FW vs RC.
-                var use_rc = False
-                var f_cid = Int(host_cid_f[j])
-                var r_cid = Int(host_cid_r[j])
-                if f_cid < 0 and r_cid >= 0:
-                    use_rc = True
-                elif f_cid >= 0 and r_cid >= 0:
-                    var fnm = Int(host_nm_f[j])
-                    var rnm = Int(host_nm_r[j])
-                    if rnm < fnm or (
-                        rnm == fnm and Int(host_mapq_r[j]) > Int(host_mapq_f[j])
-                    ):
-                        use_rc = True
-                var h1: LinearHit
-                if use_rc:
-                    h1 = _hit_from_gpu(
-                        index,
-                        batch1[j].name,
-                        batch1[j].seq,
-                        batch1[j].original_seq,
-                        r_cid,
-                        Int(host_pos_r[j]),
-                        Int(host_mapq_r[j]),
-                        Int(host_flag_r[j]),
-                        Int(host_sl_r[j]),
-                        Int(host_sr_r[j]),
-                        Int(host_iop_r[j]),
-                        Int(host_iat_r[j]),
-                        Int(host_ilen_r[j]),
-                    )
-                else:
-                    h1 = _hit_from_gpu(
-                        index,
-                        batch1[j].name,
-                        batch1[j].seq,
-                        batch1[j].original_seq,
-                        f_cid,
-                        Int(host_pos_f[j]),
-                        Int(host_mapq_f[j]),
-                        Int(host_flag_f[j]),
-                        Int(host_sl_f[j]),
-                        Int(host_sr_f[j]),
-                        Int(host_iop_f[j]),
-                        Int(host_iat_f[j]),
-                        Int(host_ilen_f[j]),
-                    )
-                h1.qual = batch1[j].qual
-                if not paired:
-                    if h1.contig != "*":
-                        n_mapped += 1
-                    fh.write(_sam_with_rg(h1) + "\n")
-                    n_reads += 1
-                else:
-                    var r2i = n1 + j
-                    var use_rc2 = False
-                    var f2 = Int(host_cid_f[r2i])
-                    var r2 = Int(host_cid_r[r2i])
-                    if f2 < 0 and r2 >= 0:
-                        use_rc2 = True
-                    elif f2 >= 0 and r2 >= 0:
-                        var fnm2 = Int(host_nm_f[r2i])
-                        var rnm2 = Int(host_nm_r[r2i])
-                        if rnm2 < fnm2 or (
-                            rnm2 == fnm2
-                            and Int(host_mapq_r[r2i]) > Int(host_mapq_f[r2i])
-                        ):
-                            use_rc2 = True
-                    var h2: LinearHit
-                    if use_rc2:
-                        h2 = _hit_from_gpu(
-                            index,
-                            batch2[j].name,
-                            batch2[j].seq,
-                            batch2[j].original_seq,
-                            r2,
-                            Int(host_pos_r[r2i]),
-                            Int(host_mapq_r[r2i]),
-                            Int(host_flag_r[r2i]),
-                            Int(host_sl_r[r2i]),
-                            Int(host_sr_r[r2i]),
-                            Int(host_iop_r[r2i]),
-                            Int(host_iat_r[r2i]),
-                            Int(host_ilen_r[r2i]),
-                        )
-                    else:
-                        h2 = _hit_from_gpu(
-                            index,
-                            batch2[j].name,
-                            batch2[j].seq,
-                            batch2[j].original_seq,
-                            f2,
-                            Int(host_pos_f[r2i]),
-                            Int(host_mapq_f[r2i]),
-                            Int(host_flag_f[r2i]),
-                            Int(host_sl_f[r2i]),
-                            Int(host_sr_f[r2i]),
-                            Int(host_iop_f[r2i]),
-                            Int(host_iat_f[r2i]),
-                            Int(host_ilen_f[r2i]),
-                        )
-                    h2.qual = batch2[j].qual
-                    var paired_hits = pair_hits(h1, h2)
-                    var p1 = paired_hits.r1.copy()
-                    var p2 = paired_hits.r2.copy()
-                    if p1.contig != "*":
-                        n_mapped += 1
-                    if p2.contig != "*":
-                        n_mapped += 1
-                    fh.write(_sam_with_rg(p1) + "\n")
-                    fh.write(_sam_with_rg(p2) + "\n")
-                    n_reads += 2
-                j += 1
+            # Stash hits for SAM emit overlapped with the next batch's pass-0.
+            pend_b1 = batch1^
+            pend_b2 = batch2^
+            pend_cid_f = host_cid_f^
+            pend_pos_f = host_pos_f^
+            pend_mapq_f = host_mapq_f^
+            pend_flag_f = host_flag_f^
+            pend_sl_f = host_sl_f^
+            pend_sr_f = host_sr_f^
+            pend_nm_f = host_nm_f^
+            pend_iop_f = host_iop_f^
+            pend_iat_f = host_iat_f^
+            pend_ilen_f = host_ilen_f^
+            pend_cid_r = host_cid_r^
+            pend_pos_r = host_pos_r^
+            pend_mapq_r = host_mapq_r^
+            pend_flag_r = host_flag_r^
+            pend_sl_r = host_sl_r^
+            pend_sr_r = host_sr_r^
+            pend_nm_r = host_nm_r^
+            pend_iop_r = host_iop_r^
+            pend_iat_r = host_iat_r^
+            pend_ilen_r = host_ilen_r^
+            pend_emit = True
 
             n_batches += 1
             if n_batches == 1 or n_batches % 5 == 0:
+                var ends = 2
+                if not paired:
+                    ends = 1
                 print(
                     "MojoLinear GPU-full progress batches=",
                     n_batches,
-                    " reads=",
-                    n_reads,
-                    " mapped=",
-                    n_mapped,
+                    " gpu_reads≈",
+                    n_batches * batch_size * ends,
                 )
                 try:
                     fh.flush()
@@ -2384,6 +2746,123 @@ def map_fastq_dense_gpu_locate(
                 batch2 = List[FastqRec]()
                 need_pack = True
 
+        # Final deferred SAM emit (last batch had no successor pass-0).
+        if pend_emit:
+            var pn1 = len(pend_b1)
+            var pj = 0
+            while pj < pn1:
+                var use_rc = False
+                var f_cid = Int(pend_cid_f[pj])
+                var r_cid = Int(pend_cid_r[pj])
+                if f_cid < 0 and r_cid >= 0:
+                    use_rc = True
+                elif f_cid >= 0 and r_cid >= 0:
+                    var fnm = Int(pend_nm_f[pj])
+                    var rnm = Int(pend_nm_r[pj])
+                    if rnm < fnm or (
+                        rnm == fnm and Int(pend_mapq_r[pj]) > Int(pend_mapq_f[pj])
+                    ):
+                        use_rc = True
+                var h1: LinearHit
+                if use_rc:
+                    h1 = _hit_from_gpu(
+                        index,
+                        pend_b1[pj].name,
+                        pend_b1[pj].seq,
+                        pend_b1[pj].original_seq,
+                        r_cid,
+                        Int(pend_pos_r[pj]),
+                        Int(pend_mapq_r[pj]),
+                        Int(pend_flag_r[pj]),
+                        Int(pend_sl_r[pj]),
+                        Int(pend_sr_r[pj]),
+                        Int(pend_iop_r[pj]),
+                        Int(pend_iat_r[pj]),
+                        Int(pend_ilen_r[pj]),
+                    )
+                else:
+                    h1 = _hit_from_gpu(
+                        index,
+                        pend_b1[pj].name,
+                        pend_b1[pj].seq,
+                        pend_b1[pj].original_seq,
+                        f_cid,
+                        Int(pend_pos_f[pj]),
+                        Int(pend_mapq_f[pj]),
+                        Int(pend_flag_f[pj]),
+                        Int(pend_sl_f[pj]),
+                        Int(pend_sr_f[pj]),
+                        Int(pend_iop_f[pj]),
+                        Int(pend_iat_f[pj]),
+                        Int(pend_ilen_f[pj]),
+                    )
+                h1.qual = pend_b1[pj].qual
+                if not paired:
+                    if h1.contig != "*":
+                        n_mapped += 1
+                    fh.write(_sam_with_rg(h1) + "\n")
+                    n_reads += 1
+                else:
+                    var r2i = pn1 + pj
+                    var use_rc2 = False
+                    var f2 = Int(pend_cid_f[r2i])
+                    var r2 = Int(pend_cid_r[r2i])
+                    if f2 < 0 and r2 >= 0:
+                        use_rc2 = True
+                    elif f2 >= 0 and r2 >= 0:
+                        var fnm2 = Int(pend_nm_f[r2i])
+                        var rnm2 = Int(pend_nm_r[r2i])
+                        if rnm2 < fnm2 or (
+                            rnm2 == fnm2
+                            and Int(pend_mapq_r[r2i]) > Int(pend_mapq_f[r2i])
+                        ):
+                            use_rc2 = True
+                    var h2: LinearHit
+                    if use_rc2:
+                        h2 = _hit_from_gpu(
+                            index,
+                            pend_b2[pj].name,
+                            pend_b2[pj].seq,
+                            pend_b2[pj].original_seq,
+                            r2,
+                            Int(pend_pos_r[r2i]),
+                            Int(pend_mapq_r[r2i]),
+                            Int(pend_flag_r[r2i]),
+                            Int(pend_sl_r[r2i]),
+                            Int(pend_sr_r[r2i]),
+                            Int(pend_iop_r[r2i]),
+                            Int(pend_iat_r[r2i]),
+                            Int(pend_ilen_r[r2i]),
+                        )
+                    else:
+                        h2 = _hit_from_gpu(
+                            index,
+                            pend_b2[pj].name,
+                            pend_b2[pj].seq,
+                            pend_b2[pj].original_seq,
+                            f2,
+                            Int(pend_pos_f[r2i]),
+                            Int(pend_mapq_f[r2i]),
+                            Int(pend_flag_f[r2i]),
+                            Int(pend_sl_f[r2i]),
+                            Int(pend_sr_f[r2i]),
+                            Int(pend_iop_f[r2i]),
+                            Int(pend_iat_f[r2i]),
+                            Int(pend_ilen_f[r2i]),
+                        )
+                    h2.qual = pend_b2[pj].qual
+                    var paired_hits = pair_hits(h1, h2)
+                    var p1 = paired_hits.r1.copy()
+                    var p2 = paired_hits.r2.copy()
+                    if p1.contig != "*":
+                        n_mapped += 1
+                    if p2.contig != "*":
+                        n_mapped += 1
+                    fh.write(_sam_with_rg(p1) + "\n")
+                    fh.write(_sam_with_rg(p2) + "\n")
+                    n_reads += 2
+                pj += 1
+
         fh1.close()
         if paired:
             fh2.close()
@@ -2404,4 +2883,23 @@ def map_fastq_dense_gpu_locate(
             " reads=",
             n_reads,
         )
+        if do_profile:
+            print(
+                "MojoLinear GPU-full profile_s fw_loc=",
+                t_fw_loc,
+                " fw_v0=",
+                t_fw_v0,
+                " fw_v1=",
+                t_fw_v1,
+                " rc_loc=",
+                t_rc_loc,
+                " rc_v0=",
+                t_rc_v0,
+                " rc_v1=",
+                t_rc_v1,
+                " d2h=",
+                t_d2h,
+                " emit=",
+                t_emit,
+            )
         return n_mapped

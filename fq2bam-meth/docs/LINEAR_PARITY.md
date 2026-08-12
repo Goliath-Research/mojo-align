@@ -131,3 +131,11 @@ fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --toy --skip-clara --dev
 ```
 
 Prefer the Parabricks sample on an NGC/GH200 host for the real gate.
+
+## Frozen science engine
+
+The Clara bakeoff always uses **`METHYLGRAPHER_LINEAR_ENGINE=parity`**
+(`src/linear_gpu_locate.mojo`). Do not retune vote/KEEP/occ there for
+wall-clock. Speed work lives in `src/linear_gpu_speed.mojo` and is
+documented in [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md).
+

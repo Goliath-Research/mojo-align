@@ -10,6 +10,12 @@ Mapper selection (``METHYLGRAPHER_LINEAR_MAPPER``):
 - ``mojo`` (default when GPU/device path ready) — ``src/linear_mapper.mojo``
 - ``bwa`` — CPU fallback via BWA-MEM
 
+Mojo GPU engine (``METHYLGRAPHER_LINEAR_ENGINE``):
+
+- ``parity`` (default) — frozen science mapper (``linear_gpu_locate.mojo``)
+- ``speed`` — experimental fast mapper; not default until it matches or
+  improves Clara/parity quality gates (see ``docs/LINEAR_ENGINES.md``)
+
 Device selection mirrors Giraffe: ``-device auto|cpu|nvidia|amd`` /
 ``METHYLGRAPHER_ALIGN_DEVICE``.
 """
@@ -307,6 +313,19 @@ def resolve_linear_mapper(device: str) -> str:
     )
 
 
+def resolve_linear_engine() -> str:
+    """Return ``parity`` or ``speed``. Default is the frozen science engine."""
+    raw = os.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "").strip().lower()
+    if raw in {"", "parity", "science", "default"}:
+        return "parity"
+    if raw in {"speed", "fast"}:
+        return "speed"
+    raise RuntimeError(
+        "METHYLGRAPHER_LINEAR_ENGINE must be 'parity' or 'speed' "
+        f"(got {raw!r})"
+    )
+
+
 def _mojo_bin() -> List[str]:
     """Return argv prefix to run Mojo under pixi when available."""
     pixi = shutil.which("pixi")
@@ -363,6 +382,7 @@ def run_mojo_linear_map(
         cmd.extend(["-bs_r2", bs_r2])
     with log.open("a", encoding="utf-8") as handle:
         handle.write("COMMAND: " + " ".join(cmd) + "\n")
+        handle.write("LINEAR_ENGINE: " + resolve_linear_engine() + "\n")
         handle.flush()
         # Stream Mojo stdout/stderr live (full-genome runs can take minutes).
         proc = subprocess.Popen(
@@ -444,7 +464,10 @@ def run_mojo_fq2bam_meth(
     log = Path(log_path or (work / "mojo_fq2bam_meth.log"))
     mapper = resolve_linear_mapper(device)
     with log.open("a", encoding="utf-8") as handle:
-        handle.write(f"device={device} threads={threads} mapper={mapper}\n")
+        handle.write(
+            f"device={device} threads={threads} mapper={mapper} "
+            f"linear_engine={resolve_linear_engine()}\n"
+        )
 
     try:
         scripts = Path(__file__).resolve().parents[2] / "giraffe" / "scripts"

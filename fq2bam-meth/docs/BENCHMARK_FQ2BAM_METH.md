@@ -21,7 +21,8 @@ fq2bam-meth/scripts/fetch_parabricks_sample.sh   # → /work/samples/parabricks_
 fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 ```
 
-See [`LINEAR_PARITY.md`](LINEAR_PARITY.md).
+See [`LINEAR_PARITY.md`](LINEAR_PARITY.md) and [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)
+(parity = frozen science default; speed = opt-in until promotion gates pass).
 
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|
