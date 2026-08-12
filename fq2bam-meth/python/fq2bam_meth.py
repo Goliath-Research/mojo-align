@@ -352,8 +352,41 @@ def run_mojo_linear_map(
     log: Path,
     bs_r1: str = "",
     bs_r2: str = "",
+    out_bam: Path | None = None,
 ) -> None:
+    """Run the Mojo mapper.
+
+    FM engine writes BAM natively when ``out_bam`` is set (no SAM, no
+    ``samtools view``). Other engines still stream SAM through a FIFO into
+    ``samtools view -u``.
+    """
     root = _repo_root()
+    samtools = shutil.which("samtools")
+    map_path = out_sam
+    view_proc: subprocess.Popen[str] | None = None
+    fifo: Path | None = None
+    native_bam = out_bam is not None and resolve_linear_engine() == "fm"
+    if native_bam:
+        map_path = out_bam
+    elif out_bam is not None:
+        if not samtools:
+            raise RuntimeError("samtools required to stream Mojo SAM → BAM")
+        fifo = out_bam.parent / "aligned.sam.fifo"
+        if fifo.exists() or fifo.is_fifo():
+            try:
+                fifo.unlink()
+            except OSError:
+                pass
+        os.mkfifo(fifo)
+        map_path = fifo
+        # Uncompressed BAM (-u): encode is cheap; sort/markdup recompress.
+        # stderr → log (not PIPE) so a chatty samtools cannot deadlock.
+        view_err = log.open("a", encoding="utf-8")
+        view_proc = subprocess.Popen(
+            [samtools, "view", "-u", "-o", str(out_bam), str(fifo)],
+            stdout=subprocess.DEVNULL,
+            stderr=view_err,
+        )
     cmd = _mojo_bin() + [
         "-I",
         "gpu-common/src",
@@ -371,7 +404,7 @@ def run_mojo_linear_map(
         "-fq2",
         str(g2a_r2),
         "-out_sam",
-        str(out_sam),
+        str(map_path),
         "-device",
         device,
         "-k",
@@ -386,14 +419,21 @@ def run_mojo_linear_map(
     with log.open("a", encoding="utf-8") as handle:
         handle.write("COMMAND: " + " ".join(cmd) + "\n")
         handle.write("LINEAR_ENGINE: " + resolve_linear_engine() + "\n")
+        if native_bam:
+            handle.write(f"NATIVE_BAM: {out_bam} (Mojo BGZF, no SAM)\n")
+        elif out_bam is not None:
+            handle.write(f"STREAM_BAM: {out_bam} (no on-disk SAM)\n")
         handle.flush()
-        # Stream Mojo stdout/stderr live (full-genome runs can take minutes).
+        env = os.environ.copy()
+        py = str(root / "fq2bam-meth" / "python")
+        env["PYTHONPATH"] = py + os.pathsep + env.get("PYTHONPATH", "")
         proc = subprocess.Popen(
             cmd,
             cwd=str(root),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -401,6 +441,23 @@ def run_mojo_linear_map(
             handle.flush()
             print(line, end="", flush=True)
         rc = proc.wait()
+        view_err_txt = ""
+        if view_proc is not None:
+            vrc = view_proc.wait()
+            try:
+                view_err.close()
+            except Exception:
+                pass
+            if vrc != 0:
+                handle.write(f"samtools view -u failed rc={vrc}\n")
+                raise RuntimeError(
+                    f"samtools view -u failed (exit {vrc}); see {log}"
+                )
+        if fifo is not None:
+            try:
+                fifo.unlink()
+            except OSError:
+                pass
         if rc != 0:
             raise RuntimeError(f"Mojo linear mapper failed (exit {rc}); see {log}")
 
@@ -503,7 +560,6 @@ def run_mojo_fq2bam_meth(
 
     if mapper == "mojo":
         try:
-            out_sam = work / "aligned.sam"
             eng = resolve_linear_engine()
             resolved_cache = resolve_mojo_linear_cache_dir(
                 reference_fasta, work, k, cache_dir=cache_dir
@@ -531,17 +587,14 @@ def run_mojo_fq2bam_meth(
                 c2t_ref=c2t_ref,
                 c2t_r1=fq1,
                 g2a_r2=fq2,
-                out_sam=out_sam,
+                out_sam=work / "aligned.sam.fifo",
+                out_bam=bam_unsorted,
                 device=device,
                 k=k,
                 cache_dir=resolved_cache,
                 log=log,
                 bs_r1="C2T",
                 bs_r2="G2A",
-            )
-            _run(
-                [samtools, "view", "-bS", str(out_sam), "-o", str(bam_unsorted)],
-                log,
             )
         except Exception as exc:
             if _gpu_require():
@@ -596,8 +649,9 @@ def run_mojo_fq2bam_meth(
     # fixmate -m fills MC/ms so markdup (and ValidateSamFile) can run.
     bam_fixmate = work / "aligned.fixmate.bam"
     bam_sorted = work / "aligned.sorted.bam"
+    st = max(1, threads)
     _run(
-        [samtools, "fixmate", "-@", str(max(1, threads // 2)), "-m", str(bam_unsorted), str(bam_fixmate)],
+        [samtools, "fixmate", "-@", str(st), "-m", str(bam_unsorted), str(bam_fixmate)],
         log,
     )
     _run(
@@ -605,7 +659,11 @@ def run_mojo_fq2bam_meth(
             samtools,
             "sort",
             "-@",
-            str(max(1, threads // 2)),
+            str(st),
+            "-m",
+            "2G",
+            "-l",
+            "1",
             "-o",
             str(bam_sorted),
             str(bam_fixmate),
@@ -624,7 +682,7 @@ def run_mojo_fq2bam_meth(
                 samtools,
                 "markdup",
                 "-@",
-                str(max(1, threads // 2)),
+                str(st),
                 str(bam_sorted),
                 str(out_bam),
             ],

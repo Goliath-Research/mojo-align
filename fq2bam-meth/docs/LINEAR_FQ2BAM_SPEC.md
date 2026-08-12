@@ -14,10 +14,10 @@ from dual-graph `Align` / MojoGiraffe (GAF → MethylCall).
    - Fleet dense-v1 mmap pack (`kmers.bin` / `offsets.bin` / `postings.bin`) via `linear_index`; in-memory Dict only for tiny fixtures
    - Optional fused BS convert (`-bs_r1 C2T` / `-bs_r2 G2A`) in the mapper
    - Portable GPU/host seeds (`linear_gpu_kernels`) **wired into** `extend_read_with_seeds` (not discarded warmup)
-   - Gapless extend + PE SAM flags → SAM
-3. Stream SAM → `samtools view|sort|index`.
+   - Gapless extend + PE SAM flags
+3. Stream SAM through a FIFO into `samtools view -u` (on-disk artifact is **BAM**, never `.sam`), then `fixmate` / `sort -l 1` / `markdup` / `index`.
 
-Mapping is **native Mojo** (index + seed → extend + SAM), not a BWA wrap.
+Mapping is **native Mojo** (index + seed → extend), not a BWA wrap.
 
 ### Fallback
 
@@ -77,7 +77,7 @@ bin/methylGrapher MojoFq2bamMeth \
 | `src/linear_gpu_speed.mojo` | **Speed** GPU engine (opt-in k-mer consensus) |
 | `src/linear_fm_index.mojo` | BWA 0.7 FM-index mmap (`.bwt/.sa/.pac/.ann`) |
 | `src/linear_gpu_fm.mojo` | **FM** GPU engine (BWA-MEM-style; promote per [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
-| `src/linear_mapper.mojo` | streaming map → SAM; dispatches parity / speed / fm |
+| `src/linear_mapper.mojo` | streaming map; dispatches parity / speed / fm; orchestrator writes BAM |
 | `engine/fq2bam_meth.py` | convert, invoke Mojo, BWA fallback, samtools, QC |
 
 ## Performance gates

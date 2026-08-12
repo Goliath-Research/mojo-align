@@ -24,6 +24,9 @@ fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 See [`LINEAR_PARITY.md`](LINEAR_PARITY.md) and [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)
 (parity = frozen science default; `speed` / `fm` = opt-in until promotion gates pass).
 
+Output is **BAM only**: the mapper streams SAM through a FIFO into `samtools view -u`
+(never a 17 GiB `.sam` on disk), then `fixmate` / `sort -l 1` / `markdup`.
+
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|
 | Mojo linear | `cpu` / `DeviceContext(api=cpu)` | PASS | streaming batches + hash postings; seeds→extend |

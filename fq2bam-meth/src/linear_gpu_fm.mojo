@@ -6,6 +6,7 @@
 # parity until Clara gates pass.
 
 from std.collections import Dict, List
+from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
@@ -67,6 +68,291 @@ def _write_sam_header_fm(fh: PythonObject, index: FmIndex) raises:
 
 def _sam_with_rg_fm(h: LinearHit) raises -> String:
     return hit_to_sam_line(h) + "\tRG:Z:" + _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+
+
+def _path_is_bam(path: String) -> Bool:
+    var n = path.byte_length()
+    if n < 4:
+        return False
+    return String(path[byte = n - 4 : n]).lower() == ".bam"
+
+
+def _open_bam_writer(
+    index: FmIndex, path: String
+) raises -> PythonObject:
+    """Canonical @SQ list + rid→tid map packed into the writer via sq order."""
+    var bam_mod = Python.import_module("bam_emit")
+    var sq_names = Python.list()
+    var sq_lens = Python.list()
+    var seen = Dict[String, Int]()
+    var n_sq = 0
+    var ci = 0
+    while ci < index.contig_count():
+        var canon = _canonical_contig(index.contig_name(ci))
+        if canon not in seen:
+            seen[canon] = n_sq
+            sq_names.append(canon)
+            sq_lens.append(index.contig_length(ci))
+            n_sq += 1
+        ci += 1
+    var rg = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+    var sm = _env_str("METHYLGRAPHER_RG_SM", "sample")
+    var lb = _env_str("METHYLGRAPHER_RG_LB", "lib1")
+    var pl = _env_str("METHYLGRAPHER_RG_PL", "ILLUMINA")
+    var level = _env_int("METHYLGRAPHER_BAM_LEVEL", 1)
+    return bam_mod.BamWriter(
+        path, sq_names, sq_lens, rg, sm, lb, pl, "0.1.0-mojo-fm", level
+    )
+
+
+def _rid_to_tid_table(index: FmIndex) raises -> List[Int]:
+    var out = List[Int]()
+    var seen = Dict[String, Int]()
+    var n_sq = 0
+    var ci = 0
+    while ci < index.contig_count():
+        var canon = _canonical_contig(index.contig_name(ci))
+        if canon not in seen:
+            seen[canon] = n_sq
+            n_sq += 1
+        out.append(seen[canon])
+        ci += 1
+    return out^
+
+
+def _put_i32(p: UnsafePointer[UInt8, MutAnyOrigin], off: Int, v: Int):
+    var u = v
+    if u < 0:
+        u = u + 4294967296
+    p[off] = UInt8(u & 255)
+    p[off + 1] = UInt8((u >> 8) & 255)
+    p[off + 2] = UInt8((u >> 16) & 255)
+    p[off + 3] = UInt8((u >> 24) & 255)
+
+
+def _put_u32(p: UnsafePointer[UInt8, MutAnyOrigin], off: Int, v: UInt32):
+    p[off] = UInt8(Int(v) & 255)
+    p[off + 1] = UInt8(Int(v >> 8) & 255)
+    p[off + 2] = UInt8(Int(v >> 16) & 255)
+    p[off + 3] = UInt8(Int(v >> 24) & 255)
+
+
+def _nt16(b: UInt8) -> UInt8:
+    if b == 65 or b == 97:
+        return 1
+    if b == 67 or b == 99:
+        return 2
+    if b == 71 or b == 103:
+        return 4
+    if b == 84 or b == 116:
+        return 8
+    return 15
+
+
+def _nt16_comp(b: UInt8) -> UInt8:
+    if b == 1:
+        return 8
+    if b == 8:
+        return 1
+    if b == 2:
+        return 4
+    if b == 4:
+        return 2
+    return 15
+    if b == 65 or b == 97:
+        return 1
+    if b == 67 or b == 99:
+        return 2
+    if b == 71 or b == 103:
+        return 4
+    if b == 84 or b == 116:
+        return 8
+    return 15
+
+
+def _reg2bin(beg: Int, end: Int) -> Int:
+    var e = end
+    if e <= beg:
+        e = beg + 1
+    e -= 1
+    if (beg >> 14) == (e >> 14):
+        return 4681 + (beg >> 14)
+    if (beg >> 17) == (e >> 17):
+        return 585 + (beg >> 17)
+    if (beg >> 20) == (e >> 20):
+        return 73 + (beg >> 20)
+    if (beg >> 23) == (e >> 23):
+        return 9 + (beg >> 23)
+    if (beg >> 26) == (e >> 26):
+        return 1 + (beg >> 26)
+    return 0
+
+
+def _pack_bam_aln(
+    p: UnsafePointer[UInt8, MutAnyOrigin],
+    off0: Int,
+    cap: Int,
+    name: String,
+    flag: Int,
+    tid: Int,
+    pos0: Int,
+    mapq: Int,
+    sl: Int,
+    sr: Int,
+    seq_in: String,
+    qual_in: String,
+    ntid: Int,
+    npos: Int,
+    tlen: Int,
+    nm: Int,
+    rg: String,
+) raises -> Int:
+    var seq = seq_in
+    var qual = qual_in
+    var rev = (flag & 16) != 0
+    var qlen = seq.byte_length()
+    var slv = sl
+    var srv = sr
+    if slv < 0:
+        slv = 0
+    if srv < 0:
+        srv = 0
+    if slv + srv >= qlen:
+        slv = 0
+        srv = 0
+    var mid = qlen - slv - srv
+    if rev:
+        var tmp_s = slv
+        slv = srv
+        srv = tmp_s
+    var n_cigar = 0
+    if tid >= 0 and (flag & 4) == 0:
+        if slv > 0:
+            n_cigar += 1
+        if mid > 0:
+            n_cigar += 1
+        if srv > 0:
+            n_cigar += 1
+    var l_qname = name.byte_length() + 1
+    var seq_packed_n = (qlen + 1) // 2
+    var rg_n = rg.byte_length()
+    var tags_n = 3 + rg_n + 1 + 4
+    var block = 32 + l_qname + 4 * n_cigar + seq_packed_n + qlen + tags_n
+    var need = off0 + 4 + block
+    if need > cap:
+        raise Error("BAM batch buffer overflow")
+    var bin_v = 4680
+    var tid_w = -1
+    var pos_w = -1
+    if tid >= 0 and (flag & 4) == 0:
+        tid_w = tid
+        pos_w = pos0
+        var end = pos0 + mid
+        if end <= pos0:
+            end = pos0 + 1
+        bin_v = _reg2bin(pos0, end)
+    var ntid_w = ntid
+    var npos_w = npos
+    if ntid_w < 0:
+        ntid_w = -1
+        npos_w = -1
+    var mq = mapq
+    if mq < 0:
+        mq = 0
+    if mq > 255:
+        mq = 255
+    _put_i32(p, off0, block)
+    _put_i32(p, off0 + 4, tid_w)
+    _put_i32(p, off0 + 8, pos_w)
+    _put_u32(
+        p,
+        off0 + 12,
+        UInt32((bin_v << 16) | (mq << 8) | l_qname),
+    )
+    _put_u32(p, off0 + 16, UInt32((flag << 16) | n_cigar))
+    _put_i32(p, off0 + 20, qlen)
+    _put_i32(p, off0 + 24, ntid_w)
+    _put_i32(p, off0 + 28, npos_w)
+    _put_i32(p, off0 + 32, tlen)
+    var off = off0 + 36
+    var ni = 0
+    while ni < name.byte_length():
+        p[off + ni] = UInt8(ord(name[byte = ni : ni + 1]))
+        ni += 1
+    p[off + ni] = 0
+    off += l_qname
+    if n_cigar > 0:
+        if slv > 0:
+            _put_u32(p, off, UInt32((slv << 4) | 4))
+            off += 4
+        if mid > 0:
+            _put_u32(p, off, UInt32((mid << 4) | 0))
+            off += 4
+        if srv > 0:
+            _put_u32(p, off, UInt32((srv << 4) | 4))
+            off += 4
+    var si = 0
+    while si + 1 < qlen:
+        var ia = si
+        var ib = si + 1
+        if rev:
+            ia = qlen - 1 - si
+            ib = qlen - 2 - si
+        var a = _nt16(UInt8(ord(seq[byte = ia : ia + 1])))
+        var b = _nt16(UInt8(ord(seq[byte = ib : ib + 1])))
+        if rev:
+            a = _nt16_comp(a)
+            b = _nt16_comp(b)
+        p[off] = (a << 4) | b
+        off += 1
+        si += 2
+    if si < qlen:
+        var ic = si
+        if rev:
+            ic = 0
+        var c = _nt16(UInt8(ord(seq[byte = ic : ic + 1])))
+        if rev:
+            c = _nt16_comp(c)
+        p[off] = c << 4
+        off += 1
+    var qi2 = 0
+    if qual.byte_length() == qlen and qual != "*":
+        while qi2 < qlen:
+            var srcq = qi2
+            if rev:
+                srcq = qlen - 1 - qi2
+            var qb2 = UInt8(ord(qual[byte = srcq : srcq + 1]))
+            if qb2 >= 33:
+                p[off + qi2] = qb2 - 33
+            else:
+                p[off + qi2] = 255
+            qi2 += 1
+    else:
+        while qi2 < qlen:
+            p[off + qi2] = 255
+            qi2 += 1
+    off += qlen
+    p[off] = 82  # R
+    p[off + 1] = 71  # G
+    p[off + 2] = 90  # Z
+    off += 3
+    var ri = 0
+    while ri < rg_n:
+        p[off + ri] = UInt8(ord(rg[byte = ri : ri + 1]))
+        ri += 1
+    p[off + rg_n] = 0
+    off += rg_n + 1
+    p[off] = 78  # N
+    p[off + 1] = 77  # M
+    p[off + 2] = 67  # C
+    var nmv = nm
+    if nmv < 0:
+        nmv = 0
+    if nmv > 255:
+        nmv = 255
+    p[off + 3] = UInt8(nmv)
+    off += 4
+    return off
 
 
 def _hit_from_fm(
@@ -801,6 +1087,103 @@ def map_fastq_fm_gpu(
                                                             best_nm
                                                         )
                                                         return
+                                            elif (
+                                                adj == 0
+                                                and is_rev == 0
+                                                and (nm > budget or alen < 24)
+                                            ):
+                                                # 1bp deletion on a coarse g grid.
+                                                if bstart + qlen + 1 <= coff + clen:
+                                                    var g = 0
+                                                    while g <= qlen:
+                                                        var nm_d = 1
+                                                        var t = 0
+                                                        while (
+                                                            t < g and nm_d <= budget
+                                                        ):
+                                                            var rcd = Int(
+                                                                (
+                                                                    pac[
+                                                                        (bstart + t)
+                                                                        >> 2
+                                                                    ]
+                                                                    >> UInt8(
+                                                                        (
+                                                                            (
+                                                                                ~(
+                                                                                    bstart
+                                                                                    + t
+                                                                                )
+                                                                            )
+                                                                            & 3
+                                                                        )
+                                                                        << 1
+                                                                    )
+                                                                )
+                                                                & 3
+                                                            )
+                                                            var qcd = Int(
+                                                                codes[q_base + t]
+                                                            )
+                                                            if (
+                                                                rcd > 3
+                                                                or qcd > 3
+                                                                or rcd != qcd
+                                                            ):
+                                                                nm_d += 1
+                                                            t += 1
+                                                        while (
+                                                            t < qlen
+                                                            and nm_d <= budget
+                                                        ):
+                                                            var rcd2 = Int(
+                                                                (
+                                                                    pac[
+                                                                        (
+                                                                            bstart
+                                                                            + t
+                                                                            + 1
+                                                                        )
+                                                                        >> 2
+                                                                    ]
+                                                                    >> UInt8(
+                                                                        (
+                                                                            (
+                                                                                ~(
+                                                                                    bstart
+                                                                                    + t
+                                                                                    + 1
+                                                                                )
+                                                                            )
+                                                                            & 3
+                                                                        )
+                                                                        << 1
+                                                                    )
+                                                                )
+                                                                & 3
+                                                            )
+                                                            var qcd2 = Int(
+                                                                codes[q_base + t]
+                                                            )
+                                                            if (
+                                                                rcd2 > 3
+                                                                or qcd2 > 3
+                                                                or rcd2 != qcd2
+                                                            ):
+                                                                nm_d += 1
+                                                            t += 1
+                                                        if (
+                                                            nm_d <= budget
+                                                            and nm_d < best_nm
+                                                        ):
+                                                            best_nm = nm_d
+                                                            best_rid = crid
+                                                            best_pos = local
+                                                            best_sl = 0
+                                                            best_sr = 0
+                                                            best_mq = 20
+                                                            best_flag = 0
+                                                        g += 4
                                     adj += 1
                         hi += 1
                 e += seed_stride
@@ -813,6 +1196,180 @@ def map_fastq_fm_gpu(
                 out_sl[rid] = UInt32(best_sl)
                 out_sr[rid] = UInt32(best_sr)
                 out_nm[rid] = UInt32(best_nm)
+
+        def fm_mate_rescue_kernel(
+            pac: UnsafePointer[UInt8, MutAnyOrigin],
+            contig_off: UnsafePointer[UInt64, MutAnyOrigin],
+            contig_len: UnsafePointer[UInt32, MutAnyOrigin],
+            n_contigs: Int,
+            l_pac: UInt64,
+            codes: UnsafePointer[UInt8, MutAnyOrigin],
+            read_lens: UnsafePointer[UInt32, MutAnyOrigin],
+            max_len: Int,
+            n_pairs: Int,
+            window: Int,
+            max_diff: Int,
+            max_soft: Int,
+            out_rid: UnsafePointer[Int32, MutAnyOrigin],
+            out_pos: UnsafePointer[UInt32, MutAnyOrigin],
+            out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
+            out_flag: UnsafePointer[Int32, MutAnyOrigin],
+            out_sl: UnsafePointer[UInt32, MutAnyOrigin],
+            out_sr: UnsafePointer[UInt32, MutAnyOrigin],
+            out_nm: UnsafePointer[UInt32, MutAnyOrigin],
+        ):
+            # If exactly one mate mapped, gapless-scan ±window on that contig
+            # (prefer opposite strand). 1bp deletion only at the best locus.
+            var pi = Int(block_idx.x * block_dim.x + thread_idx.x)
+            if pi >= n_pairs:
+                return
+            var i1 = pi
+            var i2 = pi + n_pairs
+            var m1 = Int(out_rid[i1]) >= 0
+            var m2 = Int(out_rid[i2]) >= 0
+            if m1 == m2:
+                return
+            var src = i1
+            var dst = i2
+            if m2:
+                src = i2
+                dst = i1
+            var crid = Int(out_rid[src])
+            if crid < 0 or crid >= n_contigs:
+                return
+            var qlen = Int(read_lens[dst])
+            if qlen < 24:
+                return
+            var coff = Int(contig_off[crid])
+            var clen = Int(contig_len[crid])
+            var mate_pos = Int(out_pos[src])
+            var win = window
+            if win < 32:
+                win = 32
+            if win > 1024:
+                win = 1024
+            var lo = mate_pos - win
+            if lo < 0:
+                lo = 0
+            var hi = mate_pos + win
+            if hi > clen - 24:
+                hi = clen - 24
+            if hi <= lo:
+                return
+            var budget = max_diff
+            if budget < 2:
+                budget = 2
+            if budget > qlen // 2:
+                budget = qlen // 2
+            var q_base = dst * max_len
+            var best_nm = 9999
+            var best_pos = 0
+            var best_flag = 0
+            var scan_nm = 9999
+            var scan_local = lo
+            var scan_rev = 0
+            var mate_rev = (Int(out_flag[src]) & 16) != 0
+            var pass_s = 0
+            while pass_s < 2:
+                var is_rev = 1
+                if pass_s == 0:
+                    if mate_rev:
+                        is_rev = 0
+                    else:
+                        is_rev = 1
+                else:
+                    if mate_rev:
+                        is_rev = 1
+                    else:
+                        is_rev = 0
+                var local = lo
+                while local <= hi:
+                    var bstart = coff + local
+                    if bstart < 0 or UInt64(bstart + qlen) > l_pac:
+                        local += 1
+                        continue
+                    var nm = 0
+                    var j = 0
+                    while j < qlen and nm <= budget + 4:
+                        var ppos = bstart + j
+                        var rb = Int(
+                            (pac[ppos >> 2] >> UInt8(((~ppos) & 3) << 1)) & 3
+                        )
+                        var qc = Int(codes[q_base + j])
+                        if is_rev != 0:
+                            var qcr = Int(codes[q_base + (qlen - 1 - j)])
+                            if qcr <= 3:
+                                qc = 3 - qcr
+                            else:
+                                qc = 4
+                        if rb > 3 or qc > 3 or rb != qc:
+                            nm += 1
+                        j += 1
+                    if nm < scan_nm:
+                        scan_nm = nm
+                        scan_local = local
+                        scan_rev = is_rev
+                    if nm <= budget and nm < best_nm:
+                        best_nm = nm
+                        best_pos = local
+                        best_flag = is_rev * 16
+                    local += 1
+                pass_s += 1
+            if best_nm > budget and scan_nm < 9999:
+                var bstart = coff + scan_local
+                if bstart >= 0 and UInt64(bstart + qlen + 1) <= l_pac:
+                    var g = 0
+                    while g <= qlen:
+                        var nm_d = 1
+                        var t = 0
+                        while t < g and nm_d <= budget:
+                            var p0 = bstart + t
+                            var rb0 = Int(
+                                (pac[p0 >> 2] >> UInt8(((~p0) & 3) << 1)) & 3
+                            )
+                            var qc0 = Int(codes[q_base + t])
+                            if scan_rev != 0:
+                                var q0r = Int(codes[q_base + (qlen - 1 - t)])
+                                if q0r <= 3:
+                                    qc0 = 3 - q0r
+                                else:
+                                    qc0 = 4
+                            if rb0 > 3 or qc0 > 3 or rb0 != qc0:
+                                nm_d += 1
+                            t += 1
+                        while t < qlen and nm_d <= budget:
+                            var p1 = bstart + t + 1
+                            var rb1 = Int(
+                                (pac[p1 >> 2] >> UInt8(((~p1) & 3) << 1)) & 3
+                            )
+                            var qc1 = Int(codes[q_base + t])
+                            if scan_rev != 0:
+                                var q1r = Int(codes[q_base + (qlen - 1 - t)])
+                                if q1r <= 3:
+                                    qc1 = 3 - q1r
+                                else:
+                                    qc1 = 4
+                            if rb1 > 3 or qc1 > 3 or rb1 != qc1:
+                                nm_d += 1
+                            t += 1
+                        if nm_d <= budget and nm_d < best_nm:
+                            best_nm = nm_d
+                            best_pos = scan_local
+                            best_flag = scan_rev * 16
+                        g += 4
+            if best_nm <= budget:
+                var mq: UInt32 = 20
+                if best_nm == 0:
+                    mq = 60
+                elif best_nm <= 2:
+                    mq = 40
+                out_rid[dst] = Int32(crid)
+                out_pos[dst] = UInt32(best_pos)
+                out_mapq[dst] = mq
+                out_flag[dst] = Int32(best_flag)
+                out_sl[dst] = 0
+                out_sr[dst] = 0
+                out_nm[dst] = UInt32(best_nm)
 
         var api = _device_api(resolved)
         var ctx = DeviceContext(api=api)
@@ -883,7 +1440,12 @@ def map_fastq_fm_gpu(
         var max_diff = _env_int("METHYLGRAPHER_FM_MAX_DIFF", 12)
         var max_soft = _env_int("METHYLGRAPHER_FM_MAX_SOFT", 20)
         var max_adj = _env_int("METHYLGRAPHER_FM_ADJ", 8)
+        var rescue_win = _env_int("METHYLGRAPHER_FM_RESCUE_WIN", 512)
         var paired = fq2.byte_length() > 0
+        var emit_bam = _path_is_bam(out_sam)
+        var emit_kind = String("sam")
+        if emit_bam:
+            emit_kind = String("bam")
         print(
             "MojoLinear GPU-fm map start batch=",
             batch_size,
@@ -897,12 +1459,23 @@ def map_fastq_fm_gpu(
             max_diff,
             " adj=",
             max_adj,
+            " rescue_win=",
+            rescue_win,
             " paired=",
             paired,
+            " emit=",
+            emit_kind,
         )
 
-        var fh = open_text_write(out_sam)
-        _write_sam_header_fm(fh, index)
+        var fh = Python.none()
+        var bam_w = Python.none()
+        var rid_to_tid = List[Int]()
+        if emit_bam:
+            bam_w = _open_bam_writer(index, out_sam)
+            rid_to_tid = _rid_to_tid_table(index)
+        else:
+            fh = open_text_write(out_sam)
+            _write_sam_header_fm(fh, index)
         var fh1 = _open_fastq(fq1)
         var fh2 = fh1
         if paired:
@@ -912,6 +1485,8 @@ def map_fastq_fm_gpu(
         var n_reads = 0
         var n_batches = 0
         var t_map0 = time_mod.perf_counter()
+        var t_gpu = time_mod.perf_counter() * 0
+        var t_emit = time_mod.perf_counter() * 0
         var batch1 = List[FastqRec]()
         var batch2 = List[FastqRec]()
         _read_pe_batch(
@@ -920,6 +1495,7 @@ def map_fastq_fm_gpu(
         comptime BLOCK = 256
 
         while len(batch1) > 0:
+            var t_g0 = time_mod.perf_counter()
             var seqs = List[String]()
             for r in batch1:
                 seqs.append(r.seq)
@@ -1012,6 +1588,32 @@ def map_fastq_fm_gpu(
                 grid_dim=grid_r,
                 block_dim=BLOCK,
             )
+            if paired and rescue_win > 0:
+                var n_pairs = n_seq // 2
+                var grid_p = (n_pairs + BLOCK - 1) // BLOCK
+                ctx.enqueue_function[fm_mate_rescue_kernel](
+                    dev_pac.unsafe_ptr(),
+                    dev_coff.unsafe_ptr(),
+                    dev_clen.unsafe_ptr(),
+                    n_contigs,
+                    index.l_pac,
+                    dev_codes.unsafe_ptr(),
+                    dev_lens.unsafe_ptr(),
+                    max_len,
+                    n_pairs,
+                    rescue_win,
+                    max_diff,
+                    max_soft,
+                    dev_rid.unsafe_ptr(),
+                    dev_pos.unsafe_ptr(),
+                    dev_mapq.unsafe_ptr(),
+                    dev_flag.unsafe_ptr(),
+                    dev_sl.unsafe_ptr(),
+                    dev_sr.unsafe_ptr(),
+                    dev_nm.unsafe_ptr(),
+                    grid_dim=grid_p,
+                    block_dim=BLOCK,
+                )
             var host_rid = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
             var host_pos = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_mapq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
@@ -1027,54 +1629,205 @@ def map_fastq_fm_gpu(
             ctx.enqueue_copy(src_buf=dev_sr, dst_buf=host_sr)
             ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
             ctx.synchronize()
+            t_gpu = t_gpu + (time_mod.perf_counter() - t_g0)
 
+            var t_e0 = time_mod.perf_counter()
             var n1 = len(batch1)
-            var pj = 0
-            while pj < n1:
-                var h1 = _hit_from_fm(
-                    index,
-                    batch1[pj].name,
-                    batch1[pj].seq,
-                    batch1[pj].original_seq,
-                    Int(host_rid[pj]),
-                    Int(host_pos[pj]),
-                    Int(host_mapq[pj]),
-                    Int(host_flag[pj]),
-                    Int(host_sl[pj]),
-                    Int(host_sr[pj]),
-                )
-                h1.qual = batch1[pj].qual
-                if not paired:
-                    if h1.contig != "*":
-                        n_mapped += 1
-                    fh.write(_sam_with_rg_fm(h1) + "\n")
-                    n_reads += 1
-                else:
-                    var r2i = n1 + pj
-                    var h2 = _hit_from_fm(
+            if emit_bam:
+                var recs = n1
+                if paired:
+                    recs = n1 * 2
+                var cap = recs * (192 + 2 * 160)
+                if cap < 4096:
+                    cap = 4096
+                var blob = ctx.enqueue_create_host_buffer[DType.uint8](cap)
+                var bp = blob.unsafe_ptr()
+                var off = 0
+                var rg = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+                var pj = 0
+                while pj < n1:
+                    var rid1 = Int(host_rid[pj])
+                    var pos1 = Int(host_pos[pj])
+                    var mq1 = Int(host_mapq[pj])
+                    var fl1 = Int(host_flag[pj]) | 1 | 64
+                    var sl1 = Int(host_sl[pj])
+                    var sr1 = Int(host_sr[pj])
+                    var nm1 = Int(host_nm[pj])
+                    var tid1 = -1
+                    if rid1 >= 0 and rid1 < len(rid_to_tid):
+                        tid1 = rid_to_tid[rid1]
+                    else:
+                        fl1 = fl1 | 4
+                    var seq1 = batch1[pj].original_seq
+                    if seq1.byte_length() == 0:
+                        seq1 = batch1[pj].seq
+                    if not paired:
+                        off = _pack_bam_aln(
+                            bp,
+                            off,
+                            cap,
+                            batch1[pj].name,
+                            fl1,
+                            tid1,
+                            pos1,
+                            mq1,
+                            sl1,
+                            sr1,
+                            seq1,
+                            batch1[pj].qual,
+                            -1,
+                            -1,
+                            0,
+                            nm1,
+                            rg,
+                        )
+                        if tid1 >= 0:
+                            n_mapped += 1
+                        n_reads += 1
+                    else:
+                        var r2i = n1 + pj
+                        var rid2 = Int(host_rid[r2i])
+                        var pos2 = Int(host_pos[r2i])
+                        var mq2 = Int(host_mapq[r2i])
+                        var fl2 = Int(host_flag[r2i]) | 1 | 128
+                        var sl2 = Int(host_sl[r2i])
+                        var sr2 = Int(host_sr[r2i])
+                        var nm2 = Int(host_nm[r2i])
+                        var tid2 = -1
+                        if rid2 >= 0 and rid2 < len(rid_to_tid):
+                            tid2 = rid_to_tid[rid2]
+                        else:
+                            fl2 = fl2 | 4
+                        if tid1 < 0:
+                            fl2 = fl2 | 8
+                        if tid2 < 0:
+                            fl1 = fl1 | 8
+                        var ntid1 = -1
+                        var npos1 = -1
+                        var ntid2 = -1
+                        var npos2 = -1
+                        var tlen1 = 0
+                        var tlen2 = 0
+                        if tid1 >= 0 and tid2 >= 0 and tid1 == tid2:
+                            fl1 = fl1 | 2
+                            fl2 = fl2 | 2
+                            ntid1 = tid1
+                            ntid2 = tid2
+                            npos1 = pos2
+                            npos2 = pos1
+                            var tl = pos2 - pos1
+                            if tl < 0:
+                                tl = -tl
+                            tl = tl + batch2[pj].seq.byte_length()
+                            if pos1 <= pos2:
+                                tlen1 = tl
+                                tlen2 = -tl
+                            else:
+                                tlen1 = -tl
+                                tlen2 = tl
+                        else:
+                            if tid1 >= 0:
+                                ntid2 = tid1
+                                npos2 = pos1
+                            if tid2 >= 0:
+                                ntid1 = tid2
+                                npos1 = pos2
+                        var seq2 = batch2[pj].original_seq
+                        if seq2.byte_length() == 0:
+                            seq2 = batch2[pj].seq
+                        off = _pack_bam_aln(
+                            bp,
+                            off,
+                            cap,
+                            batch1[pj].name,
+                            fl1,
+                            tid1,
+                            pos1,
+                            mq1,
+                            sl1,
+                            sr1,
+                            seq1,
+                            batch1[pj].qual,
+                            ntid1,
+                            npos1,
+                            tlen1,
+                            nm1,
+                            rg,
+                        )
+                        off = _pack_bam_aln(
+                            bp,
+                            off,
+                            cap,
+                            batch2[pj].name,
+                            fl2,
+                            tid2,
+                            pos2,
+                            mq2,
+                            sl2,
+                            sr2,
+                            seq2,
+                            batch2[pj].qual,
+                            ntid2,
+                            npos2,
+                            tlen2,
+                            nm2,
+                            rg,
+                        )
+                        if tid1 >= 0:
+                            n_mapped += 1
+                        if tid2 >= 0:
+                            n_mapped += 1
+                        n_reads += 2
+                    pj += 1
+                bam_w.write_raw(Int(bp), off)
+            else:
+                var pj = 0
+                while pj < n1:
+                    var h1 = _hit_from_fm(
                         index,
-                        batch2[pj].name,
-                        batch2[pj].seq,
-                        batch2[pj].original_seq,
-                        Int(host_rid[r2i]),
-                        Int(host_pos[r2i]),
-                        Int(host_mapq[r2i]),
-                        Int(host_flag[r2i]),
-                        Int(host_sl[r2i]),
-                        Int(host_sr[r2i]),
+                        batch1[pj].name,
+                        batch1[pj].seq,
+                        batch1[pj].original_seq,
+                        Int(host_rid[pj]),
+                        Int(host_pos[pj]),
+                        Int(host_mapq[pj]),
+                        Int(host_flag[pj]),
+                        Int(host_sl[pj]),
+                        Int(host_sr[pj]),
                     )
-                    h2.qual = batch2[pj].qual
-                    var paired_hits = pair_hits(h1, h2)
-                    var p1 = paired_hits.r1.copy()
-                    var p2 = paired_hits.r2.copy()
-                    if p1.contig != "*":
-                        n_mapped += 1
-                    if p2.contig != "*":
-                        n_mapped += 1
-                    fh.write(_sam_with_rg_fm(p1) + "\n")
-                    fh.write(_sam_with_rg_fm(p2) + "\n")
-                    n_reads += 2
-                pj += 1
+                    h1.qual = batch1[pj].qual
+                    if not paired:
+                        if h1.contig != "*":
+                            n_mapped += 1
+                        fh.write(_sam_with_rg_fm(h1) + "\n")
+                        n_reads += 1
+                    else:
+                        var r2i = n1 + pj
+                        var h2 = _hit_from_fm(
+                            index,
+                            batch2[pj].name,
+                            batch2[pj].seq,
+                            batch2[pj].original_seq,
+                            Int(host_rid[r2i]),
+                            Int(host_pos[r2i]),
+                            Int(host_mapq[r2i]),
+                            Int(host_flag[r2i]),
+                            Int(host_sl[r2i]),
+                            Int(host_sr[r2i]),
+                        )
+                        h2.qual = batch2[pj].qual
+                        var paired_hits = pair_hits(h1, h2)
+                        var p1 = paired_hits.r1.copy()
+                        var p2 = paired_hits.r2.copy()
+                        if p1.contig != "*":
+                            n_mapped += 1
+                        if p2.contig != "*":
+                            n_mapped += 1
+                        fh.write(_sam_with_rg_fm(p1) + "\n")
+                        fh.write(_sam_with_rg_fm(p2) + "\n")
+                        n_reads += 2
+                    pj += 1
+            t_emit = t_emit + (time_mod.perf_counter() - t_e0)
 
             n_batches += 1
             if n_batches == 1 or n_batches % 5 == 0:
@@ -1091,10 +1844,13 @@ def map_fastq_fm_gpu(
         fh1.close()
         if paired:
             fh2.close()
-        fh.close()
+        if emit_bam:
+            bam_w.close()
+        else:
+            fh.close()
         var t_map1 = time_mod.perf_counter()
         print(
-            "wrote SAM -> ",
+            "wrote records -> ",
             out_sam,
             " mapped_records=",
             n_mapped,
@@ -1105,6 +1861,10 @@ def map_fastq_fm_gpu(
         print(
             "MojoLinear GPU-fm map_wall_s=",
             t_map1 - t_map0,
+            " gpu_kernel_s=",
+            t_gpu,
+            " emit_s=",
+            t_emit,
             " reads=",
             n_reads,
         )
