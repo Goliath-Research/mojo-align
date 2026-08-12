@@ -100,7 +100,7 @@ Clara runs via host `pbrun` when available, otherwise Docker
 | Gate | Default | Meaning |
 |------|---------|---------|
 | `mapped_rate` | \|Δ\| ≤ 0.02 | `samtools flagstat` mapped / total |
-| `idxstats_spearman` | ≥ 0.95 | Per-contig mapped-count Spearman |
+| `idxstats_spearman` | ≥ 0.95 | Primary contigs (1–22, X, Y, MT) mapped-count Spearman |
 
 Aligned with MethylPipeline [`mojo-fq2bam-concordance-gates.md`](../../../MethylPipeline/docs/plans/mojo-fq2bam-concordance-gates.md).
 

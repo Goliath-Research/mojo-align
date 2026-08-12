@@ -17,7 +17,7 @@
 #   --parabricks-sample DIR   Or set PARABRICKS_SAMPLE
 #   --ref FASTA          Reference (must have sibling .bwameth.c2t for Clara)
 #   --max-pairs N        Subset first N PE pairs (0 = all; default 50000)
-#   --device DEV         Mojo device (default nvidia)
+#   --device DEV         Mojo device (default auto — DeviceContext probe)
 #   --image IMAGE        Clara docker image (default nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1)
 #   --skip-clara         Only run Mojo (compare against existing Clara BAM)
 #   --skip-mojo          Only run Clara
@@ -41,7 +41,8 @@ SAMPLE_ID="${SAMPLE_ID:-parabricks_sample}"
 PB_SAMPLE="${PARABRICKS_SAMPLE:-}"
 REF_OVERRIDE="${REF_OVERRIDE:-}"
 MAX_PAIRS="${MAX_PAIRS:-50000}"
-DEVICE="${DEVICE:-nvidia}"
+DEVICE="${DEVICE:-auto}"
+CLARA_MIN_HBM_GIB="${CLARA_MIN_HBM_GIB:-48}"
 PB_IMAGE="${METHYL_PARABRICKS_IMAGE:-nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1}"
 FLEET_REF="${METHYL_REFERENCE_FASTA:-/work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa}"
 RUN_CLARA=1
@@ -208,11 +209,21 @@ else
   R2="$R2_SRC"
 fi
 
+require_clara_hbm() {
+  # Clara fq2bam_meth needs a ~48 GiB-class GPU; detect via nvidia-smi/rocm-smi.
+  export PYTHONPATH="${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+  python3 - <<PY
+from gpu_mem import require_total_hbm_gib
+require_total_hbm_gib(float("${CLARA_MIN_HBM_GIB}"), device="auto")
+PY
+}
+
 run_clara() {
   local out_bam="$SAMPLE_DIR/$ALIGN_PB/${SAMPLE_ID}.bam"
   local work="$SAMPLE_DIR/$ALIGN_PB/work"
   mkdir -p "$work"
   echo "=== $ALIGN_PB (Clara pbrun fq2bam_meth) ==="
+  require_clara_hbm
   if command -v pbrun >/dev/null 2>&1; then
     pbrun fq2bam_meth \
       --ref "$REF" \
@@ -273,11 +284,13 @@ run_mojo() {
   export METHYLGRAPHER_GPU_REQUIRE="${METHYLGRAPHER_GPU_REQUIRE:-1}"
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
   # Rare-kmer locate: skip ultra-repetitive C2T keys (max occ ~7.7M otherwise).
-  export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-256}"
-  export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-5}"
+  export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-16384}"
+  export METHYLGRAPHER_LINEAR_VOTE_OCC="${METHYLGRAPHER_LINEAR_VOTE_OCC:-256}"
+  export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-3}"
   export METHYLGRAPHER_LINEAR_READ_BATCH="${METHYLGRAPHER_LINEAR_READ_BATCH:-2048}"
-  export METHYLGRAPHER_LINEAR_MAX_DIFF="${METHYLGRAPHER_LINEAR_MAX_DIFF:-6}"
-  export METHYLGRAPHER_LINEAR_MAX_SOFT="${METHYLGRAPHER_LINEAR_MAX_SOFT:-8}"
+  export METHYLGRAPHER_LINEAR_MAX_DIFF="${METHYLGRAPHER_LINEAR_MAX_DIFF:-8}"
+  export METHYLGRAPHER_LINEAR_MAX_SOFT="${METHYLGRAPHER_LINEAR_MAX_SOFT:-12}"
+  export METHYLGRAPHER_LINEAR_MAX_INDEL="${METHYLGRAPHER_LINEAR_MAX_INDEL:-4}"
   # Dense GRCh38: full GPU path (keys+offsets+postings+sequences resident).
   export METHYLGRAPHER_LINEAR_GPU_LOCATE="${METHYLGRAPHER_LINEAR_GPU_LOCATE:-1}"
   # Locate on sorted 2-bit keys: bsearch (default) or interp.

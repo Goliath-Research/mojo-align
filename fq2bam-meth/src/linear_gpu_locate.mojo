@@ -1,7 +1,7 @@
-# Full-GPU dense-v1 linear WGBS map (NVIDIA DeviceContext).
+# Full-GPU dense-v1 linear WGBS map (DeviceContext: NVIDIA cuda / AMD hip).
 #
-# Resident on device (~27 GiB science): kmers + offsets + postings + sequences
-# + contig_offsets. Per batch: 2-bit encode → locate → vote → gapless on GPU.
+# Resident on device: kmers + offsets + postings + sequences + contig_offsets.
+# Per batch: 2-bit encode → locate → vote → mismatch/softclip/indel extend.
 # Host only streams FASTQ and formats SAM from compact hit records.
 #
 # Locate default = binary search on sorted keys. Optional interpolation search
@@ -187,8 +187,15 @@ def _hit_from_gpu(
     flag: Int,
     soft_l: Int,
     soft_r: Int,
+    indel_op: Int = 0,
+    indel_at: Int = 0,
+    indel_len: Int = 0,
 ) raises -> LinearHit:
-    """Build SAM hit; SEQ is pre-conversion (GATK/Picard), RC if flag 0x10."""
+    """Build SAM hit; SEQ is pre-conversion (GATK/Picard), RC if flag 0x10.
+
+    indel_op: 0=none, 1=insertion (I), 2=deletion (D). indel_at is query
+    bases matched before the indel within the non-softclipped middle.
+    """
     var qlen = align_seq.byte_length()
     var emit = original_seq
     if emit.byte_length() == 0:
@@ -201,7 +208,28 @@ def _hit_from_gpu(
     var cigar = String("")
     if soft_l > 0:
         cigar = cigar + String(soft_l) + "S"
-    cigar = cigar + String(m) + "M"
+    if indel_op == 1 and indel_len > 0 and indel_at >= 0 and indel_at <= m:
+        # Insertion consumes query bases only.
+        var left = indel_at
+        var right = m - indel_at - indel_len
+        if right < 0:
+            return LinearHit(name, 4, "*", 0, 0, "*", emit, "*")
+        if left > 0:
+            cigar = cigar + String(left) + "M"
+        cigar = cigar + String(indel_len) + "I"
+        if right > 0:
+            cigar = cigar + String(right) + "M"
+    elif indel_op == 2 and indel_len > 0 and indel_at >= 0 and indel_at <= m:
+        # Deletion consumes reference only; middle query length stays m.
+        var left_d = indel_at
+        var right_d = m - indel_at
+        if left_d > 0:
+            cigar = cigar + String(left_d) + "M"
+        cigar = cigar + String(indel_len) + "D"
+        if right_d > 0:
+            cigar = cigar + String(right_d) + "M"
+    else:
+        cigar = cigar + String(m) + "M"
     if soft_r > 0:
         cigar = cigar + String(soft_r) + "S"
     if (flag & 16) != 0:
@@ -518,6 +546,8 @@ def map_fastq_dense_gpu_locate(
             n_reads: Int,
             max_diff: Int,
             max_soft: Int,
+            max_indel: Int,
+            vote_occ: Int,
             strand_flag: Int32,
             out_cid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
@@ -526,8 +556,11 @@ def map_fastq_dense_gpu_locate(
             out_sl: UnsafePointer[UInt32, MutAnyOrigin],
             out_sr: UnsafePointer[UInt32, MutAnyOrigin],
             out_nm: UnsafePointer[UInt32, MutAnyOrigin],
+            out_iop: UnsafePointer[UInt32, MutAnyOrigin],
+            out_iat: UnsafePointer[UInt32, MutAnyOrigin],
+            out_ilen: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            """Vote top loci; accept with mismatches + end soft-clips (BWA-ish)."""
+            """Vote (rare seeds) + seed-rescue extend (mismatch/softclip/indel)."""
             var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
             if rid >= n_reads:
                 return
@@ -538,48 +571,102 @@ def map_fastq_dense_gpu_locate(
             out_sl[rid] = 0
             out_sr[rid] = 0
             out_nm[rid] = 0
+            out_iop[rid] = 0
+            out_iat[rid] = 0
+            out_ilen[rid] = 0
             var qlen = Int(read_lens[rid])
             if qlen <= 0:
                 return
 
-            comptime TOP = 128
-            comptime KEEP = 8
+            comptime TOP = 256
+            comptime KEEP = 16
             var cand_key = InlineArray[UInt64, TOP](fill=UInt64(0xFFFFFFFFFFFFFFFF))
             var cand_n = InlineArray[Int32, TOP](fill=Int32(0))
             var n_cand = 0
 
-            var slot = 0
-            while slot < slots_per_read:
+            # Vote using seeds sorted by increasing occupancy (rare first).
+            # Dual C2T packs are highly repetitive — processing common seeds
+            # first fills TOP with decoys and drops the true locus.
+            comptime MAX_SLOTS = 128
+            var ord_slot = InlineArray[Int32, MAX_SLOTS](fill=Int32(-1))
+            var ord_occ = InlineArray[Int32, MAX_SLOTS](fill=Int32(0))
+            var n_ord = 0
+            var slot_g = 0
+            while slot_g < slots_per_read and n_ord < MAX_SLOTS:
+                var sidx_g = rid * slots_per_read + slot_g
+                var a_g = Int(occ_start[sidx_g])
+                var b_g = Int(occ_end[sidx_g])
+                var occ_g = b_g - a_g
+                if occ_g > 0 and a_g >= 0 and b_g <= n_postings:
+                    # Insert by ascending occ.
+                    var ins = n_ord
+                    var t = 0
+                    while t < n_ord:
+                        if occ_g < Int(ord_occ[t]):
+                            ins = t
+                            break
+                        t += 1
+                    var shift = n_ord
+                    while shift > ins:
+                        ord_slot[shift] = ord_slot[shift - 1]
+                        ord_occ[shift] = ord_occ[shift - 1]
+                        shift -= 1
+                    ord_slot[ins] = Int32(slot_g)
+                    ord_occ[ins] = Int32(occ_g)
+                    n_ord += 1
+                slot_g += 1
+
+            # Cap used for majority vote (locate may return higher-occ seeds
+            # for rescue). Default vote_occ << locate max_occ.
+            var vote_cap = vote_occ
+            if vote_cap < 1:
+                vote_cap = 256
+
+            var oi = 0
+            while oi < n_ord:
+                var occ_v = Int(ord_occ[oi])
+                if occ_v > vote_cap:
+                    oi += 1
+                    continue
+                var slot = Int(ord_slot[oi])
                 var sidx = rid * slots_per_read + slot
                 var a = Int(occ_start[sidx])
                 var b = Int(occ_end[sidx])
                 var q_off = Int(q_offs[sidx])
-                if b > a and a >= 0 and b <= n_postings:
-                    var pi = a
-                    while pi < b:
-                        var cid = Int(postings[pi * 2])
-                        var pos = Int(postings[pi * 2 + 1])
-                        if cid >= 0 and cid < n_contigs and pos >= q_off:
-                            var start0 = pos - q_off
-                            var vk = (UInt64(cid) << 32) | UInt64(start0)
-                            var found = -1
-                            var ci = 0
-                            while ci < n_cand:
-                                if cand_key[ci] == vk:
-                                    found = ci
-                                    break
-                                ci += 1
-                            if found >= 0:
-                                cand_n[found] = cand_n[found] + 1
-                            elif n_cand < TOP:
-                                cand_key[n_cand] = vk
-                                cand_n[n_cand] = 1
-                                n_cand += 1
-                        pi += 1
-                slot += 1
-
-            if n_cand == 0:
-                return
+                var pi = a
+                while pi < b:
+                    var cid = Int(postings[pi * 2])
+                    var pos = Int(postings[pi * 2 + 1])
+                    if cid >= 0 and cid < n_contigs and pos >= q_off:
+                        var start0 = pos - q_off
+                        var vk = (UInt64(cid) << 32) | UInt64(start0)
+                        var found = -1
+                        var ci = 0
+                        while ci < n_cand:
+                            if cand_key[ci] == vk:
+                                found = ci
+                                break
+                            ci += 1
+                        if found >= 0:
+                            cand_n[found] = cand_n[found] + 1
+                        elif n_cand < TOP:
+                            cand_key[n_cand] = vk
+                            cand_n[n_cand] = 1
+                            n_cand += 1
+                        else:
+                            var min_i = 0
+                            var min_n = cand_n[0]
+                            var zj = 1
+                            while zj < TOP:
+                                if cand_n[zj] < min_n:
+                                    min_n = cand_n[zj]
+                                    min_i = zj
+                                zj += 1
+                            if min_n <= 1:
+                                cand_key[min_i] = vk
+                                cand_n[min_i] = 1
+                    pi += 1
+                oi += 1
 
             # Select up to KEEP highest-vote candidates.
             var pick_i = InlineArray[Int32, KEEP](fill=Int32(-1))
@@ -621,21 +708,49 @@ def map_fastq_dense_gpu_locate(
             var clip_cap = max_soft
             if clip_cap > qlen // 4:
                 clip_cap = qlen // 4
+            var indel_cap = max_indel
+            if indel_cap < 0:
+                indel_cap = 0
+            if indel_cap > 4:
+                indel_cap = 4
+            var shift_cap = indel_cap
+            if shift_cap < 2:
+                shift_cap = 2
+            if shift_cap > 6:
+                shift_cap = 6
+
+            # Best accepted among candidates (lowest edit cost, then votes).
+            var best_cost = 9999
+            var best_votes: Int32 = 0
+            var best_cid = -1
+            var best_pos = 0
+            var best_sl = 0
+            var best_sr = 0
+            var best_iop = 0
+            var best_iat = 0
+            var best_ilen = 0
 
             var pk = 0
-            while pk < n_pick:
+            while pk < n_pick and n_cand > 0:
                 var ix = Int(pick_i[pk])
                 var bkey = cand_key[ix]
                 var votes = pick_n[pk]
                 var bcid = Int(bkey >> 32)
-                var bstart = Int(bkey & UInt64(0xFFFFFFFF))
-                if bcid >= 0 and bcid < n_contigs and bstart >= 0:
+                var bstart0 = Int(bkey & UInt64(0xFFFFFFFF))
+                if bcid >= 0 and bcid < n_contigs and bstart0 >= 0:
                     var off0 = Int(contig_off[bcid])
                     var off1 = Int(contig_off[bcid + 1])
                     var clen = off1 - off0
-                    if bstart + qlen <= clen:
+
+                    var adj = -shift_cap
+                    while adj <= shift_cap:
+                        var bstart = bstart0 + adj
+                        if bstart < 0 or bstart + qlen > clen:
+                            adj += 1
+                            continue
                         var ref_base = off0 + bstart
-                        # Mismatch mask along the read.
+
+                        # Gapless + end soft-clip.
                         var nm_all = 0
                         var j = 0
                         while j < qlen:
@@ -658,7 +773,6 @@ def map_fastq_dense_gpu_locate(
                         var sr = 0
                         var nm = nm_all
                         if nm_all > budget:
-                            # Trim mismatch-heavy ends (soft-clip), re-score middle.
                             while sl < clip_cap:
                                 var rb0 = sequences[ref_base + sl]
                                 var rc0: UInt8 = 255
@@ -712,25 +826,630 @@ def map_fastq_dense_gpu_locate(
 
                         var alen = qlen - sl - sr
                         if nm <= budget and alen >= 32:
-                            var mq: UInt32 = 20
-                            if votes >= 3:
-                                mq = 40
-                            if votes >= 5:
-                                mq = 60
-                            if nm == 0 and sl == 0 and sr == 0:
-                                mq = mq
-                            elif nm > 2:
-                                if mq > 20:
-                                    mq = 20
-                            out_cid[rid] = Int32(bcid)
-                            out_pos[rid] = UInt32(bstart + sl)
-                            out_mapq[rid] = mq
-                            out_flag[rid] = strand_flag
-                            out_sl[rid] = UInt32(sl)
-                            out_sr[rid] = UInt32(sr)
-                            out_nm[rid] = UInt32(nm)
-                            return
+                            var cost = nm
+                            if (
+                                cost < best_cost
+                                or (cost == best_cost and votes > best_votes)
+                            ):
+                                best_cost = cost
+                                best_votes = votes
+                                best_cid = bcid
+                                best_pos = bstart + sl
+                                best_sl = sl
+                                best_sr = sr
+                                best_iop = 0
+                                best_iat = 0
+                                best_ilen = 0
+
+                        # Single indel only when this start fails gapless/softclip.
+                        # Restrict to adj==0 (voted locus) to keep kernel latency sane.
+                        if (
+                            indel_cap > 0
+                            and adj == 0
+                            and (nm > budget or alen < 32)
+                        ):
+                            var dlen = 1
+                            while dlen <= indel_cap:
+                                # Deletion of dlen ref bases after query offset g.
+                                if bstart + qlen + dlen <= clen:
+                                    var g = 0
+                                    while g <= qlen:
+                                        var nm_d = dlen
+                                        var t = 0
+                                        while t < g and nm_d <= budget:
+                                            var rbd = sequences[ref_base + t]
+                                            var rcd: UInt8 = 255
+                                            if rbd == 65 or rbd == 97:
+                                                rcd = 0
+                                            elif rbd == 67 or rbd == 99:
+                                                rcd = 1
+                                            elif rbd == 71 or rbd == 103:
+                                                rcd = 2
+                                            elif rbd == 84 or rbd == 116:
+                                                rcd = 3
+                                            var qcd = codes[q_base + t]
+                                            if rcd > 3 or qcd > 3 or rcd != qcd:
+                                                nm_d += 1
+                                            t += 1
+                                        while t < qlen and nm_d <= budget:
+                                            var rbd2 = sequences[
+                                                ref_base + t + dlen
+                                            ]
+                                            var rcd2: UInt8 = 255
+                                            if rbd2 == 65 or rbd2 == 97:
+                                                rcd2 = 0
+                                            elif rbd2 == 67 or rbd2 == 99:
+                                                rcd2 = 1
+                                            elif rbd2 == 71 or rbd2 == 103:
+                                                rcd2 = 2
+                                            elif rbd2 == 84 or rbd2 == 116:
+                                                rcd2 = 3
+                                            var qcd2 = codes[q_base + t]
+                                            if (
+                                                rcd2 > 3
+                                                or qcd2 > 3
+                                                or rcd2 != qcd2
+                                            ):
+                                                nm_d += 1
+                                            t += 1
+                                        if nm_d <= budget and (
+                                            nm_d < best_cost
+                                            or (
+                                                nm_d == best_cost
+                                                and votes > best_votes
+                                            )
+                                        ):
+                                            best_cost = nm_d
+                                            best_votes = votes
+                                            best_cid = bcid
+                                            best_pos = bstart
+                                            best_sl = 0
+                                            best_sr = 0
+                                            best_iop = 2
+                                            best_iat = g
+                                            best_ilen = dlen
+                                        g += 1
+
+                                # Insertion of dlen query bases after offset g.
+                                if qlen > dlen and bstart + (qlen - dlen) <= clen:
+                                    var gi = 0
+                                    while gi <= qlen - dlen:
+                                        var nm_i = dlen
+                                        var ti = 0
+                                        while ti < gi and nm_i <= budget:
+                                            var rbi = sequences[ref_base + ti]
+                                            var rci: UInt8 = 255
+                                            if rbi == 65 or rbi == 97:
+                                                rci = 0
+                                            elif rbi == 67 or rbi == 99:
+                                                rci = 1
+                                            elif rbi == 71 or rbi == 103:
+                                                rci = 2
+                                            elif rbi == 84 or rbi == 116:
+                                                rci = 3
+                                            var qci = codes[q_base + ti]
+                                            if rci > 3 or qci > 3 or rci != qci:
+                                                nm_i += 1
+                                            ti += 1
+                                        var tj = gi + dlen
+                                        var rj = gi
+                                        while tj < qlen and nm_i <= budget:
+                                            var rbi2 = sequences[ref_base + rj]
+                                            var rci2: UInt8 = 255
+                                            if rbi2 == 65 or rbi2 == 97:
+                                                rci2 = 0
+                                            elif rbi2 == 67 or rbi2 == 99:
+                                                rci2 = 1
+                                            elif rbi2 == 71 or rbi2 == 103:
+                                                rci2 = 2
+                                            elif rbi2 == 84 or rbi2 == 116:
+                                                rci2 = 3
+                                            var qci2 = codes[q_base + tj]
+                                            if (
+                                                rci2 > 3
+                                                or qci2 > 3
+                                                or rci2 != qci2
+                                            ):
+                                                nm_i += 1
+                                            tj += 1
+                                            rj += 1
+                                        if nm_i <= budget and (
+                                            nm_i < best_cost
+                                            or (
+                                                nm_i == best_cost
+                                                and votes > best_votes
+                                            )
+                                        ):
+                                            best_cost = nm_i
+                                            best_votes = votes
+                                            best_cid = bcid
+                                            best_pos = bstart
+                                            best_sl = 0
+                                            best_sr = 0
+                                            best_iop = 1
+                                            best_iat = gi
+                                            best_ilen = dlen
+                                        gi += 1
+                                dlen += 1
+
+                        # Exact hit — stop searching further adj / candidates.
+                        if best_cost == 0:
+                            break
+                        adj += 1
+
+                    if best_cost == 0:
+                        break
                 pk += 1
+
+            # Seed-rescue from rarest seeds. High-occ seeds (occ>vote_cap):
+            # tally full-length exact hits across seeds; accept a locus only
+            # if it wins with ≥2 seeds and beats the runner-up (repetitive
+            # decoys rarely share the same start across independent seeds).
+            if best_cid < 0 or best_cost > 0:
+                comptime HX = 48
+                var hx_key = InlineArray[UInt64, HX](fill=UInt64(0xFFFFFFFFFFFFFFFF))
+                var hx_n = InlineArray[Int32, HX](fill=Int32(0))
+                var hx_min_occ = InlineArray[Int32, HX](fill=Int32(0x7FFFFFFF))
+                var n_hx = 0
+                var ri = 0
+                var n_high_tried = 0
+                while ri < n_ord:
+                    var occ_r = Int(ord_occ[ri])
+                    if occ_r <= 0:
+                        ri += 1
+                        continue
+                    var high_occ = occ_r > vote_cap
+                    if high_occ:
+                        # Try all high-occ seeds (sorted rare→common). Early
+                        # exit once a locus has a clear multi-seed plurality.
+                        n_high_tried += 1
+                        if n_high_tried > 64:
+                            ri += 1
+                            continue
+                    var slot_r = Int(ord_slot[ri])
+                    var sidx_r = rid * slots_per_read + slot_r
+                    var a_r = Int(occ_start[sidx_r])
+                    var b_r = Int(occ_end[sidx_r])
+                    var q_off_r = Int(q_offs[sidx_r])
+
+                    if high_occ:
+                        var pi_h = a_r
+                        while pi_h < b_r:
+                            var cid_h = Int(postings[pi_h * 2])
+                            var pos_h = Int(postings[pi_h * 2 + 1])
+                            if (
+                                cid_h >= 0
+                                and cid_h < n_contigs
+                                and pos_h >= q_off_r
+                            ):
+                                var bs_h = pos_h - q_off_r
+                                var o0_h = Int(contig_off[cid_h])
+                                var o1_h = Int(contig_off[cid_h + 1])
+                                if bs_h >= 0 and bs_h + qlen <= (o1_h - o0_h):
+                                    var ref_h = o0_h + bs_h
+                                    var nm_h = 0
+                                    var jh = 0
+                                    while jh < qlen and nm_h == 0:
+                                        var rbh = sequences[ref_h + jh]
+                                        var rch: UInt8 = 255
+                                        if rbh == 65 or rbh == 97:
+                                            rch = 0
+                                        elif rbh == 67 or rbh == 99:
+                                            rch = 1
+                                        elif rbh == 71 or rbh == 103:
+                                            rch = 2
+                                        elif rbh == 84 or rbh == 116:
+                                            rch = 3
+                                        var qch = codes[q_base + jh]
+                                        if rch > 3 or qch > 3 or rch != qch:
+                                            nm_h = 1
+                                        jh += 1
+                                    if nm_h == 0:
+                                        var vk_h = (UInt64(cid_h) << 32) | UInt64(
+                                            bs_h
+                                        )
+                                        var found_h = -1
+                                        var ci_h = 0
+                                        while ci_h < n_hx:
+                                            if hx_key[ci_h] == vk_h:
+                                                found_h = ci_h
+                                                break
+                                            ci_h += 1
+                                        if found_h >= 0:
+                                            hx_n[found_h] = hx_n[found_h] + 1
+                                            if Int32(occ_r) < hx_min_occ[found_h]:
+                                                hx_min_occ[found_h] = Int32(occ_r)
+                                        elif n_hx < HX:
+                                            hx_key[n_hx] = vk_h
+                                            hx_n[n_hx] = 1
+                                            hx_min_occ[n_hx] = Int32(occ_r)
+                                            n_hx += 1
+                            pi_h += 1
+                        # Early-stop high-occ scan once plurality is clear.
+                        if n_hx > 0:
+                            var b1 = 0
+                            var b2 = 0
+                            var zi = 0
+                            while zi < n_hx:
+                                var zv = Int(hx_n[zi])
+                                if zv > b1:
+                                    b2 = b1
+                                    b1 = zv
+                                elif zv > b2:
+                                    b2 = zv
+                                zi += 1
+                            if b1 >= 3 and b1 > b2:
+                                # Skip remaining high-occ seeds.
+                                while ri + 1 < n_ord and Int(ord_occ[ri + 1]) > vote_cap:
+                                    ri += 1
+                        ri += 1
+                        continue
+
+                    # Low-occ rescue: gapless → softclip → single-indel.
+                    var pi_r = a_r
+                    while pi_r < b_r:
+                        var cid_r = Int(postings[pi_r * 2])
+                        var pos_r = Int(postings[pi_r * 2 + 1])
+                        if (
+                            cid_r >= 0
+                            and cid_r < n_contigs
+                            and pos_r >= q_off_r
+                        ):
+                            var bstart_r = pos_r - q_off_r
+                            var off0_r = Int(contig_off[cid_r])
+                            var off1_r = Int(contig_off[cid_r + 1])
+                            var clen_r = off1_r - off0_r
+                            if bstart_r >= 0 and bstart_r + qlen <= clen_r:
+                                var ref_r = off0_r + bstart_r
+                                var nm_r = 0
+                                var jr = 0
+                                while jr < qlen and nm_r <= budget:
+                                    var rb = sequences[ref_r + jr]
+                                    var rc: UInt8 = 255
+                                    if rb == 65 or rb == 97:
+                                        rc = 0
+                                    elif rb == 67 or rb == 99:
+                                        rc = 1
+                                    elif rb == 71 or rb == 103:
+                                        rc = 2
+                                    elif rb == 84 or rb == 116:
+                                        rc = 3
+                                    var qc = codes[q_base + jr]
+                                    if rc > 3 or qc > 3 or rc != qc:
+                                        nm_r += 1
+                                    jr += 1
+
+                                var sl_r = 0
+                                var sr_r = 0
+                                var cost_r = nm_r
+                                var iop_r = 0
+                                var iat_r = 0
+                                var ilen_r = 0
+                                var pos_out = bstart_r
+
+                                if nm_r > budget and clip_cap > 0:
+                                    while sl_r < clip_cap:
+                                        var rb0 = sequences[ref_r + sl_r]
+                                        var rc0: UInt8 = 255
+                                        if rb0 == 65 or rb0 == 97:
+                                            rc0 = 0
+                                        elif rb0 == 67 or rb0 == 99:
+                                            rc0 = 1
+                                        elif rb0 == 71 or rb0 == 103:
+                                            rc0 = 2
+                                        elif rb0 == 84 or rb0 == 116:
+                                            rc0 = 3
+                                        var qc0 = codes[q_base + sl_r]
+                                        if rc0 <= 3 and qc0 <= 3 and rc0 == qc0:
+                                            break
+                                        sl_r += 1
+                                    while sr_r < clip_cap:
+                                        var jrr = qlen - 1 - sr_r
+                                        if jrr <= sl_r:
+                                            break
+                                        var rb1 = sequences[ref_r + jrr]
+                                        var rc1: UInt8 = 255
+                                        if rb1 == 65 or rb1 == 97:
+                                            rc1 = 0
+                                        elif rb1 == 67 or rb1 == 99:
+                                            rc1 = 1
+                                        elif rb1 == 71 or rb1 == 103:
+                                            rc1 = 2
+                                        elif rb1 == 84 or rb1 == 116:
+                                            rc1 = 3
+                                        var qc1 = codes[q_base + jrr]
+                                        if rc1 <= 3 and qc1 <= 3 and rc1 == qc1:
+                                            break
+                                        sr_r += 1
+                                    cost_r = 0
+                                    var jm = sl_r
+                                    while jm < qlen - sr_r:
+                                        var rbm = sequences[ref_r + jm]
+                                        var rcm: UInt8 = 255
+                                        if rbm == 65 or rbm == 97:
+                                            rcm = 0
+                                        elif rbm == 67 or rbm == 99:
+                                            rcm = 1
+                                        elif rbm == 71 or rbm == 103:
+                                            rcm = 2
+                                        elif rbm == 84 or rbm == 116:
+                                            rcm = 3
+                                        var qcm = codes[q_base + jm]
+                                        if rcm > 3 or qcm > 3 or rcm != qcm:
+                                            cost_r += 1
+                                        jm += 1
+                                    pos_out = bstart_r + sl_r
+                                    if qlen - sl_r - sr_r < 32:
+                                        cost_r = 9999
+
+                                # Single indel at seed locus (size 1..indel_cap).
+                                if indel_cap > 0 and cost_r > budget:
+                                    var dlen = 1
+                                    while dlen <= indel_cap:
+                                        if bstart_r + qlen + dlen <= clen_r:
+                                            var g = q_off_r
+                                            if g > qlen:
+                                                g = qlen
+                                            # Prefer indel near the seed offset.
+                                            var g0 = g - 8
+                                            if g0 < 0:
+                                                g0 = 0
+                                            var g1 = g + 8
+                                            if g1 > qlen:
+                                                g1 = qlen
+                                            var gg = g0
+                                            while gg <= g1:
+                                                var nm_d = dlen
+                                                var t = 0
+                                                while t < gg and nm_d <= budget:
+                                                    var rbd = sequences[
+                                                        ref_r + t
+                                                    ]
+                                                    var rcd: UInt8 = 255
+                                                    if rbd == 65 or rbd == 97:
+                                                        rcd = 0
+                                                    elif rbd == 67 or rbd == 99:
+                                                        rcd = 1
+                                                    elif (
+                                                        rbd == 71 or rbd == 103
+                                                    ):
+                                                        rcd = 2
+                                                    elif (
+                                                        rbd == 84 or rbd == 116
+                                                    ):
+                                                        rcd = 3
+                                                    var qcd = codes[q_base + t]
+                                                    if (
+                                                        rcd > 3
+                                                        or qcd > 3
+                                                        or rcd != qcd
+                                                    ):
+                                                        nm_d += 1
+                                                    t += 1
+                                                while t < qlen and nm_d <= budget:
+                                                    var rbd2 = sequences[
+                                                        ref_r + t + dlen
+                                                    ]
+                                                    var rcd2: UInt8 = 255
+                                                    if rbd2 == 65 or rbd2 == 97:
+                                                        rcd2 = 0
+                                                    elif (
+                                                        rbd2 == 67 or rbd2 == 99
+                                                    ):
+                                                        rcd2 = 1
+                                                    elif (
+                                                        rbd2 == 71
+                                                        or rbd2 == 103
+                                                    ):
+                                                        rcd2 = 2
+                                                    elif (
+                                                        rbd2 == 84
+                                                        or rbd2 == 116
+                                                    ):
+                                                        rcd2 = 3
+                                                    var qcd2 = codes[q_base + t]
+                                                    if (
+                                                        rcd2 > 3
+                                                        or qcd2 > 3
+                                                        or rcd2 != qcd2
+                                                    ):
+                                                        nm_d += 1
+                                                    t += 1
+                                                if nm_d < cost_r:
+                                                    cost_r = nm_d
+                                                    sl_r = 0
+                                                    sr_r = 0
+                                                    iop_r = 2
+                                                    iat_r = gg
+                                                    ilen_r = dlen
+                                                    pos_out = bstart_r
+                                                gg += 1
+                                        if (
+                                            qlen > dlen
+                                            and bstart_r + (qlen - dlen)
+                                            <= clen_r
+                                        ):
+                                            var g2 = q_off_r
+                                            if g2 > qlen - dlen:
+                                                g2 = qlen - dlen
+                                            var g0i = g2 - 8
+                                            if g0i < 0:
+                                                g0i = 0
+                                            var g1i = g2 + 8
+                                            if g1i > qlen - dlen:
+                                                g1i = qlen - dlen
+                                            var gi = g0i
+                                            while gi <= g1i:
+                                                var nm_i = dlen
+                                                var ti = 0
+                                                while ti < gi and nm_i <= budget:
+                                                    var rbi = sequences[
+                                                        ref_r + ti
+                                                    ]
+                                                    var rci: UInt8 = 255
+                                                    if rbi == 65 or rbi == 97:
+                                                        rci = 0
+                                                    elif rbi == 67 or rbi == 99:
+                                                        rci = 1
+                                                    elif (
+                                                        rbi == 71 or rbi == 103
+                                                    ):
+                                                        rci = 2
+                                                    elif (
+                                                        rbi == 84 or rbi == 116
+                                                    ):
+                                                        rci = 3
+                                                    var qci = codes[q_base + ti]
+                                                    if (
+                                                        rci > 3
+                                                        or qci > 3
+                                                        or rci != qci
+                                                    ):
+                                                        nm_i += 1
+                                                    ti += 1
+                                                var tj = gi + dlen
+                                                var rj = gi
+                                                while (
+                                                    tj < qlen and nm_i <= budget
+                                                ):
+                                                    var rbi2 = sequences[
+                                                        ref_r + rj
+                                                    ]
+                                                    var rci2: UInt8 = 255
+                                                    if rbi2 == 65 or rbi2 == 97:
+                                                        rci2 = 0
+                                                    elif (
+                                                        rbi2 == 67 or rbi2 == 99
+                                                    ):
+                                                        rci2 = 1
+                                                    elif (
+                                                        rbi2 == 71
+                                                        or rbi2 == 103
+                                                    ):
+                                                        rci2 = 2
+                                                    elif (
+                                                        rbi2 == 84
+                                                        or rbi2 == 116
+                                                    ):
+                                                        rci2 = 3
+                                                    var qci2 = codes[
+                                                        q_base + tj
+                                                    ]
+                                                    if (
+                                                        rci2 > 3
+                                                        or qci2 > 3
+                                                        or rci2 != qci2
+                                                    ):
+                                                        nm_i += 1
+                                                    tj += 1
+                                                    rj += 1
+                                                if nm_i < cost_r:
+                                                    cost_r = nm_i
+                                                    sl_r = 0
+                                                    sr_r = 0
+                                                    iop_r = 1
+                                                    iat_r = gi
+                                                    ilen_r = dlen
+                                                    pos_out = bstart_r
+                                                gi += 1
+                                        dlen += 1
+
+                                if cost_r <= budget and (
+                                    cost_r < best_cost or best_cid < 0
+                                ):
+                                    best_cost = cost_r
+                                    best_votes = Int32(4)
+                                    if occ_r <= 64:
+                                        best_votes = 5
+                                    best_cid = cid_r
+                                    best_pos = pos_out
+                                    best_sl = sl_r
+                                    best_sr = sr_r
+                                    best_iop = iop_r
+                                    best_iat = iat_r
+                                    best_ilen = ilen_r
+                                    if cost_r == 0 and iop_r == 0:
+                                        pi_r = b_r
+                                        ri = n_ord
+                        pi_r += 1
+                    if best_cost == 0 and best_iop == 0 and best_cid >= 0:
+                        break
+                    ri += 1
+
+                # Resolve high-occ exact tally: need ≥2 seeds and a plurality.
+                # Tie-break by rarer seed evidence (lower min occ) so multi-copy
+                # exact repeats prefer the locus supported by rarer kmers.
+                if n_hx > 0:
+                    var best_hi = 0
+                    var second_hi = 0
+                    var best_hx_i = -1
+                    var best_mocc = 0x7FFFFFFF
+                    var hi = 0
+                    while hi < n_hx:
+                        var vn = Int(hx_n[hi])
+                        var mo = Int(hx_min_occ[hi])
+                        if vn > best_hi:
+                            second_hi = best_hi
+                            best_hi = vn
+                            best_mocc = mo
+                            best_hx_i = hi
+                        elif vn == best_hi and mo < best_mocc:
+                            best_mocc = mo
+                            best_hx_i = hi
+                        elif vn > second_hi:
+                            second_hi = vn
+                        hi += 1
+                    # Accept if ≥2 seeds agree, or a single exact locus is
+                    # unique in the tally (second_hi==0). Ties map with low MAPQ.
+                    if (
+                        best_hx_i >= 0
+                        and (
+                            best_hi >= 2
+                            or (best_hi >= 1 and second_hi == 0)
+                        )
+                        and (
+                            best_cid < 0
+                            or best_cost > 0
+                            or Int(best_votes) < best_hi
+                        )
+                    ):
+                        var bk = hx_key[best_hx_i]
+                        best_cost = 0
+                        if best_hi > second_hi:
+                            best_votes = Int32(best_hi)
+                            if best_votes > 5:
+                                best_votes = 5
+                        else:
+                            best_votes = 1
+                        best_cid = Int(bk >> 32)
+                        best_pos = Int(bk & UInt64(0xFFFFFFFF))
+                        best_sl = 0
+                        best_sr = 0
+                        best_iop = 0
+                        best_iat = 0
+                        best_ilen = 0
+
+            if best_cid >= 0:
+                var mq: UInt32 = 20
+                if best_votes >= 3:
+                    mq = 40
+                if best_votes >= 5:
+                    mq = 60
+                if best_cost > 2:
+                    if mq > 20:
+                        mq = 20
+                if best_iop != 0 and mq > 20:
+                    mq = 20
+                out_cid[rid] = Int32(best_cid)
+                out_pos[rid] = UInt32(best_pos)
+                out_mapq[rid] = mq
+                out_flag[rid] = strand_flag
+                out_sl[rid] = UInt32(best_sl)
+                out_sr[rid] = UInt32(best_sr)
+                out_nm[rid] = UInt32(best_cost)
+                out_iop[rid] = UInt32(best_iop)
+                out_iat[rid] = UInt32(best_iat)
+                out_ilen[rid] = UInt32(best_ilen)
 
         var api = _device_api(resolved)
         var ctx = DeviceContext(api=api)
@@ -830,9 +1549,14 @@ def map_fastq_dense_gpu_locate(
         var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 4096)
         var seed_stride = _env_int("METHYLGRAPHER_LINEAR_SEED_STRIDE", 5)
         var max_occ = index.max_occ()
+        # Majority-vote only uses seeds at or below vote_occ; higher-occ seeds
+        # from locate are exact-only rescue candidates.
+        var vote_occ = _env_int("METHYLGRAPHER_LINEAR_VOTE_OCC", 256)
         # ~4% mismatches + end soft-clip — closes most of the exact-only map gap.
         var max_diff = _env_int("METHYLGRAPHER_LINEAR_MAX_DIFF", 6)
         var max_soft = _env_int("METHYLGRAPHER_LINEAR_MAX_SOFT", 8)
+        # Single-indel gapped extend (1..N bp I/D) after gapless/softclip.
+        var max_indel = _env_int("METHYLGRAPHER_LINEAR_MAX_INDEL", 4)
         # Reverse orientation is required even on bwameth f*/r* packs (BWA
         # still sets 0x10 against the converted contig). Set LINEAR_RC=0 only
         # for experiments.
@@ -850,10 +1574,14 @@ def map_fastq_dense_gpu_locate(
             seed_stride,
             " max_occ=",
             max_occ,
+            " vote_occ=",
+            vote_occ,
             " max_diff=",
             max_diff,
             " max_soft=",
             max_soft,
+            " max_indel=",
+            max_indel,
             " rc=",
             do_rc,
             " paired=",
@@ -938,6 +1666,9 @@ def map_fastq_dense_gpu_locate(
             var dev_sl_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_sr_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_nm_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_iop_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_iat_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_ilen_f = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_cid_r = ctx.enqueue_create_buffer[DType.int32](n_seq)
             var dev_pos_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_mapq_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
@@ -945,6 +1676,9 @@ def map_fastq_dense_gpu_locate(
             var dev_sl_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_sr_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             var dev_nm_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_iop_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_iat_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+            var dev_ilen_r = ctx.enqueue_create_buffer[DType.uint32](n_seq)
 
             ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
             ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
@@ -1015,6 +1749,8 @@ def map_fastq_dense_gpu_locate(
                 n_seq,
                 max_diff,
                 max_soft,
+                max_indel,
+                vote_occ,
                 Int32(0),
                 dev_cid_f.unsafe_ptr(),
                 dev_pos_f.unsafe_ptr(),
@@ -1023,6 +1759,9 @@ def map_fastq_dense_gpu_locate(
                 dev_sl_f.unsafe_ptr(),
                 dev_sr_f.unsafe_ptr(),
                 dev_nm_f.unsafe_ptr(),
+                dev_iop_f.unsafe_ptr(),
+                dev_iat_f.unsafe_ptr(),
+                dev_ilen_f.unsafe_ptr(),
                 grid_dim=grid_r,
                 block_dim=BLOCK,
             )
@@ -1093,6 +1832,8 @@ def map_fastq_dense_gpu_locate(
                     n_seq,
                     max_diff,
                     max_soft,
+                    max_indel,
+                    vote_occ,
                     Int32(16),
                     dev_cid_r.unsafe_ptr(),
                     dev_pos_r.unsafe_ptr(),
@@ -1101,6 +1842,9 @@ def map_fastq_dense_gpu_locate(
                     dev_sl_r.unsafe_ptr(),
                     dev_sr_r.unsafe_ptr(),
                     dev_nm_r.unsafe_ptr(),
+                    dev_iop_r.unsafe_ptr(),
+                    dev_iat_r.unsafe_ptr(),
+                    dev_ilen_r.unsafe_ptr(),
                     grid_dim=grid_r,
                     block_dim=BLOCK,
                 )
@@ -1122,6 +1866,9 @@ def map_fastq_dense_gpu_locate(
             var host_sl_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_sr_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_nm_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_iop_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_iat_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_ilen_f = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_cid_r = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
             var host_pos_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_mapq_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
@@ -1129,6 +1876,9 @@ def map_fastq_dense_gpu_locate(
             var host_sl_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_sr_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             var host_nm_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_iop_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_iat_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            var host_ilen_r = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_f)
             ctx.enqueue_copy(src_buf=dev_pos_f, dst_buf=host_pos_f)
             ctx.enqueue_copy(src_buf=dev_mapq_f, dst_buf=host_mapq_f)
@@ -1136,6 +1886,9 @@ def map_fastq_dense_gpu_locate(
             ctx.enqueue_copy(src_buf=dev_sl_f, dst_buf=host_sl_f)
             ctx.enqueue_copy(src_buf=dev_sr_f, dst_buf=host_sr_f)
             ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_f)
+            ctx.enqueue_copy(src_buf=dev_iop_f, dst_buf=host_iop_f)
+            ctx.enqueue_copy(src_buf=dev_iat_f, dst_buf=host_iat_f)
+            ctx.enqueue_copy(src_buf=dev_ilen_f, dst_buf=host_ilen_f)
             ctx.enqueue_copy(src_buf=dev_cid_r, dst_buf=host_cid_r)
             ctx.enqueue_copy(src_buf=dev_pos_r, dst_buf=host_pos_r)
             ctx.enqueue_copy(src_buf=dev_mapq_r, dst_buf=host_mapq_r)
@@ -1143,6 +1896,9 @@ def map_fastq_dense_gpu_locate(
             ctx.enqueue_copy(src_buf=dev_sl_r, dst_buf=host_sl_r)
             ctx.enqueue_copy(src_buf=dev_sr_r, dst_buf=host_sr_r)
             ctx.enqueue_copy(src_buf=dev_nm_r, dst_buf=host_nm_r)
+            ctx.enqueue_copy(src_buf=dev_iop_r, dst_buf=host_iop_r)
+            ctx.enqueue_copy(src_buf=dev_iat_r, dst_buf=host_iat_r)
+            ctx.enqueue_copy(src_buf=dev_ilen_r, dst_buf=host_ilen_r)
             ctx.synchronize()
 
             var n1 = len(batch1)
@@ -1174,6 +1930,9 @@ def map_fastq_dense_gpu_locate(
                         Int(host_flag_r[j]),
                         Int(host_sl_r[j]),
                         Int(host_sr_r[j]),
+                        Int(host_iop_r[j]),
+                        Int(host_iat_r[j]),
+                        Int(host_ilen_r[j]),
                     )
                 else:
                     h1 = _hit_from_gpu(
@@ -1187,6 +1946,9 @@ def map_fastq_dense_gpu_locate(
                         Int(host_flag_f[j]),
                         Int(host_sl_f[j]),
                         Int(host_sr_f[j]),
+                        Int(host_iop_f[j]),
+                        Int(host_iat_f[j]),
+                        Int(host_ilen_f[j]),
                     )
                 h1.qual = batch1[j].qual
                 if not paired:
@@ -1222,6 +1984,9 @@ def map_fastq_dense_gpu_locate(
                             Int(host_flag_r[r2i]),
                             Int(host_sl_r[r2i]),
                             Int(host_sr_r[r2i]),
+                            Int(host_iop_r[r2i]),
+                            Int(host_iat_r[r2i]),
+                            Int(host_ilen_r[r2i]),
                         )
                     else:
                         h2 = _hit_from_gpu(
@@ -1235,6 +2000,9 @@ def map_fastq_dense_gpu_locate(
                             Int(host_flag_f[r2i]),
                             Int(host_sl_f[r2i]),
                             Int(host_sr_f[r2i]),
+                            Int(host_iop_f[r2i]),
+                            Int(host_iat_f[r2i]),
+                            Int(host_ilen_f[r2i]),
                         )
                     h2.qual = batch2[j].qual
                     var paired_hits = pair_hits(h1, h2)

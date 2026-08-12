@@ -85,10 +85,24 @@ def hbm_info_rocm() -> Optional[GpuHbmInfo]:
     return GpuHbmInfo(free, total, "rocm-smi")
 
 
-def hbm_info(device: str = "nvidia") -> GpuHbmInfo:
-    """Return free/total HBM or raise with a clear probe error."""
-    d = (device or "nvidia").strip().lower()
-    if d in {"nvidia", "cuda", "auto", ""}:
+def hbm_info(device: str = "auto") -> GpuHbmInfo:
+    """Return free/total HBM or raise with a clear probe error.
+
+    ``auto`` probes NVIDIA then AMD (same preference as Mojo ``select_device``).
+    """
+    d = (device or "auto").strip().lower()
+    if d in {"auto", ""}:
+        info = hbm_info_nvidia()
+        if info is not None:
+            return info
+        info = hbm_info_rocm()
+        if info is not None:
+            return info
+        raise RuntimeError(
+            "GPU HBM preflight: neither nvidia-smi nor rocm-smi reported "
+            "device memory (is a GPU driver up?)"
+        )
+    if d in {"nvidia", "cuda"}:
         info = hbm_info_nvidia()
         if info is not None:
             return info
@@ -105,6 +119,57 @@ def hbm_info(device: str = "nvidia") -> GpuHbmInfo:
             "(is ROCm installed on PATH?)"
         )
     raise RuntimeError(f"GPU HBM preflight: unsupported device={device!r}")
+
+
+def require_total_hbm_gib(
+    min_total_gib: float,
+    *,
+    device: str = "auto",
+) -> dict:
+    """Fail closed if GPU *total* HBM is below ``min_total_gib``.
+
+    Used for Clara Parabricks ``fq2bam_meth`` (needs ~48 GiB-class GPUs).
+    Set ``METHYLGRAPHER_CLARA_HBM_PREFLIGHT=0`` to skip.
+    """
+    if os.environ.get("METHYLGRAPHER_CLARA_HBM_PREFLIGHT", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return {"skipped": True}
+    if min_total_gib <= 0:
+        raise RuntimeError("require_total_hbm_gib: min_total_gib must be > 0")
+    info = hbm_info(device)
+    need = int(float(min_total_gib) * float(1024**3))
+    report = {
+        "skipped": False,
+        "source": info.source,
+        "free_bytes": info.free_bytes,
+        "total_bytes": info.total_bytes,
+        "min_total_gib": float(min_total_gib),
+        "free_gib": _gib(info.free_bytes),
+        "total_gib": _gib(info.total_bytes),
+    }
+    print(
+        "clara_hbm_preflight source=",
+        info.source,
+        " total_gib=",
+        round(report["total_gib"], 3),
+        " free_gib=",
+        round(report["free_gib"], 3),
+        " min_total_gib=",
+        min_total_gib,
+        flush=True,
+    )
+    if info.total_bytes < need:
+        raise RuntimeError(
+            "Clara fq2bam_meth requires a GPU with at least "
+            f"{min_total_gib:.0f} GiB HBM; have {report['total_gib']:.2f} GiB total "
+            f"(via {info.source}). Use an A6000/A100-80/H100/GH200-class device, "
+            "or set METHYLGRAPHER_CLARA_HBM_PREFLIGHT=0 to skip."
+        )
+    return report
 
 
 def hbm_fraction_from_env() -> Optional[float]:

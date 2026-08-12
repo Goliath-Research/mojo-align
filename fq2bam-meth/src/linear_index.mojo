@@ -426,10 +426,12 @@ struct LinearIndex(Copyable, Movable):
     def max_occ(self) raises -> Int:
         """Skip k-mers with more than this many genome hits (BWA-style)."""
         var os_mod = Python.import_module("os")
-        var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_MAX_OCC", "128"))
+        # Locate cap: dual C2T packs leave many true-locus seeds at occ
+        # 2k–12k. Voting uses VOTE_OCC; higher-occ seeds are exact-only rescue.
+        var raw = String(os_mod.environ.get("METHYLGRAPHER_LINEAR_MAX_OCC", "16384"))
         var n = Int(raw)
         if n < 1:
-            return 128
+            return 512
         return n
 
     def _dense_find_key(self, key: UInt64) raises -> Int:

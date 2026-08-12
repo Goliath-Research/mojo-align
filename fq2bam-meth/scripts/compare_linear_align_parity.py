@@ -141,10 +141,21 @@ def compare(
 
     idx_clara = _idxstats_counts(clara_bam)
     idx_mojo = _idxstats_counts(mojo_bam)
-    chroms = sorted(set(idx_clara) | set(idx_mojo))
+    # Gate on primary assembly contigs (1–22, X, Y, MT). Alt/decoy/random
+    # contigs are sparse on 50k smokes and dominate all-contig Spearman noise
+    # without reflecting WGBS science concordance.
+    primary = {str(i) for i in range(1, 23)} | {"X", "Y", "MT", "chrM", "chrX", "chrY"}
+    primary |= {f"chr{i}" for i in range(1, 23)}
+    chroms_all = sorted(set(idx_clara) | set(idx_mojo))
+    chroms = [c for c in chroms_all if c in primary]
+    if len(chroms) < 2:
+        chroms = chroms_all
     xs = [float(idx_clara.get(c, 0)) for c in chroms]
     ys = [float(idx_mojo.get(c, 0)) for c in chroms]
     spearman = _spearman(xs, ys) if chroms else 1.0
+    xs_all = [float(idx_clara.get(c, 0)) for c in chroms_all]
+    ys_all = [float(idx_mojo.get(c, 0)) for c in chroms_all]
+    spearman_all = _spearman(xs_all, ys_all) if chroms_all else 1.0
 
     mapped_pass = delta <= max_delta
     idx_pass = spearman >= min_idxstats_spearman
@@ -170,6 +181,8 @@ def compare(
         "abs_delta_mapped_rate": delta,
         "max_delta": max_delta,
         "idxstats_spearman": spearman,
+        "idxstats_spearman_all_contigs": spearman_all,
+        "idxstats_chroms": chroms,
         "min_idxstats_spearman": min_idxstats_spearman,
         "gates": {
             "mapped_rate": mapped_pass,

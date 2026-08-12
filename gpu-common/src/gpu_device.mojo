@@ -28,8 +28,15 @@ def select_device(requested: String) raises -> String:
         if req == "":
             req = String("auto")
     if req == "auto":
-        # Probe with shutil.which first — subprocess.run raises FileNotFoundError
-        # when the binary is missing (common inside Docker without --gpus).
+        # Prefer a DeviceContext that actually opens (cuda then hip), then
+        # fall back to presence of nvidia-smi / rocm-smi. Callers should
+        # pass -device auto; do not hardcode nvidia|amd at the CLI.
+        var cuda_probe = probe_device_context(String(DEVICE_NVIDIA))
+        if cuda_probe.startswith("devicecontext-cuda"):
+            return String(DEVICE_NVIDIA)
+        var hip_probe = probe_device_context(String(DEVICE_AMD))
+        if hip_probe.startswith("devicecontext-hip"):
+            return String(DEVICE_AMD)
         var sp = Python.import_module("subprocess")
         var shutil = Python.import_module("shutil")
         if shutil.which("nvidia-smi") is not None:
