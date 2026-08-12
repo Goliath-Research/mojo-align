@@ -97,6 +97,37 @@ def _read_one(fh: PythonObject) raises -> FastqRec:
     return FastqRec(bare, s, q)
 
 
+def _read_pe_batch(
+    fh1: PythonObject,
+    fh2: PythonObject,
+    paired: Bool,
+    batch_size: Int,
+    bs_r1: String,
+    bs_r2: String,
+    mut batch1: List[FastqRec],
+    mut batch2: List[FastqRec],
+) raises:
+    """Read up to batch_size PE (or SE) records into batch1/batch2. Empty ⇒ EOF."""
+    batch1 = List[FastqRec]()
+    batch2 = List[FastqRec]()
+    var i = 0
+    while i < batch_size:
+        var r1 = _read_one(fh1)
+        if r1.name.byte_length() == 0:
+            break
+        if bs_r1.byte_length() > 0:
+            r1.seq = _bs_convert(r1.seq, bs_r1)
+        batch1.append(r1^)
+        if paired:
+            var r2 = _read_one(fh2)
+            if r2.name.byte_length() == 0:
+                raise Error("paired FASTQ length mismatch (R2 ended early)")
+            if bs_r2.byte_length() > 0:
+                r2.seq = _bs_convert(r2.seq, bs_r2)
+            batch2.append(r2^)
+        i += 1
+
+
 def _env_int(name: String, default: Int) raises -> Int:
     var os_mod = Python.import_module("os")
     var raw = String(os_mod.environ.get(name, String(default)))
@@ -548,6 +579,12 @@ def map_fastq_dense_gpu_locate(
             max_soft: Int,
             max_indel: Int,
             vote_occ: Int,
+            # 0 = fast (vote + low-occ rescue); 1 = high-occ exact for unmapped only.
+            pass_mode: Int,
+            # When n_active >= 0, threads map through rid_map (compacted unmapped).
+            # When n_active < 0, thread i handles read i (full batch).
+            n_active: Int,
+            rid_map: UnsafePointer[Int32, MutAnyOrigin],
             strand_flag: Int32,
             out_cid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
@@ -560,9 +597,19 @@ def map_fastq_dense_gpu_locate(
             out_iat: UnsafePointer[UInt32, MutAnyOrigin],
             out_ilen: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            """Vote (rare seeds) + seed-rescue extend (mismatch/softclip/indel)."""
-            var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
-            if rid >= n_reads:
+            """Two-pass extend: fast vote/rescue, then compacted high-occ for unmapped."""
+            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var rid: Int
+            if n_active >= 0:
+                if tid >= n_active:
+                    return
+                rid = Int(rid_map[tid])
+            else:
+                rid = tid
+                if rid >= n_reads:
+                    return
+            # Pass 1 safety: leave already-mapped reads alone.
+            if pass_mode == 1 and Int(out_cid[rid]) >= 0:
                 return
             out_cid[rid] = Int32(-1)
             out_pos[rid] = 0
@@ -622,58 +669,60 @@ def map_fastq_dense_gpu_locate(
             if vote_cap < 1:
                 vote_cap = 256
 
-            var oi = 0
-            while oi < n_ord:
-                var occ_v = Int(ord_occ[oi])
-                if occ_v > vote_cap:
+            # Pass 0: rare-seed vote. Pass 1: skip (high-occ path only).
+            if pass_mode == 0:
+                var oi = 0
+                while oi < n_ord:
+                    var occ_v = Int(ord_occ[oi])
+                    if occ_v > vote_cap:
+                        oi += 1
+                        continue
+                    var slot = Int(ord_slot[oi])
+                    var sidx = rid * slots_per_read + slot
+                    var a = Int(occ_start[sidx])
+                    var b = Int(occ_end[sidx])
+                    var q_off = Int(q_offs[sidx])
+                    var pi = a
+                    while pi < b:
+                        var cid = Int(postings[pi * 2])
+                        var pos = Int(postings[pi * 2 + 1])
+                        if cid >= 0 and cid < n_contigs and pos >= q_off:
+                            var start0 = pos - q_off
+                            var vk = (UInt64(cid) << 32) | UInt64(start0)
+                            var found = -1
+                            var ci = 0
+                            while ci < n_cand:
+                                if cand_key[ci] == vk:
+                                    found = ci
+                                    break
+                                ci += 1
+                            if found >= 0:
+                                cand_n[found] = cand_n[found] + 1
+                            elif n_cand < TOP:
+                                cand_key[n_cand] = vk
+                                cand_n[n_cand] = 1
+                                n_cand += 1
+                            else:
+                                var min_i = 0
+                                var min_n = cand_n[0]
+                                var zj = 1
+                                while zj < TOP:
+                                    if cand_n[zj] < min_n:
+                                        min_n = cand_n[zj]
+                                        min_i = zj
+                                    zj += 1
+                                if min_n <= 1:
+                                    cand_key[min_i] = vk
+                                    cand_n[min_i] = 1
+                        pi += 1
                     oi += 1
-                    continue
-                var slot = Int(ord_slot[oi])
-                var sidx = rid * slots_per_read + slot
-                var a = Int(occ_start[sidx])
-                var b = Int(occ_end[sidx])
-                var q_off = Int(q_offs[sidx])
-                var pi = a
-                while pi < b:
-                    var cid = Int(postings[pi * 2])
-                    var pos = Int(postings[pi * 2 + 1])
-                    if cid >= 0 and cid < n_contigs and pos >= q_off:
-                        var start0 = pos - q_off
-                        var vk = (UInt64(cid) << 32) | UInt64(start0)
-                        var found = -1
-                        var ci = 0
-                        while ci < n_cand:
-                            if cand_key[ci] == vk:
-                                found = ci
-                                break
-                            ci += 1
-                        if found >= 0:
-                            cand_n[found] = cand_n[found] + 1
-                        elif n_cand < TOP:
-                            cand_key[n_cand] = vk
-                            cand_n[n_cand] = 1
-                            n_cand += 1
-                        else:
-                            var min_i = 0
-                            var min_n = cand_n[0]
-                            var zj = 1
-                            while zj < TOP:
-                                if cand_n[zj] < min_n:
-                                    min_n = cand_n[zj]
-                                    min_i = zj
-                                zj += 1
-                            if min_n <= 1:
-                                cand_key[min_i] = vk
-                                cand_n[min_i] = 1
-                    pi += 1
-                oi += 1
 
             # Select up to KEEP highest-vote candidates.
             var pick_i = InlineArray[Int32, KEEP](fill=Int32(-1))
             var pick_n = InlineArray[Int32, KEEP](fill=Int32(0))
             var n_pick = 0
             var ci2 = 0
-            while ci2 < n_cand:
+            while pass_mode == 0 and ci2 < n_cand:
                 var votes = cand_n[ci2]
                 var inserted = False
                 var p = 0
@@ -981,11 +1030,10 @@ def map_fastq_dense_gpu_locate(
                         break
                 pk += 1
 
-            # Seed-rescue from rarest seeds. High-occ seeds (occ>vote_cap):
-            # tally full-length exact hits across seeds; accept a locus only
-            # if it wins with ≥2 seeds and beats the runner-up (repetitive
-            # decoys rarely share the same start across independent seeds).
-            if best_cid < 0 or best_cost > 0:
+            # Seed-rescue from rarest seeds.
+            # Pass 0: low-occ gapless/softclip/indel only.
+            # Pass 1: high-occ exact tally for still-unmapped reads.
+            if pass_mode == 1 or best_cid < 0 or best_cost > 0:
                 comptime HX = 48
                 var hx_key = InlineArray[UInt64, HX](fill=UInt64(0xFFFFFFFFFFFFFFFF))
                 var hx_n = InlineArray[Int32, HX](fill=Int32(0))
@@ -999,6 +1047,13 @@ def map_fastq_dense_gpu_locate(
                         ri += 1
                         continue
                     var high_occ = occ_r > vote_cap
+                    # Pass split: skip the expensive path that belongs to the other pass.
+                    if high_occ and pass_mode == 0:
+                        ri += 1
+                        continue
+                    if (not high_occ) and pass_mode == 1:
+                        ri += 1
+                        continue
                     if high_occ:
                         # Try all high-occ seeds (sorted rare→common). Early
                         # exit once a locus has a clear multi-seed plurality.
@@ -1493,6 +1548,8 @@ def map_fastq_dense_gpu_locate(
         var dev_seq = ctx.enqueue_create_buffer[DType.uint8](seq_bytes)
         var dev_coff = ctx.enqueue_create_buffer[DType.uint64](n_contigs + 1)
 
+        var time_mod = Python.import_module("time")
+        var t_upload0 = time_mod.perf_counter()
         upload_mmap_to_device(
             ctx,
             dev_kmers.unsafe_ptr().bitcast[UInt8](),
@@ -1529,6 +1586,11 @@ def map_fastq_dense_gpu_locate(
             "contig_offsets",
         )
         print("MojoLinear GPU-full index resident ok")
+        var t_upload1 = time_mod.perf_counter()
+        print(
+            "MojoLinear GPU-full upload_wall_s=",
+            t_upload1 - t_upload0,
+        )
 
         var locate_algo = _env_str("METHYLGRAPHER_LINEAR_LOCATE_ALGO", "bsearch").lower()
         var use_interp = locate_algo == "interp" or locate_algo == "interpolation"
@@ -1546,7 +1608,9 @@ def map_fastq_dense_gpu_locate(
         if paired:
             fh2 = _open_fastq(fq2)
 
-        var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 4096)
+        # Large batches amortize kernel launch + host sync on high-HBM GPUs
+        # (GH200-class). Per-batch working set is tens–hundreds of MiB vs ~50 GiB index.
+        var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 16384)
         var seed_stride = _env_int("METHYLGRAPHER_LINEAR_SEED_STRIDE", 5)
         var max_occ = index.max_occ()
         # Majority-vote only uses seeds at or below vote_occ; higher-occ seeds
@@ -1586,70 +1650,84 @@ def map_fastq_dense_gpu_locate(
             do_rc,
             " paired=",
             paired,
+            " prefetch_overlap=1",
         )
+        var t_map0 = time_mod.perf_counter()
 
-        while True:
-            var batch1 = List[FastqRec]()
-            var batch2 = List[FastqRec]()
-            var i = 0
-            while i < batch_size:
-                var r1 = _read_one(fh1)
-                if r1.name.byte_length() == 0:
-                    break
-                if bs_r1.byte_length() > 0:
-                    r1.seq = _bs_convert(r1.seq, bs_r1)
-                batch1.append(r1^)
-                if paired:
-                    var r2 = _read_one(fh2)
-                    if r2.name.byte_length() == 0:
-                        raise Error("paired FASTQ length mismatch (R2 ended early)")
-                    if bs_r2.byte_length() > 0:
-                        r2.seq = _bs_convert(r2.seq, bs_r2)
-                    batch2.append(r2^)
-                i += 1
-            if len(batch1) == 0:
-                break
+        # Prime first batch on host; later batches are read+packed while the
+        # previous batch's pass-0 GPU kernels run (science-identical).
+        var batch1 = List[FastqRec]()
+        var batch2 = List[FastqRec]()
+        _read_pe_batch(
+            fh1, fh2, paired, batch_size, bs_r1, bs_r2, batch1, batch2
+        )
+        # Dummy host buffers; replaced before first H2D when batch non-empty.
+        var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](1)
+        var host_lens = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        var n_seq = 0
+        var max_len = 0
+        var slots_per = 1
+        var n_slots = 0
+        var n_bases = 0
+        var need_pack = True
 
-            var seqs = List[String]()
-            for r in batch1:
-                seqs.append(r.seq)
-            if paired:
-                for r in batch2:
+        while len(batch1) > 0:
+            if need_pack:
+                var seqs = List[String]()
+                for r in batch1:
                     seqs.append(r.seq)
+                if paired:
+                    for r in batch2:
+                        seqs.append(r.seq)
+                n_seq = len(seqs)
+                max_len = 0
+                var ri0 = 0
+                while ri0 < n_seq:
+                    var L0 = seqs[ri0].byte_length()
+                    if L0 > max_len:
+                        max_len = L0
+                    ri0 += 1
+                if max_len < k_len:
+                    max_len = k_len
+                slots_per = 1
+                if max_len >= k_len:
+                    slots_per = ((max_len - k_len) // seed_stride) + 1
+                n_slots = n_seq * slots_per
+                n_bases = n_seq * max_len
+                host_bases = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
+                host_lens = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+                var si = 0
+                while si < n_seq:
+                    var s = seqs[si]
+                    var L = s.byte_length()
+                    host_lens[si] = UInt32(L)
+                    var base = si * max_len
+                    var p = 0
+                    while p < max_len:
+                        if p < L:
+                            host_bases[base + p] = UInt8(
+                                ord(s[byte = p : p + 1])
+                            )
+                        else:
+                            host_bases[base + p] = 78
+                        p += 1
+                    si += 1
 
-            var n_seq = len(seqs)
-            var max_len = 0
-            var ri0 = 0
-            while ri0 < n_seq:
-                var L0 = seqs[ri0].byte_length()
-                if L0 > max_len:
-                    max_len = L0
-                ri0 += 1
-            if max_len < k_len:
-                max_len = k_len
-
-            var slots_per = 1
-            if max_len >= k_len:
-                slots_per = ((max_len - k_len) // seed_stride) + 1
-            var n_slots = n_seq * slots_per
-            var n_bases = n_seq * max_len
-
-            var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
-            var host_lens = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var si = 0
-            while si < n_seq:
-                var s = seqs[si]
-                var L = s.byte_length()
-                host_lens[si] = UInt32(L)
-                var base = si * max_len
-                var p = 0
-                while p < max_len:
-                    if p < L:
-                        host_bases[base + p] = UInt8(ord(s[byte = p : p + 1]))
-                    else:
-                        host_bases[base + p] = 78
-                    p += 1
-                si += 1
+            if n_batches == 0:
+                # bases+codes+rc + keys/qoff/start/end + ~20×i32 hit fields ×2 strands
+                var workset = (
+                    n_bases * 3
+                    + n_slots * (8 + 4 + 8 + 8)
+                    + n_seq * 4 * 20
+                )
+                print(
+                    "MojoLinear GPU-full batch_workset_bytes≈",
+                    workset,
+                    " n_seq=",
+                    n_seq,
+                    " n_slots=",
+                    n_slots,
+                )
 
             var dev_bases = ctx.enqueue_create_buffer[DType.uint8](n_bases)
             var dev_codes = ctx.enqueue_create_buffer[DType.uint8](n_bases)
@@ -1733,6 +1811,13 @@ def map_fastq_dense_gpu_locate(
                     grid_dim=grid_s,
                     block_dim=BLOCK,
                 )
+            # Dummy rid_map for full-batch (n_active < 0) launches.
+            var host_rid_dummy = ctx.enqueue_create_host_buffer[DType.int32](1)
+            host_rid_dummy[0] = Int32(0)
+            var dev_rid_dummy = ctx.enqueue_create_buffer[DType.int32](1)
+            ctx.enqueue_copy(src_buf=host_rid_dummy, dst_buf=dev_rid_dummy)
+
+            # Pass 0 FW: vote + low-occ rescue (fast path, full batch).
             ctx.enqueue_function[vote_extend_kernel](
                 dev_start.unsafe_ptr(),
                 dev_end.unsafe_ptr(),
@@ -1751,6 +1836,9 @@ def map_fastq_dense_gpu_locate(
                 max_soft,
                 max_indel,
                 vote_occ,
+                0,
+                -1,
+                dev_rid_dummy.unsafe_ptr(),
                 Int32(0),
                 dev_cid_f.unsafe_ptr(),
                 dev_pos_f.unsafe_ptr(),
@@ -1766,56 +1854,97 @@ def map_fastq_dense_gpu_locate(
                 block_dim=BLOCK,
             )
 
-            if do_rc:
-                # Reverse strand (RC codes → locate → extend)
-                ctx.enqueue_function[rc_codes_kernel](
-                    dev_codes.unsafe_ptr(),
-                    dev_rc.unsafe_ptr(),
-                    dev_lens.unsafe_ptr(),
-                    n_seq,
-                    max_len,
-                    grid_dim=grid_r,
-                    block_dim=BLOCK,
+            # Overlap: read+pack next batch on host while pass-0 FW runs.
+            var next_b1 = List[FastqRec]()
+            var next_b2 = List[FastqRec]()
+            _read_pe_batch(
+                fh1, fh2, paired, batch_size, bs_r1, bs_r2, next_b1, next_b2
+            )
+            var next_host_bases = ctx.enqueue_create_host_buffer[DType.uint8](1)
+            var next_host_lens = ctx.enqueue_create_host_buffer[DType.uint32](1)
+            var next_n_seq = 0
+            var next_max_len = 0
+            var next_slots_per = 1
+            var next_n_slots = 0
+            var next_n_bases = 0
+            var next_ready = False
+            if len(next_b1) > 0:
+                var next_seqs = List[String]()
+                for r in next_b1:
+                    next_seqs.append(r.seq)
+                if paired:
+                    for r in next_b2:
+                        next_seqs.append(r.seq)
+                next_n_seq = len(next_seqs)
+                next_max_len = 0
+                var nri = 0
+                while nri < next_n_seq:
+                    var nL = next_seqs[nri].byte_length()
+                    if nL > next_max_len:
+                        next_max_len = nL
+                    nri += 1
+                if next_max_len < k_len:
+                    next_max_len = k_len
+                next_slots_per = 1
+                if next_max_len >= k_len:
+                    next_slots_per = (
+                        (next_max_len - k_len) // seed_stride
+                    ) + 1
+                next_n_slots = next_n_seq * next_slots_per
+                next_n_bases = next_n_seq * next_max_len
+                next_host_bases = ctx.enqueue_create_host_buffer[DType.uint8](
+                    next_n_bases
                 )
-                ctx.enqueue_function[encode_strided_kernel](
-                    dev_rc.unsafe_ptr(),
-                    dev_keys.unsafe_ptr(),
-                    dev_qoff.unsafe_ptr(),
-                    dev_lens.unsafe_ptr(),
-                    n_seq,
-                    max_len,
-                    k_len,
-                    seed_stride,
-                    slots_per,
-                    grid_dim=grid_s,
-                    block_dim=BLOCK,
+                next_host_lens = ctx.enqueue_create_host_buffer[DType.uint32](
+                    next_n_seq
                 )
-                if use_interp:
-                    ctx.enqueue_function[locate_interp_kernel](
-                        dev_keys.unsafe_ptr(),
-                        dev_kmers.unsafe_ptr(),
-                        dev_offsets.unsafe_ptr(),
-                        dev_start.unsafe_ptr(),
-                        dev_end.unsafe_ptr(),
-                        n_slots,
-                        n_table,
-                        max_occ,
-                        grid_dim=grid_s,
-                        block_dim=BLOCK,
-                    )
-                else:
-                    ctx.enqueue_function[locate_bsearch_kernel](
-                        dev_keys.unsafe_ptr(),
-                        dev_kmers.unsafe_ptr(),
-                        dev_offsets.unsafe_ptr(),
-                        dev_start.unsafe_ptr(),
-                        dev_end.unsafe_ptr(),
-                        n_slots,
-                        n_table,
-                        max_occ,
-                        grid_dim=grid_s,
-                        block_dim=BLOCK,
-                    )
+                var nsi = 0
+                while nsi < next_n_seq:
+                    var ns = next_seqs[nsi]
+                    var nLen = ns.byte_length()
+                    next_host_lens[nsi] = UInt32(nLen)
+                    var nbase = nsi * next_max_len
+                    var np = 0
+                    while np < next_max_len:
+                        if np < nLen:
+                            next_host_bases[nbase + np] = UInt8(
+                                ord(ns[byte = np : np + 1])
+                            )
+                        else:
+                            next_host_bases[nbase + np] = 78
+                        np += 1
+                    nsi += 1
+                next_ready = True
+
+            # Compact still-unmapped → Pass 1 high-occ (avoids warp divergence).
+            # Pull cid+nm together so RC can reuse this snapshot when pass-1 is a no-op
+            # (saves a second host sync on most batches).
+            var host_cid_fw = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
+            var host_nm_fw = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_fw)
+            ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_fw)
+            ctx.synchronize()
+            var n_unmap_f = 0
+            var ui = 0
+            while ui < n_seq:
+                if Int(host_cid_fw[ui]) < 0:
+                    n_unmap_f += 1
+                ui += 1
+            var ran_pass1_f = False
+            if n_unmap_f > 0:
+                var host_rid_f = ctx.enqueue_create_host_buffer[DType.int32](
+                    n_unmap_f
+                )
+                var w = 0
+                ui = 0
+                while ui < n_seq:
+                    if Int(host_cid_fw[ui]) < 0:
+                        host_rid_f[w] = Int32(ui)
+                        w += 1
+                    ui += 1
+                var dev_rid_f = ctx.enqueue_create_buffer[DType.int32](n_unmap_f)
+                ctx.enqueue_copy(src_buf=host_rid_f, dst_buf=dev_rid_f)
+                var grid_u = (n_unmap_f + BLOCK - 1) // BLOCK
                 ctx.enqueue_function[vote_extend_kernel](
                     dev_start.unsafe_ptr(),
                     dev_end.unsafe_ptr(),
@@ -1825,7 +1954,7 @@ def map_fastq_dense_gpu_locate(
                     dev_seq.unsafe_ptr(),
                     dev_coff.unsafe_ptr(),
                     n_contigs,
-                    dev_rc.unsafe_ptr(),
+                    dev_codes.unsafe_ptr(),
                     dev_lens.unsafe_ptr(),
                     max_len,
                     slots_per,
@@ -1834,20 +1963,226 @@ def map_fastq_dense_gpu_locate(
                     max_soft,
                     max_indel,
                     vote_occ,
-                    Int32(16),
-                    dev_cid_r.unsafe_ptr(),
-                    dev_pos_r.unsafe_ptr(),
-                    dev_mapq_r.unsafe_ptr(),
-                    dev_flag_r.unsafe_ptr(),
-                    dev_sl_r.unsafe_ptr(),
-                    dev_sr_r.unsafe_ptr(),
-                    dev_nm_r.unsafe_ptr(),
-                    dev_iop_r.unsafe_ptr(),
-                    dev_iat_r.unsafe_ptr(),
-                    dev_ilen_r.unsafe_ptr(),
-                    grid_dim=grid_r,
+                    1,
+                    n_unmap_f,
+                    dev_rid_f.unsafe_ptr(),
+                    Int32(0),
+                    dev_cid_f.unsafe_ptr(),
+                    dev_pos_f.unsafe_ptr(),
+                    dev_mapq_f.unsafe_ptr(),
+                    dev_flag_f.unsafe_ptr(),
+                    dev_sl_f.unsafe_ptr(),
+                    dev_sr_f.unsafe_ptr(),
+                    dev_nm_f.unsafe_ptr(),
+                    dev_iop_f.unsafe_ptr(),
+                    dev_iat_f.unsafe_ptr(),
+                    dev_ilen_f.unsafe_ptr(),
+                    grid_dim=grid_u,
                     block_dim=BLOCK,
                 )
+                ran_pass1_f = True
+
+            if do_rc:
+                # Refresh FW hits only if pass-1 may have filled some unmapped.
+                if ran_pass1_f:
+                    ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_fw)
+                    ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_fw)
+                    ctx.synchronize()
+                var n_need_rc = 0
+                ui = 0
+                while ui < n_seq:
+                    # Exact FW hit (NM=0) is definitive — RC cannot improve NM.
+                    if Int(host_cid_fw[ui]) < 0 or Int(host_nm_fw[ui]) > 0:
+                        n_need_rc += 1
+                    ui += 1
+                if n_batches == 0:
+                    print(
+                        "MojoLinear GPU-full need_rc=",
+                        n_need_rc,
+                        "/",
+                        n_seq,
+                        " (first batch)",
+                    )
+                # Mark all RC outputs unmapped; compacted kernels fill need_rc.
+                var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
+                    n_seq
+                )
+                var zi0 = 0
+                while zi0 < n_seq:
+                    host_cid_r_init[zi0] = Int32(-1)
+                    zi0 += 1
+                ctx.enqueue_copy(src_buf=host_cid_r_init, dst_buf=dev_cid_r)
+
+                if n_need_rc > 0:
+                    var host_rid_rc = ctx.enqueue_create_host_buffer[DType.int32](
+                        n_need_rc
+                    )
+                    var wrc = 0
+                    ui = 0
+                    while ui < n_seq:
+                        if Int(host_cid_fw[ui]) < 0 or Int(host_nm_fw[ui]) > 0:
+                            host_rid_rc[wrc] = Int32(ui)
+                            wrc += 1
+                        ui += 1
+                    var dev_rid_rc = ctx.enqueue_create_buffer[DType.int32](
+                        n_need_rc
+                    )
+                    ctx.enqueue_copy(src_buf=host_rid_rc, dst_buf=dev_rid_rc)
+                    var grid_rc = (n_need_rc + BLOCK - 1) // BLOCK
+
+                    # Reverse strand locate still full-batch (slot layout); extend
+                    # runs only on need_rc via rid_map.
+                    ctx.enqueue_function[rc_codes_kernel](
+                        dev_codes.unsafe_ptr(),
+                        dev_rc.unsafe_ptr(),
+                        dev_lens.unsafe_ptr(),
+                        n_seq,
+                        max_len,
+                        grid_dim=grid_r,
+                        block_dim=BLOCK,
+                    )
+                    ctx.enqueue_function[encode_strided_kernel](
+                        dev_rc.unsafe_ptr(),
+                        dev_keys.unsafe_ptr(),
+                        dev_qoff.unsafe_ptr(),
+                        dev_lens.unsafe_ptr(),
+                        n_seq,
+                        max_len,
+                        k_len,
+                        seed_stride,
+                        slots_per,
+                        grid_dim=grid_s,
+                        block_dim=BLOCK,
+                    )
+                    if use_interp:
+                        ctx.enqueue_function[locate_interp_kernel](
+                            dev_keys.unsafe_ptr(),
+                            dev_kmers.unsafe_ptr(),
+                            dev_offsets.unsafe_ptr(),
+                            dev_start.unsafe_ptr(),
+                            dev_end.unsafe_ptr(),
+                            n_slots,
+                            n_table,
+                            max_occ,
+                            grid_dim=grid_s,
+                            block_dim=BLOCK,
+                        )
+                    else:
+                        ctx.enqueue_function[locate_bsearch_kernel](
+                            dev_keys.unsafe_ptr(),
+                            dev_kmers.unsafe_ptr(),
+                            dev_offsets.unsafe_ptr(),
+                            dev_start.unsafe_ptr(),
+                            dev_end.unsafe_ptr(),
+                            n_slots,
+                            n_table,
+                            max_occ,
+                            grid_dim=grid_s,
+                            block_dim=BLOCK,
+                        )
+                    # Pass 0 RC on need_rc only.
+                    ctx.enqueue_function[vote_extend_kernel](
+                        dev_start.unsafe_ptr(),
+                        dev_end.unsafe_ptr(),
+                        dev_qoff.unsafe_ptr(),
+                        dev_postings.unsafe_ptr(),
+                        n_post,
+                        dev_seq.unsafe_ptr(),
+                        dev_coff.unsafe_ptr(),
+                        n_contigs,
+                        dev_rc.unsafe_ptr(),
+                        dev_lens.unsafe_ptr(),
+                        max_len,
+                        slots_per,
+                        n_seq,
+                        max_diff,
+                        max_soft,
+                        max_indel,
+                        vote_occ,
+                        0,
+                        n_need_rc,
+                        dev_rid_rc.unsafe_ptr(),
+                        Int32(16),
+                        dev_cid_r.unsafe_ptr(),
+                        dev_pos_r.unsafe_ptr(),
+                        dev_mapq_r.unsafe_ptr(),
+                        dev_flag_r.unsafe_ptr(),
+                        dev_sl_r.unsafe_ptr(),
+                        dev_sr_r.unsafe_ptr(),
+                        dev_nm_r.unsafe_ptr(),
+                        dev_iop_r.unsafe_ptr(),
+                        dev_iat_r.unsafe_ptr(),
+                        dev_ilen_r.unsafe_ptr(),
+                        grid_dim=grid_rc,
+                        block_dim=BLOCK,
+                    )
+                    # Pass 1 RC: still-unmapped among need_rc.
+                    var host_cid_r_compact = ctx.enqueue_create_host_buffer[
+                        DType.int32
+                    ](n_seq)
+                    ctx.enqueue_copy(
+                        src_buf=dev_cid_r, dst_buf=host_cid_r_compact
+                    )
+                    ctx.synchronize()
+                    var n_unmap_r = 0
+                    var uir = 0
+                    while uir < n_need_rc:
+                        var rr = Int(host_rid_rc[uir])
+                        if Int(host_cid_r_compact[rr]) < 0:
+                            n_unmap_r += 1
+                        uir += 1
+                    if n_unmap_r > 0:
+                        var host_rid_r = ctx.enqueue_create_host_buffer[
+                            DType.int32
+                        ](n_unmap_r)
+                        var wr = 0
+                        uir = 0
+                        while uir < n_need_rc:
+                            var rr2 = Int(host_rid_rc[uir])
+                            if Int(host_cid_r_compact[rr2]) < 0:
+                                host_rid_r[wr] = Int32(rr2)
+                                wr += 1
+                            uir += 1
+                        var dev_rid_r = ctx.enqueue_create_buffer[DType.int32](
+                            n_unmap_r
+                        )
+                        ctx.enqueue_copy(src_buf=host_rid_r, dst_buf=dev_rid_r)
+                        var grid_ur = (n_unmap_r + BLOCK - 1) // BLOCK
+                        ctx.enqueue_function[vote_extend_kernel](
+                            dev_start.unsafe_ptr(),
+                            dev_end.unsafe_ptr(),
+                            dev_qoff.unsafe_ptr(),
+                            dev_postings.unsafe_ptr(),
+                            n_post,
+                            dev_seq.unsafe_ptr(),
+                            dev_coff.unsafe_ptr(),
+                            n_contigs,
+                            dev_rc.unsafe_ptr(),
+                            dev_lens.unsafe_ptr(),
+                            max_len,
+                            slots_per,
+                            n_seq,
+                            max_diff,
+                            max_soft,
+                            max_indel,
+                            vote_occ,
+                            1,
+                            n_unmap_r,
+                            dev_rid_r.unsafe_ptr(),
+                            Int32(16),
+                            dev_cid_r.unsafe_ptr(),
+                            dev_pos_r.unsafe_ptr(),
+                            dev_mapq_r.unsafe_ptr(),
+                            dev_flag_r.unsafe_ptr(),
+                            dev_sl_r.unsafe_ptr(),
+                            dev_sr_r.unsafe_ptr(),
+                            dev_nm_r.unsafe_ptr(),
+                            dev_iop_r.unsafe_ptr(),
+                            dev_iat_r.unsafe_ptr(),
+                            dev_ilen_r.unsafe_ptr(),
+                            grid_dim=grid_ur,
+                            block_dim=BLOCK,
+                        )
             else:
                 # Mark RC outputs unmapped so host merge keeps FW hits.
                 var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
@@ -2032,10 +2367,28 @@ def map_fastq_dense_gpu_locate(
                 except:
                     pass
 
+            # Promote prefetched next batch (already packed during pass-0).
+            if next_ready:
+                batch1 = next_b1^
+                batch2 = next_b2^
+                host_bases = next_host_bases^
+                host_lens = next_host_lens^
+                n_seq = next_n_seq
+                max_len = next_max_len
+                slots_per = next_slots_per
+                n_slots = next_n_slots
+                n_bases = next_n_bases
+                need_pack = False
+            else:
+                batch1 = List[FastqRec]()
+                batch2 = List[FastqRec]()
+                need_pack = True
+
         fh1.close()
         if paired:
             fh2.close()
         fh.close()
+        var t_map1 = time_mod.perf_counter()
         print(
             "wrote SAM -> ",
             out_sam,
@@ -2044,5 +2397,11 @@ def map_fastq_dense_gpu_locate(
             " reads=",
             n_reads,
             " backend=gpu-full",
+        )
+        print(
+            "MojoLinear GPU-full map_wall_s=",
+            t_map1 - t_map0,
+            " reads=",
+            n_reads,
         )
         return n_mapped
