@@ -538,7 +538,7 @@ def map_fastq_dense_gpu_speed(
                                         nm += 1
                                     jm += 1
                             var alen = qlen - sl - sr
-                            if nm <= budget and alen >= 32:
+                            if nm <= budget and alen >= 24:
                                 if (
                                     nm < best_cost
                                     or (nm == best_cost and votes > best_votes)
@@ -580,7 +580,7 @@ def map_fastq_dense_gpu_speed(
                                             best_pos = btry
                                             best_sl = 0
                                             best_sr = 0
-                                        g += 8
+                                        g += 2
                                 if qlen > 1 and btry + (qlen - 1) <= clen:
                                     var gi = 0
                                     while gi <= qlen - 1:
@@ -612,7 +612,7 @@ def map_fastq_dense_gpu_speed(
                                             best_pos = btry
                                             best_sl = 0
                                             best_sr = 0
-                                        gi += 8
+                                        gi += 2
                         adj_i += 1
                     if best_cost == 0:
                         break
@@ -778,8 +778,8 @@ def map_fastq_dense_gpu_speed(
         var max_occ = _env_int("METHYLGRAPHER_SPEED_MAX_OCC", 4096)
         var vote_fast = _env_int("METHYLGRAPHER_SPEED_VOTE_FAST", 32)
         var vote_occ = _env_int("METHYLGRAPHER_SPEED_VOTE_OCC", 256)
-        var max_diff = _env_int("METHYLGRAPHER_SPEED_MAX_DIFF", 8)
-        var max_soft = _env_int("METHYLGRAPHER_SPEED_MAX_SOFT", 12)
+        var max_diff = _env_int("METHYLGRAPHER_SPEED_MAX_DIFF", 10)
+        var max_soft = _env_int("METHYLGRAPHER_SPEED_MAX_SOFT", 16)
         var paired = fq2.byte_length() > 0
         print(
             "MojoLinear GPU-speed map start batch=",

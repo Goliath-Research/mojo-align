@@ -31,7 +31,7 @@ Same report as [`LINEAR_PARITY.md`](LINEAR_PARITY.md):
 ## Promotion (speed → default)
 
 Speed may replace parity as the default **only if all** hold on the
-Parabricks sample (50k smoke **and** full sample):
+Parabricks sample (100k smoke **and** full sample):
 
 1. Clara gates above **pass**
 2. Mojo mapped rate **≥** frozen parity mapped rate (match or improve)
@@ -45,12 +45,12 @@ stay on **parity**.
 
 ```bash
 # Science default (unchanged)
-fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --skip-clara --max-pairs 50000
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --skip-clara --max-pairs 100000
 
 # Speed engine (opt-in; expect quality to lag until it catches up)
 METHYLGRAPHER_LINEAR_ENGINE=speed \
   fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-    --engine speed --sample-dir /tmp/parity_50k_speed --skip-clara --max-pairs 50000
+    --engine speed --sample-dir /tmp/parity_100k_speed --skip-clara --max-pairs 100000
 ```
 
 Speed-only knobs (do not change parity):
@@ -61,8 +61,8 @@ Speed-only knobs (do not change parity):
 | `METHYLGRAPHER_SPEED_MAX_OCC` | 4096 | Locate occupancy cap |
 | `METHYLGRAPHER_SPEED_VOTE_FAST` | 32 | Pass-0 rare-seed vote cap |
 | `METHYLGRAPHER_SPEED_VOTE_OCC` | 256 | Pass-1 vote cap (unmapped only) |
-| `METHYLGRAPHER_SPEED_MAX_DIFF` | 8 | Gapless/softclip NM budget |
-| `METHYLGRAPHER_SPEED_MAX_SOFT` | 12 | End soft-clip cap |
+| `METHYLGRAPHER_SPEED_MAX_DIFF` | 10 | Gapless/softclip NM budget |
+| `METHYLGRAPHER_SPEED_MAX_SOFT` | 16 | End soft-clip cap |
 
 Parity knobs (`VOTE_OCC`, `SEED_STRIDE=3`, `MAX_OCC=16384`, …) apply only to
 the frozen engine.

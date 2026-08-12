@@ -81,7 +81,7 @@ See [`reference-inventory-qnap.md`](../../../MethylPipeline/docs/deployment/refe
 ## Run both arms + score
 
 ```bash
-# Defaults: sample-dir=/work/samples/parabricks_sample, first 50k PE pairs
+# Defaults: sample-dir=/work/samples/parabricks_sample, first 100k PE pairs
 # Uses fleet indexed GRCh38 if assembly38 lacks .bwameth.c2t
 fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 

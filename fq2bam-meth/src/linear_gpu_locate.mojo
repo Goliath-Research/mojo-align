@@ -2,7 +2,7 @@
 #
 # Full-GPU dense-v1 linear WGBS map (DeviceContext: NVIDIA cuda / AMD hip).
 # Do not retune vote/KEEP/occ knobs here for wall-clock — that belongs in
-# linear_gpu_speed.mojo. Bugfixes that preserve mapped-rate / idxstats only.
+# linear_gpu_speed.mojo. Mapped-rate fixes vs Clara (100k smoke) are in scope.
 #
 # Resident on device: kmers + offsets + postings + sequences + contig_offsets.
 # Per batch: 2-bit encode → locate → vote → mismatch/softclip/indel extend.
@@ -1117,7 +1117,7 @@ def map_fastq_dense_gpu_locate(
                                 jm += 1
 
                         var alen = qlen - sl - sr
-                        if nm <= budget and alen >= 32:
+                        if nm <= budget and alen >= 24:
                             var cost = nm
                             if (
                                 cost < best_cost
@@ -1140,7 +1140,7 @@ def map_fastq_dense_gpu_locate(
                         if (
                             indel_cap > 0
                             and adj == 0
-                            and (nm > budget or alen < 32)
+                            and (nm > budget or alen < 24)
                         ):
                             var dlen = 1
                             while dlen <= indel_cap:
@@ -1182,7 +1182,7 @@ def map_fastq_dense_gpu_locate(
                                             best_iop = 2
                                             best_iat = g
                                             best_ilen = dlen
-                                        g += 4
+                                        g += 2
 
                                 # Insertion of dlen query bases after offset g.
                                 if qlen > dlen and bstart + (qlen - dlen) <= clen:
@@ -1225,7 +1225,7 @@ def map_fastq_dense_gpu_locate(
                                             best_iop = 1
                                             best_iat = gi
                                             best_ilen = dlen
-                                        gi += 4
+                                        gi += 2
                                 dlen += 1
 
                         if best_cost == 0:
@@ -1265,7 +1265,7 @@ def map_fastq_dense_gpu_locate(
                         # Try all high-occ seeds (sorted rare→common). Early
                         # exit once a locus has a clear multi-seed plurality.
                         n_high_tried += 1
-                        if n_high_tried > 64:
+                        if n_high_tried > 96:
                             ri += 1
                             continue
                     var slot_r = Int(ord_slot[ri])

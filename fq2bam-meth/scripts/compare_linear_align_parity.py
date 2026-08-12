@@ -142,7 +142,7 @@ def compare(
     idx_clara = _idxstats_counts(clara_bam)
     idx_mojo = _idxstats_counts(mojo_bam)
     # Gate on primary assembly contigs (1–22, X, Y, MT). Alt/decoy/random
-    # contigs are sparse on 50k smokes and dominate all-contig Spearman noise
+    # contigs are sparse on 100k smokes and dominate all-contig Spearman noise
     # without reflecting WGBS science concordance.
     primary = {str(i) for i in range(1, 23)} | {"X", "Y", "MT", "chrM", "chrX", "chrY"}
     primary |= {f"chr{i}" for i in range(1, 23)}

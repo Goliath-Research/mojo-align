@@ -16,7 +16,7 @@
 #   --sample-id ID       Default: parabricks_sample
 #   --parabricks-sample DIR   Or set PARABRICKS_SAMPLE
 #   --ref FASTA          Reference (must have sibling .bwameth.c2t for Clara)
-#   --max-pairs N        Subset first N PE pairs (0 = all; default 50000)
+#   --max-pairs N        Subset first N PE pairs (0 = all; default 100000)
 #   --device DEV         Mojo device (default auto — DeviceContext probe)
 #   --image IMAGE        Clara docker image (default nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1)
 #   --skip-clara         Only run Mojo (compare against existing Clara BAM)
@@ -41,7 +41,7 @@ SAMPLE_DIR="${SAMPLE_DIR:-/work/samples/parabricks_sample}"
 SAMPLE_ID="${SAMPLE_ID:-parabricks_sample}"
 PB_SAMPLE="${PARABRICKS_SAMPLE:-}"
 REF_OVERRIDE="${REF_OVERRIDE:-}"
-MAX_PAIRS="${MAX_PAIRS:-50000}"
+MAX_PAIRS="${MAX_PAIRS:-100000}"
 DEVICE="${DEVICE:-auto}"
 CLARA_MIN_HBM_GIB="${CLARA_MIN_HBM_GIB:-48}"
 PB_IMAGE="${METHYL_PARABRICKS_IMAGE:-nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1}"
@@ -294,8 +294,8 @@ run_mojo() {
   export METHYLGRAPHER_LINEAR_SEED_STRIDE="${METHYLGRAPHER_LINEAR_SEED_STRIDE:-3}"
   # Large batch on high-HBM GPUs (≈100–200 MiB workset ≪ ~50 GiB index).
   export METHYLGRAPHER_LINEAR_READ_BATCH="${METHYLGRAPHER_LINEAR_READ_BATCH:-65536}"
-  export METHYLGRAPHER_LINEAR_MAX_DIFF="${METHYLGRAPHER_LINEAR_MAX_DIFF:-8}"
-  export METHYLGRAPHER_LINEAR_MAX_SOFT="${METHYLGRAPHER_LINEAR_MAX_SOFT:-12}"
+  export METHYLGRAPHER_LINEAR_MAX_DIFF="${METHYLGRAPHER_LINEAR_MAX_DIFF:-10}"
+  export METHYLGRAPHER_LINEAR_MAX_SOFT="${METHYLGRAPHER_LINEAR_MAX_SOFT:-16}"
   export METHYLGRAPHER_LINEAR_MAX_INDEL="${METHYLGRAPHER_LINEAR_MAX_INDEL:-4}"
   # Dense GRCh38: full GPU path (keys+offsets+postings+sequences resident).
   export METHYLGRAPHER_LINEAR_GPU_LOCATE="${METHYLGRAPHER_LINEAR_GPU_LOCATE:-1}"
@@ -352,6 +352,10 @@ if [[ "$COMPARE" -eq 1 ]]; then
       --sample-dir "$SAMPLE_DIR" \
       --sample-id "$SAMPLE_ID" \
       --out-json "$SAMPLE_DIR/linear_parity_report.json"
+    echo "=== Wall time (Mojo map kernel, excludes index upload / samtools) ==="
+    grep -E "engine=|map_wall_s=|mapped_records=" \
+      "$SAMPLE_DIR/$ALIGN_MOJO/${SAMPLE_ID}.fq2bam_meth.log" | tail -n 20
+    echo "Clara 100k/full wall is not in this skip-clara path; full-sample Clara align was ~84s."
   else
     echo "Skip compare — need both BAMs:" >&2
     echo "  clara: $CLARA_BAM ($([[ -f $CLARA_BAM ]] && echo ok || echo missing))" >&2
