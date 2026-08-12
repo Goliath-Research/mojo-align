@@ -54,11 +54,12 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `METHYLGRAPHER_FM_SEED_LEN` | 19 | Exact seed length (BWA-MEM min) |
-| `METHYLGRAPHER_FM_SEED_STRIDE` | 5 | Seed start spacing |
-| `METHYLGRAPHER_FM_MAX_OCC` | 256 | Max SA interval size to extend |
-| `METHYLGRAPHER_FM_MAX_DIFF` | 10 | Gapless/softclip NM budget |
-| `METHYLGRAPHER_FM_MAX_SOFT` | 16 | End soft-clip cap |
+| `METHYLGRAPHER_FM_SEED_LEN` | 18 | Min SMEM length |
+| `METHYLGRAPHER_FM_SEED_STRIDE` | 2 | Right-endpoint spacing for unique SMEM |
+| `METHYLGRAPHER_FM_MAX_OCC` | 4096 | Give-up cap while left-extending a repetitive seed |
+| `METHYLGRAPHER_FM_ADJ` | 8 | ±bp locus search around unique SMEM |
+| `METHYLGRAPHER_FM_MAX_DIFF` | 12 | Gapless/softclip NM budget |
+| `METHYLGRAPHER_FM_MAX_SOFT` | 20 | End soft-clip cap |
 
 ### Speed knobs
 
@@ -74,16 +75,14 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 Parity knobs (`VOTE_OCC`, `SEED_STRIDE=3`, `MAX_OCC=16384`, …) apply only to
 the frozen engine.
 
-## 100k smoke (2026-08-12, Parabricks sample vs Clara slice)
+## 100k smoke (Parabricks sample vs Clara slice)
 
 | Engine | Mapped | \|Δ\| vs Clara | Spearman | `map_wall_s` | Gate |
 |--------|--------|---------------|----------|--------------|------|
 | Clara (slice) | 99.71% | — | — | — | — |
 | parity (k-mer) | 97.83% | 0.019 | 1.00 | ~14.1 | **pass** |
-| fm (v1 exact-seed + gapless) | ~52–53% | ~0.47 | ≥0.99 | **~1.8–2.6** | fail |
+| fm (unique SMEM + ±adj) | 97.82% | 0.019 | 1.00 | **~2.1** | **pass** (100k) |
 
-FM v1 is wired and fast (no 50 GiB posting walks) but **not** promotion-ready:
-needs SMEM/reseed/chain + banded affine extend (and/or host indel path) before
-default switch. Artifacts: `/tmp/parity_100k_fm/linear_parity_report.json`.
+FM is opt-in until a **full-sample** Clara run also passes. 100k mapped rate now matches frozen parity; wall is ~7× faster. Remaining quality work (banded SW / 1-bp indel) is for the last ~1.9% vs Clara.
 
 Round-trip unit: `fq2bam-meth/tests/fm_roundtrip.mojo` (unique 32-mer BWT+SA).

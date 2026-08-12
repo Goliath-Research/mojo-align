@@ -254,6 +254,7 @@ def map_fastq_fm_gpu(
             max_occ: Int,
             max_diff: Int,
             max_soft: Int,
+            max_adj: Int,
             out_rid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
             out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
@@ -283,6 +284,11 @@ def map_fastq_fm_gpu(
             var clip_cap = max_soft
             if clip_cap > qlen // 4:
                 clip_cap = qlen // 4
+            var adj_cap = max_adj
+            if adj_cap < 0:
+                adj_cap = 0
+            if adj_cap > 12:
+                adj_cap = 12
             var q_base = rid * max_len
             var L2_0 = l2_0
             var L2_1 = l2_1
@@ -296,517 +302,514 @@ def map_fastq_fm_gpu(
             var best_sl = 0
             var best_sr = 0
             var best_mq: UInt32 = 0
-            var x = 0
-            while x + seed_len <= qlen:
-                # --- FM backward search for codes[x .. x+seed_len) ---
+            var best_flag = 0
+
+            # Unique SMEM: left-extend from each right endpoint until occ==1.
+            var e = seed_len - 1
+            while e < qlen:
                 var k: UInt64 = 0
                 var l = seq_len
-                var matched = True
-                var si = seed_len - 1
-                while si >= 0:
-                    var c = Int(codes[q_base + x + si])
-                    if c > 3:
-                        matched = False
+                var s = e
+                var uk: UInt64 = 0
+                var ul: UInt64 = 0
+                var us = -1
+                var found = False
+                var last_k: UInt64 = 0
+                var last_l: UInt64 = 0
+                var last_s = -1
+                while s >= 0:
+                    var cc = Int(codes[q_base + s])
+                    if cc > 3:
                         break
-                    # occ(k-1, c)
                     var ok: UInt64 = 0
                     var ol: UInt64 = 0
-                    # occ for k-1
-                    var k_m1 = Int(k) - 1
-                    if k_m1 < 0:
-                        ok = 0
-                    elif UInt64(k_m1) == seq_len:
-                        if c == 0:
-                            ok = L2_1 - L2_0
-                        elif c == 1:
-                            ok = L2_2 - L2_1
-                        elif c == 2:
-                            ok = L2_3 - L2_2
+                    var pass_i = 0
+                    while pass_i < 2:
+                        if pass_i == 0 and k == 0:
+                            ok = 0
+                            pass_i += 1
+                            continue
+                        var kv: UInt64 = l
+                        if pass_i == 0:
+                            kv = k - 1
+                        var nocc: UInt64 = 0
+                        var k_m = Int(kv)
+                        if k_m < 0:
+                            nocc = 0
+                        elif UInt64(k_m) == seq_len:
+                            if cc == 0:
+                                nocc = L2_1 - L2_0
+                            elif cc == 1:
+                                nocc = L2_2 - L2_1
+                            elif cc == 2:
+                                nocc = L2_3 - L2_2
+                            else:
+                                nocc = L2_4 - L2_3
                         else:
-                            ok = L2_4 - L2_3
-                    else:
-                        var kk = UInt64(k_m1)
-                        if kk >= primary:
-                            kk -= 1
-                        var base = Int((kk >> 7) << 4)
-                        ok = UInt64(bwt[base + c * 2]) | (
-                            UInt64(bwt[base + c * 2 + 1]) << 32
-                        )
-                        var p = base + 8
-                        var end = p + Int(
-                            (
+                            var kko = UInt64(k_m)
+                            if kko >= primary:
+                                kko -= 1
+                            var baseo = Int((kko >> 7) << 4)
+                            nocc = UInt64(bwt[baseo + cc * 2]) | (
+                                UInt64(bwt[baseo + cc * 2 + 1]) << 32
+                            )
+                            var po = baseo + 8
+                            var endo = po + Int(
                                 (
-                                    (kk >> 5)
-                                    - ((kk & UInt64(0xFFFFFFFFFFFFFF80)) >> 5)
+                                    (
+                                        (kko >> 5)
+                                        - ((kko & UInt64(0xFFFFFFFFFFFFFF80)) >> 5)
+                                    )
+                                    << 1
                                 )
-                                << 1
                             )
-                        )
-                        while p < end:
-                            var y = (UInt64(bwt[p]) << 32) | UInt64(bwt[p + 1])
-                            var a: UInt64
-                            var b2: UInt64
-                            if (c & 2) != 0:
-                                a = y
-                            else:
-                                a = ~y
-                            if (c & 1) != 0:
-                                b2 = y
-                            else:
-                                b2 = ~y
-                            var yy = (a >> 1) & b2 & UInt64(0x5555555555555555)
-                            yy = (yy & UInt64(0x3333333333333333)) + (
-                                (yy >> 2) & UInt64(0x3333333333333333)
-                            )
-                            yy = (
-                                (yy + (yy >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
-                            ) * UInt64(0x0101010101010101)
-                            ok += yy >> 56
-                            p += 2
-                        var bits = Int(((~Int(kk)) & 31) << 1)
-                        var mask: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
-                        if bits > 0 and bits < 64:
-                            mask = ~((UInt64(1) << UInt64(bits)) - 1)
-                        var y2 = (
-                            (UInt64(bwt[p]) << 32) | UInt64(bwt[p + 1])
-                        ) & mask
-                        var a2: UInt64
-                        var b3: UInt64
-                        if (c & 2) != 0:
-                            a2 = y2
-                        else:
-                            a2 = ~y2
-                        if (c & 1) != 0:
-                            b3 = y2
-                        else:
-                            b3 = ~y2
-                        var yy2 = (a2 >> 1) & b3 & UInt64(0x5555555555555555)
-                        yy2 = (yy2 & UInt64(0x3333333333333333)) + (
-                            (yy2 >> 2) & UInt64(0x3333333333333333)
-                        )
-                        yy2 = (
-                            (yy2 + (yy2 >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
-                        ) * UInt64(0x0101010101010101)
-                        ok += yy2 >> 56
-                        if c == 0:
-                            ok -= UInt64((~Int(kk)) & 31)
-                    # occ(l, c)
-                    if UInt64(Int(l)) == seq_len or Int(l) < 0:
-                        if Int(l) < 0:
-                            ol = 0
-                        else:
-                            if c == 0:
-                                ol = L2_1 - L2_0
-                            elif c == 1:
-                                ol = L2_2 - L2_1
-                            elif c == 2:
-                                ol = L2_3 - L2_2
-                            else:
-                                ol = L2_4 - L2_3
-                    else:
-                        var kk2 = l
-                        if kk2 >= primary:
-                            kk2 -= 1
-                        var base2 = Int((kk2 >> 7) << 4)
-                        ol = UInt64(bwt[base2 + c * 2]) | (
-                            UInt64(bwt[base2 + c * 2 + 1]) << 32
-                        )
-                        var p2 = base2 + 8
-                        var end2 = p2 + Int(
-                            (
-                                (
-                                    (kk2 >> 5)
-                                    - ((kk2 & UInt64(0xFFFFFFFFFFFFFF80)) >> 5)
+                            while po < endo:
+                                var yo = (UInt64(bwt[po]) << 32) | UInt64(
+                                    bwt[po + 1]
                                 )
-                                << 1
-                            )
-                        )
-                        while p2 < end2:
-                            var y3 = (UInt64(bwt[p2]) << 32) | UInt64(
-                                bwt[p2 + 1]
-                            )
-                            var a3: UInt64
-                            var b4: UInt64
-                            if (c & 2) != 0:
-                                a3 = y3
+                                var ao: UInt64
+                                var bo: UInt64
+                                if (cc & 2) != 0:
+                                    ao = yo
+                                else:
+                                    ao = ~yo
+                                if (cc & 1) != 0:
+                                    bo = yo
+                                else:
+                                    bo = ~yo
+                                var yyo = (ao >> 1) & bo & UInt64(
+                                    0x5555555555555555
+                                )
+                                yyo = (yyo & UInt64(0x3333333333333333)) + (
+                                    (yyo >> 2) & UInt64(0x3333333333333333)
+                                )
+                                yyo = (
+                                    (yyo + (yyo >> 4))
+                                    & UInt64(0x0F0F0F0F0F0F0F0F)
+                                ) * UInt64(0x0101010101010101)
+                                nocc += yyo >> 56
+                                po += 2
+                            var bitso = Int(((~Int(kko)) & 31) << 1)
+                            var masko: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
+                            if bitso > 0 and bitso < 64:
+                                masko = ~((UInt64(1) << UInt64(bitso)) - 1)
+                            var y5 = (
+                                (UInt64(bwt[po]) << 32) | UInt64(bwt[po + 1])
+                            ) & masko
+                            var a5: UInt64
+                            var b6: UInt64
+                            if (cc & 2) != 0:
+                                a5 = y5
                             else:
-                                a3 = ~y3
-                            if (c & 1) != 0:
-                                b4 = y3
+                                a5 = ~y5
+                            if (cc & 1) != 0:
+                                b6 = y5
                             else:
-                                b4 = ~y3
-                            var yy3 = (a3 >> 1) & b4 & UInt64(
+                                b6 = ~y5
+                            var yy5 = (a5 >> 1) & b6 & UInt64(
                                 0x5555555555555555
                             )
-                            yy3 = (yy3 & UInt64(0x3333333333333333)) + (
-                                (yy3 >> 2) & UInt64(0x3333333333333333)
+                            yy5 = (yy5 & UInt64(0x3333333333333333)) + (
+                                (yy5 >> 2) & UInt64(0x3333333333333333)
                             )
-                            yy3 = (
-                                (yy3 + (yy3 >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
+                            yy5 = (
+                                (yy5 + (yy5 >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
                             ) * UInt64(0x0101010101010101)
-                            ol += yy3 >> 56
-                            p2 += 2
-                        var bits2 = Int(((~Int(kk2)) & 31) << 1)
-                        var mask2: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
-                        if bits2 > 0 and bits2 < 64:
-                            mask2 = ~((UInt64(1) << UInt64(bits2)) - 1)
-                        var y4 = (
-                            (UInt64(bwt[p2]) << 32) | UInt64(bwt[p2 + 1])
-                        ) & mask2
-                        var a4: UInt64
-                        var b5: UInt64
-                        if (c & 2) != 0:
-                            a4 = y4
+                            nocc += yy5 >> 56
+                            if cc == 0:
+                                nocc -= UInt64((~Int(kko)) & 31)
+
+                        if pass_i == 0:
+                            if Int(k) == 0:
+                                ok = 0
+                            else:
+                                ok = nocc
                         else:
-                            a4 = ~y4
-                        if (c & 1) != 0:
-                            b5 = y4
-                        else:
-                            b5 = ~y4
-                        var yy4 = (a4 >> 1) & b5 & UInt64(0x5555555555555555)
-                        yy4 = (yy4 & UInt64(0x3333333333333333)) + (
-                            (yy4 >> 2) & UInt64(0x3333333333333333)
-                        )
-                        yy4 = (
-                            (yy4 + (yy4 >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
-                        ) * UInt64(0x0101010101010101)
-                        ol += yy4 >> 56
-                        if c == 0:
-                            ol -= UInt64((~Int(kk2)) & 31)
+                            ol = nocc
+                        pass_i += 1
                     var Lc: UInt64 = L2_0
-                    if c == 1:
+                    if cc == 1:
                         Lc = L2_1
-                    elif c == 2:
+                    elif cc == 2:
                         Lc = L2_2
-                    elif c == 3:
+                    elif cc == 3:
                         Lc = L2_3
                     k = Lc + ok + 1
                     l = Lc + ol
                     if k > l:
-                        matched = False
                         break
-                    si -= 1
-                if matched:
                     var occ_n = Int(l - k + 1)
-                    if occ_n > 0 and occ_n <= max_occ:
-                        var hi = k
-                        while hi <= l:
-                            # SA lookup
-                            var kk = hi
-                            var sa_v: UInt64 = 0
-                            var smask = UInt64(sa_intv - 1)
-                            var sa_ok = True
-                            while (kk & smask) != 0:
-                                sa_v += 1
-                                if kk == primary:
-                                    kk = 0
-                                    break
-                                var xpsi = kk
-                                if kk > primary:
-                                    xpsi -= 1
-                                var bi = Int(xpsi)
-                                var bidx = ((bi >> 7) << 4) + 8 + (
-                                    (bi & 0x7F) >> 4
-                                )
-                                var w = bwt[bidx]
-                                var bc = Int(
-                                    (w >> UInt32(((~bi) & 15) << 1)) & 3
-                                )
-                                # occ(kk, bc)
-                                var oc: UInt64 = 0
-                                var kki = Int(kk)
-                                if kki < 0:
-                                    oc = 0
-                                elif UInt64(kki) == seq_len:
-                                    if bc == 0:
-                                        oc = L2_1 - L2_0
-                                    elif bc == 1:
-                                        oc = L2_2 - L2_1
-                                    elif bc == 2:
-                                        oc = L2_3 - L2_2
-                                    else:
-                                        oc = L2_4 - L2_3
+                    var mlen = e - s + 1
+                    if occ_n == 1 and mlen >= seed_len:
+                        uk = k
+                        ul = l
+                        us = s
+                        found = True
+                        break
+                    if occ_n >= 1 and occ_n <= 16 and mlen >= seed_len:
+                        last_k = k
+                        last_l = l
+                        last_s = s
+                    if occ_n > max_occ and mlen >= seed_len:
+                        break
+                    s -= 1
+                if not found and last_s >= 0:
+                    uk = last_k
+                    ul = last_l
+                    us = last_s
+                    found = True
+                if found:
+                    var hi = uk
+                    while hi <= ul:
+                        # SA lookup of interval member hi
+                        var kk = hi
+                        var sa_v: UInt64 = 0
+                        var smask = UInt64(sa_intv - 1)
+                        var sa_ok = True
+                        while (kk & smask) != 0:
+                            sa_v += 1
+                            if kk == primary:
+                                kk = 0
+                                break
+                            var xpsi = kk
+                            if kk > primary:
+                                xpsi -= 1
+                            var bi = Int(xpsi)
+                            var bidx = ((bi >> 7) << 4) + 8 + ((bi & 0x7F) >> 4)
+                            var w = bwt[bidx]
+                            var cc = Int((w >> UInt32(((~bi) & 15) << 1)) & 3)
+                            var kv = kk
+
+                            var nocc: UInt64 = 0
+                            var k_m = Int(kv)
+                            if k_m < 0:
+                                nocc = 0
+                            elif UInt64(k_m) == seq_len:
+                                if cc == 0:
+                                    nocc = L2_1 - L2_0
+                                elif cc == 1:
+                                    nocc = L2_2 - L2_1
+                                elif cc == 2:
+                                    nocc = L2_3 - L2_2
                                 else:
-                                    var kko = UInt64(kki)
-                                    if kko >= primary:
-                                        kko -= 1
-                                    var baseo = Int((kko >> 7) << 4)
-                                    oc = UInt64(bwt[baseo + bc * 2]) | (
-                                        UInt64(bwt[baseo + bc * 2 + 1]) << 32
-                                    )
-                                    var po = baseo + 8
-                                    var endo = po + Int(
+                                    nocc = L2_4 - L2_3
+                            else:
+                                var kko = UInt64(k_m)
+                                if kko >= primary:
+                                    kko -= 1
+                                var baseo = Int((kko >> 7) << 4)
+                                nocc = UInt64(bwt[baseo + cc * 2]) | (
+                                    UInt64(bwt[baseo + cc * 2 + 1]) << 32
+                                )
+                                var po = baseo + 8
+                                var endo = po + Int(
+                                    (
                                         (
-                                            (
-                                                (kko >> 5)
-                                                - (
-                                                    (
-                                                        kko
-                                                        & UInt64(
-                                                            0xFFFFFFFFFFFFFF80
-                                                        )
-                                                    )
-                                                    >> 5
-                                                )
-                                            )
-                                            << 1
+                                            (kko >> 5)
+                                            - ((kko & UInt64(0xFFFFFFFFFFFFFF80)) >> 5)
                                         )
+                                        << 1
                                     )
-                                    while po < endo:
-                                        var yo = (UInt64(bwt[po]) << 32) | UInt64(
-                                            bwt[po + 1]
-                                        )
-                                        var ao: UInt64
-                                        var bo: UInt64
-                                        if (bc & 2) != 0:
-                                            ao = yo
-                                        else:
-                                            ao = ~yo
-                                        if (bc & 1) != 0:
-                                            bo = yo
-                                        else:
-                                            bo = ~yo
-                                        var yyo = (ao >> 1) & bo & UInt64(
-                                            0x5555555555555555
-                                        )
-                                        yyo = (
-                                            yyo & UInt64(0x3333333333333333)
-                                        ) + (
-                                            (yyo >> 2)
-                                            & UInt64(0x3333333333333333)
-                                        )
-                                        yyo = (
-                                            (yyo + (yyo >> 4))
-                                            & UInt64(0x0F0F0F0F0F0F0F0F)
-                                        ) * UInt64(0x0101010101010101)
-                                        oc += yyo >> 56
-                                        po += 2
-                                    var bitso = Int(((~Int(kko)) & 31) << 1)
-                                    var masko: UInt64 = UInt64(
-                                        0xFFFFFFFFFFFFFFFF
+                                )
+                                while po < endo:
+                                    var yo = (UInt64(bwt[po]) << 32) | UInt64(
+                                        bwt[po + 1]
                                     )
-                                    if bitso > 0 and bitso < 64:
-                                        masko = ~(
-                                            (UInt64(1) << UInt64(bitso)) - 1
-                                        )
-                                    var y5 = (
-                                        (UInt64(bwt[po]) << 32)
-                                        | UInt64(bwt[po + 1])
-                                    ) & masko
-                                    var a5: UInt64
-                                    var b6: UInt64
-                                    if (bc & 2) != 0:
-                                        a5 = y5
+                                    var ao: UInt64
+                                    var bo: UInt64
+                                    if (cc & 2) != 0:
+                                        ao = yo
                                     else:
-                                        a5 = ~y5
-                                    if (bc & 1) != 0:
-                                        b6 = y5
+                                        ao = ~yo
+                                    if (cc & 1) != 0:
+                                        bo = yo
                                     else:
-                                        b6 = ~y5
-                                    var yy5 = (a5 >> 1) & b6 & UInt64(
+                                        bo = ~yo
+                                    var yyo = (ao >> 1) & bo & UInt64(
                                         0x5555555555555555
                                     )
-                                    yy5 = (
-                                        yy5 & UInt64(0x3333333333333333)
-                                    ) + (
-                                        (yy5 >> 2)
-                                        & UInt64(0x3333333333333333)
+                                    yyo = (yyo & UInt64(0x3333333333333333)) + (
+                                        (yyo >> 2) & UInt64(0x3333333333333333)
                                     )
-                                    yy5 = (
-                                        (yy5 + (yy5 >> 4))
+                                    yyo = (
+                                        (yyo + (yyo >> 4))
                                         & UInt64(0x0F0F0F0F0F0F0F0F)
                                     ) * UInt64(0x0101010101010101)
-                                    oc += yy5 >> 56
-                                    if bc == 0:
-                                        oc -= UInt64((~Int(kko)) & 31)
-                                var Lc2: UInt64 = L2_0
-                                if bc == 1:
-                                    Lc2 = L2_1
-                                elif bc == 2:
-                                    Lc2 = L2_2
-                                elif bc == 3:
-                                    Lc2 = L2_3
-                                kk = Lc2 + oc
-                            var sidx = Int(kk // UInt64(sa_intv))
-                            if sidx <= 0 or sidx >= n_sa:
-                                sa_ok = False
-                            var sa_pos = sa_v
+                                    nocc += yyo >> 56
+                                    po += 2
+                                var bitso = Int(((~Int(kko)) & 31) << 1)
+                                var masko: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
+                                if bitso > 0 and bitso < 64:
+                                    masko = ~((UInt64(1) << UInt64(bitso)) - 1)
+                                var y5 = (
+                                    (UInt64(bwt[po]) << 32) | UInt64(bwt[po + 1])
+                                ) & masko
+                                var a5: UInt64
+                                var b6: UInt64
+                                if (cc & 2) != 0:
+                                    a5 = y5
+                                else:
+                                    a5 = ~y5
+                                if (cc & 1) != 0:
+                                    b6 = y5
+                                else:
+                                    b6 = ~y5
+                                var yy5 = (a5 >> 1) & b6 & UInt64(
+                                    0x5555555555555555
+                                )
+                                yy5 = (yy5 & UInt64(0x3333333333333333)) + (
+                                    (yy5 >> 2) & UInt64(0x3333333333333333)
+                                )
+                                yy5 = (
+                                    (yy5 + (yy5 >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
+                                ) * UInt64(0x0101010101010101)
+                                nocc += yy5 >> 56
+                                if cc == 0:
+                                    nocc -= UInt64((~Int(kko)) & 31)
+
+                            var Lc2: UInt64 = L2_0
+                            if cc == 1:
+                                Lc2 = L2_1
+                            elif cc == 2:
+                                Lc2 = L2_2
+                            elif cc == 3:
+                                Lc2 = L2_3
+                            kk = Lc2 + nocc
+                        var sidx = Int(kk // UInt64(sa_intv))
+                        if sidx <= 0 or sidx >= n_sa:
+                            sa_ok = False
+                        var sa_pos = sa_v
+                        if sa_ok:
+                            sa_pos = sa_v + sa[sidx - 1]
+                        if sa_ok:
+                            var is_rev = 0
+                            var b0 = 0
+                            var plen = e - us + 1
+                            if sa_pos < l_pac:
+                                b0 = Int(sa_pos) - us
+                                is_rev = 0
+                            else:
+                                var seed_end = sa_pos + UInt64(plen) - 1
+                                if seed_end >= l_pac * 2:
+                                    sa_ok = False
+                                else:
+                                    var fp_end = Int(l_pac * 2 - 1 - sa_pos)
+                                    var fp_start = fp_end - (plen - 1)
+                                    b0 = fp_start - (qlen - 1 - e)
+                                    is_rev = 1
                             if sa_ok:
-                                sa_pos = sa_v + sa[sidx - 1]
-                            # Forward-pack hits only (bwameth f*/r* contigs).
-                            if sa_ok and sa_pos < l_pac:
-                                var bstart = Int(sa_pos) - x
-                                var probe = bstart + x  # seed locus for contig lookup
-                                if probe < 0:
-                                    probe = 0
-                                if UInt64(probe) >= l_pac:
-                                    probe = Int(l_pac) - 1
-                                var lo = 0
-                                var hi2 = n_contigs
-                                var crid = -1
-                                while lo < hi2:
-                                    var mid = (lo + hi2) // 2
-                                    var off = Int(contig_off[mid])
-                                    var ln = Int(contig_len[mid])
-                                    if probe < off:
-                                        hi2 = mid
-                                    elif probe >= off + ln:
-                                        lo = mid + 1
-                                    else:
-                                        crid = mid
-                                        break
-                                if crid >= 0:
-                                    var coff = Int(contig_off[crid])
-                                    var clen = Int(contig_len[crid])
-                                    var local = bstart - coff
-                                    # Softclip bases that fall outside the contig.
-                                    var sl0 = 0
-                                    var sr0 = 0
-                                    if local < 0:
-                                        sl0 = -local
-                                    if local + qlen > clen:
-                                        sr0 = local + qlen - clen
-                                    if sl0 + sr0 < qlen and sl0 <= clip_cap and sr0 <= clip_cap:
-                                        var nm_all = 0
-                                        var j = sl0
-                                        while j < qlen - sr0 and nm_all <= budget:
-                                            var ppos = bstart + j
-                                            var rb = Int(
-                                                (
-                                                    pac[ppos >> 2]
-                                                    >> UInt8(
-                                                        ((~ppos) & 3) << 1
+                                var adj = -adj_cap
+                                while adj <= adj_cap:
+                                    var bstart = b0 + adj
+                                    var probe = bstart
+                                    if is_rev != 0:
+                                        probe = bstart
+                                    if probe < 0:
+                                        probe = 0
+                                    if UInt64(probe) >= l_pac:
+                                        probe = Int(l_pac) - 1
+                                    var lo = 0
+                                    var hi2 = n_contigs
+                                    var crid = -1
+                                    while lo < hi2:
+                                        var mid = (lo + hi2) // 2
+                                        var off = Int(contig_off[mid])
+                                        var ln = Int(contig_len[mid])
+                                        if probe < off:
+                                            hi2 = mid
+                                        elif probe >= off + ln:
+                                            lo = mid + 1
+                                        else:
+                                            crid = mid
+                                            break
+                                    if crid >= 0:
+                                        var coff = Int(contig_off[crid])
+                                        var clen = Int(contig_len[crid])
+                                        var local = bstart - coff
+                                        var sl0 = 0
+                                        var sr0 = 0
+                                        if local < 0:
+                                            sl0 = -local
+                                        if local + qlen > clen:
+                                            sr0 = local + qlen - clen
+                                        if (
+                                            sl0 + sr0 < qlen
+                                            and sl0 <= clip_cap
+                                            and sr0 <= clip_cap
+                                        ):
+                                            var nm_all = 0
+                                            var j = sl0
+                                            while j < qlen - sr0 and nm_all <= budget:
+                                                var ppos = bstart + j
+                                                var rb = Int(
+                                                    (
+                                                        pac[ppos >> 2]
+                                                        >> UInt8(((~ppos) & 3) << 1)
                                                     )
+                                                    & 3
                                                 )
-                                                & 3
-                                            )
-                                            var qc = Int(codes[q_base + j])
-                                            if rb > 3 or qc > 3 or rb != qc:
-                                                nm_all += 1
-                                            j += 1
-                                        var sl = sl0
-                                        var sr = sr0
-                                        var nm = nm_all
-                                        if nm_all > budget and clip_cap > 0:
-                                            while sl < clip_cap:
-                                                var p0 = bstart + sl
-                                                if p0 < coff or p0 >= coff + clen:
+                                                var qc = Int(codes[q_base + j])
+                                                if is_rev != 0:
+                                                    var qcr = Int(
+                                                        codes[q_base + (qlen - 1 - j)]
+                                                    )
+                                                    if qcr <= 3:
+                                                        qc = 3 - qcr
+                                                    else:
+                                                        qc = 4
+                                                if rb > 3 or qc > 3 or rb != qc:
+                                                    nm_all += 1
+                                                j += 1
+                                            var sl = sl0
+                                            var sr = sr0
+                                            var nm = nm_all
+                                            if nm_all > budget and clip_cap > 0:
+                                                while sl < clip_cap:
+                                                    var p0 = bstart + sl
+                                                    if p0 < coff or p0 >= coff + clen:
+                                                        sl += 1
+                                                        continue
+                                                    var rb0 = Int(
+                                                        (
+                                                            pac[p0 >> 2]
+                                                            >> UInt8(
+                                                                ((~p0) & 3) << 1
+                                                            )
+                                                        )
+                                                        & 3
+                                                    )
+                                                    var qc0 = Int(codes[q_base + sl])
+                                                    if is_rev != 0:
+                                                        var q0r = Int(
+                                                            codes[
+                                                                q_base
+                                                                + (qlen - 1 - sl)
+                                                            ]
+                                                        )
+                                                        if q0r <= 3:
+                                                            qc0 = 3 - q0r
+                                                        else:
+                                                            qc0 = 4
+                                                    if (
+                                                        rb0 <= 3
+                                                        and qc0 <= 3
+                                                        and rb0 == qc0
+                                                    ):
+                                                        break
                                                     sl += 1
-                                                    continue
-                                                var rb0 = Int(
-                                                    (
-                                                        pac[p0 >> 2]
-                                                        >> UInt8(
-                                                            ((~p0) & 3) << 1
+                                                while sr < clip_cap:
+                                                    var jr = qlen - 1 - sr
+                                                    if jr <= sl:
+                                                        break
+                                                    var p1 = bstart + jr
+                                                    if p1 < coff or p1 >= coff + clen:
+                                                        sr += 1
+                                                        continue
+                                                    var rb1 = Int(
+                                                        (
+                                                            pac[p1 >> 2]
+                                                            >> UInt8(
+                                                                ((~p1) & 3) << 1
+                                                            )
                                                         )
+                                                        & 3
                                                     )
-                                                    & 3
-                                                )
-                                                var qc0 = Int(
-                                                    codes[q_base + sl]
-                                                )
-                                                if (
-                                                    rb0 <= 3
-                                                    and qc0 <= 3
-                                                    and rb0 == qc0
-                                                ):
-                                                    break
-                                                sl += 1
-                                            while sr < clip_cap:
-                                                var jr = qlen - 1 - sr
-                                                if jr <= sl:
-                                                    break
-                                                var p1 = bstart + jr
-                                                if p1 < coff or p1 >= coff + clen:
+                                                    var qc1 = Int(codes[q_base + jr])
+                                                    if is_rev != 0:
+                                                        var q1r = Int(
+                                                            codes[
+                                                                q_base
+                                                                + (qlen - 1 - jr)
+                                                            ]
+                                                        )
+                                                        if q1r <= 3:
+                                                            qc1 = 3 - q1r
+                                                        else:
+                                                            qc1 = 4
+                                                    if (
+                                                        rb1 <= 3
+                                                        and qc1 <= 3
+                                                        and rb1 == qc1
+                                                    ):
+                                                        break
                                                     sr += 1
-                                                    continue
-                                                var rb1 = Int(
-                                                    (
-                                                        pac[p1 >> 2]
-                                                        >> UInt8(
-                                                            ((~p1) & 3) << 1
-                                                        )
-                                                    )
-                                                    & 3
-                                                )
-                                                var qc1 = Int(
-                                                    codes[q_base + jr]
-                                                )
-                                                if (
-                                                    rb1 <= 3
-                                                    and qc1 <= 3
-                                                    and rb1 == qc1
+                                                nm = 0
+                                                var jm = sl
+                                                while (
+                                                    jm < qlen - sr and nm <= budget
                                                 ):
-                                                    break
-                                                sr += 1
-                                            nm = 0
-                                            var jm = sl
-                                            while (
-                                                jm < qlen - sr and nm <= budget
-                                            ):
-                                                var pm = bstart + jm
-                                                var rbm = Int(
-                                                    (
-                                                        pac[pm >> 2]
-                                                        >> UInt8(
-                                                            ((~pm) & 3) << 1
+                                                    var pm = bstart + jm
+                                                    var rbm = Int(
+                                                        (
+                                                            pac[pm >> 2]
+                                                            >> UInt8(
+                                                                ((~pm) & 3) << 1
+                                                            )
                                                         )
+                                                        & 3
                                                     )
-                                                    & 3
-                                                )
-                                                var qcm = Int(
-                                                    codes[q_base + jm]
-                                                )
-                                                if (
-                                                    rbm > 3
-                                                    or qcm > 3
-                                                    or rbm != qcm
-                                                ):
-                                                    nm += 1
-                                                jm += 1
-                                        var alen = qlen - sl - sr
-                                        if nm <= budget and alen >= 24:
-                                            if nm < best_nm or (
-                                                nm == best_nm and occ_n == 1
-                                            ):
-                                                best_nm = nm
-                                                best_rid = crid
-                                                best_pos = local + sl
-                                                best_sl = sl
-                                                best_sr = sr
-                                                var mq: UInt32 = 20
-                                                if occ_n == 1 and nm == 0:
-                                                    mq = 60
-                                                elif nm == 0:
-                                                    mq = 40
-                                                best_mq = mq
-                                                if best_nm == 0 and occ_n == 1:
-                                                    out_rid[rid] = Int32(
-                                                        best_rid
-                                                    )
-                                                    out_pos[rid] = UInt32(
-                                                        best_pos
-                                                    )
-                                                    out_mapq[rid] = best_mq
-                                                    out_flag[rid] = Int32(0)
-                                                    out_sl[rid] = UInt32(
-                                                        best_sl
-                                                    )
-                                                    out_sr[rid] = UInt32(
-                                                        best_sr
-                                                    )
-                                                    out_nm[rid] = UInt32(
-                                                        best_nm
-                                                    )
-                                                    return
-                            hi += 1
-                x += seed_stride
+                                                    var qcm = Int(codes[q_base + jm])
+                                                    if is_rev != 0:
+                                                        var qmr = Int(
+                                                            codes[
+                                                                q_base
+                                                                + (qlen - 1 - jm)
+                                                            ]
+                                                        )
+                                                        if qmr <= 3:
+                                                            qcm = 3 - qmr
+                                                        else:
+                                                            qcm = 4
+                                                    if (
+                                                        rbm > 3
+                                                        or qcm > 3
+                                                        or rbm != qcm
+                                                    ):
+                                                        nm += 1
+                                                    jm += 1
+                                            var alen = qlen - sl - sr
+                                            if nm <= budget and alen >= 24:
+                                                if nm < best_nm:
+                                                    best_nm = nm
+                                                    best_rid = crid
+                                                    best_pos = local + sl
+                                                    best_sl = sl
+                                                    best_sr = sr
+                                                    var mq: UInt32 = 20
+                                                    if nm == 0:
+                                                        mq = 60
+                                                    best_mq = mq
+                                                    best_flag = is_rev * 16
+                                                    if best_nm == 0:
+                                                        out_rid[rid] = Int32(
+                                                            best_rid
+                                                        )
+                                                        out_pos[rid] = UInt32(
+                                                            best_pos
+                                                        )
+                                                        out_mapq[rid] = best_mq
+                                                        out_flag[rid] = Int32(
+                                                            best_flag
+                                                        )
+                                                        out_sl[rid] = UInt32(
+                                                            best_sl
+                                                        )
+                                                        out_sr[rid] = UInt32(
+                                                            best_sr
+                                                        )
+                                                        out_nm[rid] = UInt32(
+                                                            best_nm
+                                                        )
+                                                        return
+                                    adj += 1
+                        hi += 1
+                e += seed_stride
 
             if best_rid >= 0:
                 out_rid[rid] = Int32(best_rid)
                 out_pos[rid] = UInt32(best_pos)
                 out_mapq[rid] = best_mq
-                out_flag[rid] = Int32(0)
+                out_flag[rid] = Int32(best_flag)
                 out_sl[rid] = UInt32(best_sl)
                 out_sr[rid] = UInt32(best_sr)
                 out_nm[rid] = UInt32(best_nm)
@@ -873,12 +876,13 @@ def map_fastq_fm_gpu(
         print("MojoLinear GPU-fm index resident ok")
 
         var batch_size = _env_int("METHYLGRAPHER_LINEAR_READ_BATCH", 16384)
-        var seed_len = _env_int("METHYLGRAPHER_FM_SEED_LEN", 19)
-        # C2T is repetitive — denser seeds + higher occ cap than BWA defaults.
-        var seed_stride = _env_int("METHYLGRAPHER_FM_SEED_STRIDE", 5)
-        var max_occ = _env_int("METHYLGRAPHER_FM_MAX_OCC", 256)
-        var max_diff = _env_int("METHYLGRAPHER_FM_MAX_DIFF", 10)
-        var max_soft = _env_int("METHYLGRAPHER_FM_MAX_SOFT", 16)
+        var seed_len = _env_int("METHYLGRAPHER_FM_SEED_LEN", 18)
+        # Unique SMEM left-extend; stride is right-endpoint spacing.
+        var seed_stride = _env_int("METHYLGRAPHER_FM_SEED_STRIDE", 2)
+        var max_occ = _env_int("METHYLGRAPHER_FM_MAX_OCC", 4096)
+        var max_diff = _env_int("METHYLGRAPHER_FM_MAX_DIFF", 12)
+        var max_soft = _env_int("METHYLGRAPHER_FM_MAX_SOFT", 20)
+        var max_adj = _env_int("METHYLGRAPHER_FM_ADJ", 8)
         var paired = fq2.byte_length() > 0
         print(
             "MojoLinear GPU-fm map start batch=",
@@ -891,6 +895,8 @@ def map_fastq_fm_gpu(
             max_occ,
             " max_diff=",
             max_diff,
+            " adj=",
+            max_adj,
             " paired=",
             paired,
         )
@@ -995,6 +1001,7 @@ def map_fastq_fm_gpu(
                 max_occ,
                 max_diff,
                 max_soft,
+                max_adj,
                 dev_rid.unsafe_ptr(),
                 dev_pos.unsafe_ptr(),
                 dev_mapq.unsafe_ptr(),
