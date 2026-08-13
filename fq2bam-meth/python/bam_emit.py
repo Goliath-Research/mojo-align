@@ -108,6 +108,38 @@ class _BgzfWriter:
 
     def write(self, data: bytes | bytearray) -> None:
         self._buf.extend(data)
+        self._drain_full_blocks()
+
+    def write_from_addr(self, addr: int, n: int) -> None:
+        """BGZF ``n`` bytes at ``addr`` with one copy per 65 KiB block."""
+        n = int(n)
+        if n <= 0:
+            return
+        off = 0
+        tail = len(self._buf) - self._off
+        if tail < 0:
+            tail = 0
+        if tail:
+            need = _MAX_UNCOMPRESSED - tail
+            if need < 0:
+                need = 0
+            take = n if n < need else need
+            if take:
+                window = (ctypes.c_ubyte * take).from_address(int(addr))
+                self._buf.extend(memoryview(window))
+                off = take
+                self._drain_full_blocks()
+        while off + _MAX_UNCOMPRESSED <= n:
+            take = _MAX_UNCOMPRESSED
+            window = (ctypes.c_ubyte * take).from_address(int(addr) + off)
+            self._submit(bytes(memoryview(window)))
+            off += take
+        if off < n:
+            take = n - off
+            window = (ctypes.c_ubyte * take).from_address(int(addr) + off)
+            self._buf.extend(memoryview(window))
+
+    def _drain_full_blocks(self) -> None:
         while len(self._buf) - self._off >= _MAX_UNCOMPRESSED:
             start = self._off
             end = start + _MAX_UNCOMPRESSED
@@ -125,8 +157,9 @@ class _BgzfWriter:
             self._fh.write(_bgzf_block(chunk, self._level))
             return
         self._pending.append(self._pool.submit(_bgzf_block, chunk, self._level))
-        # Back-pressure: keep ~2 in-flight blocks per worker.
-        while len(self._pending) >= self._threads * 2:
+        # Keep zlib busy during gather: ~32 in-flight blocks per worker (~2 MiB
+        # uncompressed each worker at 65 KiB/block).
+        while len(self._pending) >= self._threads * 32:
             self._fh.write(self._pending.pop(0).result())
 
     def _flush_tail(self) -> None:
@@ -158,6 +191,8 @@ class BamArena:
     def __init__(self) -> None:
         self._chunks: list[bytearray] = []
         self._n = 0
+        self._sorted = bytearray()
+        self._sorted_hdr = None
 
     def append_raw(self, addr: int, n: int) -> int:
         """Copy ``n`` bytes at ``addr``; return the new chunk index."""
@@ -173,6 +208,17 @@ class BamArena:
 
     def nbytes(self) -> int:
         return self._n
+
+    def alloc_sorted(self, n: int) -> int:
+        """Pinned-ish host bytearray for parallel gather; returns start address."""
+        n = int(n)
+        if n <= 0:
+            self._sorted = bytearray()
+            self._sorted_hdr = None
+            return 0
+        self._sorted = bytearray(n)
+        self._sorted_hdr = (ctypes.c_char * 1).from_buffer(self._sorted)
+        return ctypes.addressof(self._sorted_hdr)
 
     def chunk_addr(self, i: int) -> int:
         c = self._chunks[int(i)]
@@ -348,7 +394,7 @@ class BamWriter:
         """Append ``n`` bytes at ``addr`` (Mojo host buffer) into BGZF."""
         if n <= 0:
             return
-        self._bgzf.write(ctypes.string_at(int(addr), int(n)))
+        self._bgzf.write_from_addr(int(addr), int(n))
 
     def close(self) -> None:
         self._bgzf.close()

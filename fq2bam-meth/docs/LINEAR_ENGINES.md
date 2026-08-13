@@ -106,15 +106,20 @@ the frozen engine.
 | fm (bytearray FASTQ + Mojo pack + async pigz) | **98.34%** | **0.013** | **1.00** | kernel 9.4 (hidden) / emit 114 (BGZF 28) / fastq 96 / sort 2.2 / **map 222 s** | **~367 s** script | **pass** |
 | fm (Mojo bulk FASTQ / pigz fd) | **98.33%** | **0.014** | **1.00** | kernel 1.9 (hidden) / emit **66** (BGZF 28) / fastq **32** / sort 2.2 / **map 103 s** | **~256 s** script | **pass** |
 | fm (pack ∥ FASTQ `parallelize`) | **98.33%** | **0.014** | **1.00** | kernel **24** (exposed) / emit **64** (BGZF 28) / fastq 32 (hidden under pack) / **map 94 s** | **~249 s** script | **pass** |
+| fm (2-deep GPU + event wait) | **98.33%** | **0.014** | **1.00** | kernel wait **22** / emit **64** (BGZF 28) / fastq 32 (hidden) / sort 2.2 / **map 92 s** | **~251 s** script | **pass** |
+| fm (2-deep + copy-lite BGZF) | **98.33%** | **0.014** | **1.00** | kernel wait **22** / emit **60** (BGZF **25**) / fastq 32 (hidden) / sort 2.2 / **map 88 s** | **~242 s** script | **pass** |
 
 GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k). Mojo
 `parallelize` runs BAM pack and FASTQ parse on two workers (third arena so
-they do not alias; Python `append_raw` stays on the main thread). Full-sample
-**map 103 s → 94 s**. FASTQ (~32 s) is hidden under pack; that made per-batch
-CPU shorter than the GPU kernel, so **~24 s of GPU wait is now visible**.
-Remaining wall is that GPU bubble plus final gather/BGZF (~28 s). Next cut is
-a 2-deep GPU pipeline (keep the next kernel in flight during emit) toward
-Clara's ~84 s mem / ~122 s E2E. Default stays **parity**.
+they do not alias; Python `append_raw` stays on the main thread). A 2-deep
+GPU pipeline (second buffer set + `DeviceEvent` after D2H) queues batch N+1
+before waiting for N. Event wait is event-scoped (not a full device sync),
+but per-batch GPU work still exceeds the CPU overlap window, so **~22 s GPU
+wait** stays exposed. Copy-lite BGZF (`write_from_addr`, one copy per 65 KiB
+block, deeper zlib in-flight) cut gather **28 s → 25 s**. Full-sample **map
+94 s → 92 s → 88 s** vs Clara mem **83.8 s**. Leftover vs Clara is that GPU
+bubble plus gather/BGZF; a second host `parallelize` in `linear_gpu_fm.mojo`
+OOMs the kernel compile (~436 GiB). Default stays **parity**.
 
 Mate-rescue recovered the good one-end-mapped mates. Remaining Δ vs Clara is mostly 2–4 bp indels and low-quality extras we are not chasing.
 

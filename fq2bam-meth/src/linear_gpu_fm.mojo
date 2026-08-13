@@ -882,7 +882,14 @@ def map_fastq_fm_gpu(
         raise Error("map_fastq_fm_gpu requires accelerator build")
     else:
         from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
+        from std.gpu.host import (
+            DeviceBuffer,
+            DeviceContext,
+            DeviceEvent,
+            DeviceFunction,
+            DeviceStream,
+            HostBuffer,
+        )
         from std.memory import UnsafePointer, memcpy
 
         def copy_bytes_offset_kernel(
@@ -1966,7 +1973,9 @@ def map_fastq_fm_gpu(
             fq_reserve(arena_cur, batch_size, paired)
             fq_reserve(arena_ready, batch_size, paired)
             fq_reserve(arena_spare, batch_size, paired)
-            print("MojoLinear GPU-fm FASTQ=mojo-bulk overlap=pack||fq")
+            print(
+                "MojoLinear GPU-fm FASTQ=mojo-bulk overlap=pack||fq gpu=2-deep"
+            )
         else:
             fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
 
@@ -1994,6 +2003,28 @@ def map_fastq_fm_gpu(
         var host_sl = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
         var host_sr = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
         var host_nm = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_bases1 = ctx.enqueue_create_host_buffer[DType.uint8](bases_cap)
+        var host_lens1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var dev_bases1 = ctx.enqueue_create_buffer[DType.uint8](bases_cap)
+        var dev_codes1 = ctx.enqueue_create_buffer[DType.uint8](bases_cap)
+        var dev_lens1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_rid1 = ctx.enqueue_create_buffer[DType.int32](cap_n)
+        var dev_pos1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_mapq1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_flag1 = ctx.enqueue_create_buffer[DType.int32](cap_n)
+        var dev_sl1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_sr1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_nm1 = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var host_rid1 = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var host_pos1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_mapq1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_flag1 = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var host_sl1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_sr1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_nm1 = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var ev0 = ctx.create_event()
+        var ev1 = ctx.create_event()
+        var gpu_st = ctx.stream()
         var emit_rid = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
         var emit_pos = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
         var emit_mapq = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
@@ -2032,6 +2063,150 @@ def map_fastq_fm_gpu(
         var t_emit = time_mod.perf_counter() * 0
         var t_fastq = time_mod.perf_counter() * 0
         comptime BLOCK = 256
+        var k_pack = ctx.compile_function[pack_bases_kernel]()
+        var k_seed = ctx.compile_function[fm_seed_extend_kernel]()
+        var k_rescue = ctx.compile_function[fm_mate_rescue_kernel]()
+
+        def _fm_fire_batch(
+            ctx: DeviceContext,
+            st: DeviceStream,
+            k_pack: DeviceFunction,
+            k_seed: DeviceFunction,
+            k_rescue: DeviceFunction,
+            mut host_bases: HostBuffer[DType.uint8],
+            mut host_lens: HostBuffer[DType.uint32],
+            mut host_rid: HostBuffer[DType.int32],
+            mut host_pos: HostBuffer[DType.uint32],
+            mut host_mapq: HostBuffer[DType.uint32],
+            mut host_flag: HostBuffer[DType.int32],
+            mut host_sl: HostBuffer[DType.uint32],
+            mut host_sr: HostBuffer[DType.uint32],
+            mut host_nm: HostBuffer[DType.uint32],
+            mut dev_bases: DeviceBuffer[DType.uint8],
+            mut dev_codes: DeviceBuffer[DType.uint8],
+            mut dev_lens: DeviceBuffer[DType.uint32],
+            mut dev_rid: DeviceBuffer[DType.int32],
+            mut dev_pos: DeviceBuffer[DType.uint32],
+            mut dev_mapq: DeviceBuffer[DType.uint32],
+            mut dev_flag: DeviceBuffer[DType.int32],
+            mut dev_sl: DeviceBuffer[DType.uint32],
+            mut dev_sr: DeviceBuffer[DType.uint32],
+            mut dev_nm: DeviceBuffer[DType.uint32],
+            mut ev: DeviceEvent,
+            n_bases: Int,
+            n_seq: Int,
+            max_len: Int,
+            mut index_bwt: DeviceBuffer[DType.uint32],
+            mut index_sa: DeviceBuffer[DType.uint64],
+            mut index_pac: DeviceBuffer[DType.uint8],
+            mut index_coff: DeviceBuffer[DType.uint64],
+            mut index_clen: DeviceBuffer[DType.uint32],
+            n_contigs: Int,
+            primary: UInt64,
+            seq_len: UInt64,
+            l_pac: UInt64,
+            l2_0: UInt64,
+            l2_1: UInt64,
+            l2_2: UInt64,
+            l2_3: UInt64,
+            l2_4: UInt64,
+            sa_intv: Int,
+            n_sa: Int,
+            seed_len: Int,
+            seed_stride: Int,
+            max_occ: Int,
+            max_diff: Int,
+            max_soft: Int,
+            max_adj: Int,
+            rescue_win: Int,
+            paired: Bool,
+        ) raises:
+            ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
+            ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
+            var grid_b = (n_bases + 256 - 1) // 256
+            var grid_r = (n_seq + 256 - 1) // 256
+            st.enqueue_function(
+                k_pack,
+                dev_bases.unsafe_ptr(),
+                dev_codes.unsafe_ptr(),
+                n_bases,
+                grid_dim=grid_b,
+                block_dim=256,
+            )
+            st.enqueue_function(
+                k_seed,
+                index_bwt.unsafe_ptr(),
+                index_sa.unsafe_ptr(),
+                index_pac.unsafe_ptr(),
+                index_coff.unsafe_ptr(),
+                index_clen.unsafe_ptr(),
+                n_contigs,
+                primary,
+                seq_len,
+                l_pac,
+                l2_0,
+                l2_1,
+                l2_2,
+                l2_3,
+                l2_4,
+                sa_intv,
+                n_sa,
+                dev_codes.unsafe_ptr(),
+                dev_lens.unsafe_ptr(),
+                max_len,
+                n_seq,
+                seed_len,
+                seed_stride,
+                max_occ,
+                max_diff,
+                max_soft,
+                max_adj,
+                dev_rid.unsafe_ptr(),
+                dev_pos.unsafe_ptr(),
+                dev_mapq.unsafe_ptr(),
+                dev_flag.unsafe_ptr(),
+                dev_sl.unsafe_ptr(),
+                dev_sr.unsafe_ptr(),
+                dev_nm.unsafe_ptr(),
+                grid_dim=grid_r,
+                block_dim=256,
+            )
+            if paired and rescue_win > 0:
+                var n_pairs = n_seq // 2
+                var grid_p = (n_pairs + 256 - 1) // 256
+                st.enqueue_function(
+                    k_rescue,
+                    index_pac.unsafe_ptr(),
+                    index_coff.unsafe_ptr(),
+                    index_clen.unsafe_ptr(),
+                    n_contigs,
+                    l_pac,
+                    dev_codes.unsafe_ptr(),
+                    dev_lens.unsafe_ptr(),
+                    max_len,
+                    n_pairs,
+                    rescue_win,
+                    max_diff,
+                    max_soft,
+                    dev_rid.unsafe_ptr(),
+                    dev_pos.unsafe_ptr(),
+                    dev_mapq.unsafe_ptr(),
+                    dev_flag.unsafe_ptr(),
+                    dev_sl.unsafe_ptr(),
+                    dev_sr.unsafe_ptr(),
+                    dev_nm.unsafe_ptr(),
+                    grid_dim=grid_p,
+                    block_dim=256,
+                )
+            ctx.enqueue_copy(src_buf=dev_rid, dst_buf=host_rid)
+            ctx.enqueue_copy(src_buf=dev_pos, dst_buf=host_pos)
+            ctx.enqueue_copy(src_buf=dev_mapq, dst_buf=host_mapq)
+            ctx.enqueue_copy(src_buf=dev_flag, dst_buf=host_flag)
+            ctx.enqueue_copy(src_buf=dev_sl, dst_buf=host_sl)
+            ctx.enqueue_copy(src_buf=dev_sr, dst_buf=host_sr)
+            ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
+            st.record_event(ev)
+
 
         var t_f0 = time_mod.perf_counter()
         var py_cur = Python.none()
@@ -2046,6 +2221,10 @@ def map_fastq_fm_gpu(
         var py_ready = Python.none()
         var n1_ready = 0
         var have_ready = False
+        var gpu_live = False
+        var gpu_g = 0
+        var n_seq_g = 0
+
 
         while n1_cur > 0:
             var t_g0 = time_mod.perf_counter()
@@ -2066,14 +2245,42 @@ def map_fastq_fm_gpu(
             if n_seq > cap_n:
                 raise Error("FASTQ batch larger than GPU buffers")
             var n_bases = n_seq * max_len
+
+            var next_live = False
+            var n_seq_next = 0
+            var gpu_g2 = gpu_g
+            var n1_next = 0
+            var py_next = Python.none()
+            var t_emit_ov = time_mod.perf_counter() * 0
+            var t_overlap = time_mod.perf_counter() * 0
+            var do_fire = False
+            var fire_g = 0
+            var fire_n_seq = n_seq
+            var fire_max_len = max_len
+            var fire_n_bases = n_bases
+
             if emit_bam:
-                fq_pack_bases(
-                    arena_cur,
-                    paired,
-                    Int(host_bases.unsafe_ptr()),
-                    max_len,
-                    Int(host_lens.unsafe_ptr()),
-                )
+                if not gpu_live:
+                    if gpu_g == 0:
+                        fq_pack_bases(
+                            arena_cur,
+                            paired,
+                            Int(host_bases.unsafe_ptr()),
+                            max_len,
+                            Int(host_lens.unsafe_ptr()),
+                        )
+                    else:
+                        fq_pack_bases(
+                            arena_cur,
+                            paired,
+                            Int(host_bases1.unsafe_ptr()),
+                            max_len,
+                            Int(host_lens1.unsafe_ptr()),
+                        )
+                    do_fire = True
+                    fire_g = gpu_g
+                    n_seq_g = n_seq
+                    gpu_live = True
             else:
                 py_cur.zero_align(Int(host_bases.unsafe_ptr()), n_bases)
                 py_cur.export_seq_ptrs(
@@ -2093,95 +2300,126 @@ def map_fastq_fm_gpu(
                             count=ln,
                         )
                     si += 1
-            ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
-            ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
-            var grid_b = (n_bases + BLOCK - 1) // BLOCK
-            var grid_r = (n_seq + BLOCK - 1) // BLOCK
-            ctx.enqueue_function[pack_bases_kernel](
-                dev_bases.unsafe_ptr(),
-                dev_codes.unsafe_ptr(),
-                n_bases,
-                grid_dim=grid_b,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[fm_seed_extend_kernel](
-                dev_bwt.unsafe_ptr(),
-                dev_sa.unsafe_ptr(),
-                dev_pac.unsafe_ptr(),
-                dev_coff.unsafe_ptr(),
-                dev_clen.unsafe_ptr(),
-                n_contigs,
-                index.primary,
-                index.seq_len,
-                index.l_pac,
-                index.L2[0],
-                index.L2[1],
-                index.L2[2],
-                index.L2[3],
-                index.L2[4],
-                index.sa_intv,
-                index.n_sa,
-                dev_codes.unsafe_ptr(),
-                dev_lens.unsafe_ptr(),
-                max_len,
-                n_seq,
-                seed_len,
-                seed_stride,
-                max_occ,
-                max_diff,
-                max_soft,
-                max_adj,
-                dev_rid.unsafe_ptr(),
-                dev_pos.unsafe_ptr(),
-                dev_mapq.unsafe_ptr(),
-                dev_flag.unsafe_ptr(),
-                dev_sl.unsafe_ptr(),
-                dev_sr.unsafe_ptr(),
-                dev_nm.unsafe_ptr(),
-                grid_dim=grid_r,
-                block_dim=BLOCK,
-            )
-            if paired and rescue_win > 0:
-                var n_pairs = n_seq // 2
-                var grid_p = (n_pairs + BLOCK - 1) // BLOCK
-                ctx.enqueue_function[fm_mate_rescue_kernel](
-                    dev_pac.unsafe_ptr(),
-                    dev_coff.unsafe_ptr(),
-                    dev_clen.unsafe_ptr(),
-                    n_contigs,
-                    index.l_pac,
-                    dev_codes.unsafe_ptr(),
-                    dev_lens.unsafe_ptr(),
-                    max_len,
-                    n_pairs,
-                    rescue_win,
-                    max_diff,
-                    max_soft,
-                    dev_rid.unsafe_ptr(),
-                    dev_pos.unsafe_ptr(),
-                    dev_mapq.unsafe_ptr(),
-                    dev_flag.unsafe_ptr(),
-                    dev_sl.unsafe_ptr(),
-                    dev_sr.unsafe_ptr(),
-                    dev_nm.unsafe_ptr(),
-                    grid_dim=grid_p,
-                    block_dim=BLOCK,
-                )
-            ctx.enqueue_copy(src_buf=dev_rid, dst_buf=host_rid)
-            ctx.enqueue_copy(src_buf=dev_pos, dst_buf=host_pos)
-            ctx.enqueue_copy(src_buf=dev_mapq, dst_buf=host_mapq)
-            ctx.enqueue_copy(src_buf=dev_flag, dst_buf=host_flag)
-            ctx.enqueue_copy(src_buf=dev_sl, dst_buf=host_sl)
-            ctx.enqueue_copy(src_buf=dev_sr, dst_buf=host_sr)
-            ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
+                do_fire = True
+                fire_g = 0
 
+            if do_fire:
+                if fire_g == 0:
+                    _fm_fire_batch(
+                        ctx,
+                        gpu_st,
+                        k_pack,
+                        k_seed,
+                        k_rescue,
+                        host_bases,
+                        host_lens,
+                        host_rid,
+                        host_pos,
+                        host_mapq,
+                        host_flag,
+                        host_sl,
+                        host_sr,
+                        host_nm,
+                        dev_bases,
+                        dev_codes,
+                        dev_lens,
+                        dev_rid,
+                        dev_pos,
+                        dev_mapq,
+                        dev_flag,
+                        dev_sl,
+                        dev_sr,
+                        dev_nm,
+                        ev0,
+                        fire_n_bases,
+                        fire_n_seq,
+                        fire_max_len,
+                        dev_bwt,
+                        dev_sa,
+                        dev_pac,
+                        dev_coff,
+                        dev_clen,
+                        n_contigs,
+                        index.primary,
+                        index.seq_len,
+                        index.l_pac,
+                        index.L2[0],
+                        index.L2[1],
+                        index.L2[2],
+                        index.L2[3],
+                        index.L2[4],
+                        index.sa_intv,
+                        index.n_sa,
+                        seed_len,
+                        seed_stride,
+                        max_occ,
+                        max_diff,
+                        max_soft,
+                        max_adj,
+                        rescue_win,
+                        paired,
+                    )
+                else:
+                    _fm_fire_batch(
+                        ctx,
+                        gpu_st,
+                        k_pack,
+                        k_seed,
+                        k_rescue,
+                        host_bases1,
+                        host_lens1,
+                        host_rid1,
+                        host_pos1,
+                        host_mapq1,
+                        host_flag1,
+                        host_sl1,
+                        host_sr1,
+                        host_nm1,
+                        dev_bases1,
+                        dev_codes1,
+                        dev_lens1,
+                        dev_rid1,
+                        dev_pos1,
+                        dev_mapq1,
+                        dev_flag1,
+                        dev_sl1,
+                        dev_sr1,
+                        dev_nm1,
+                        ev1,
+                        fire_n_bases,
+                        fire_n_seq,
+                        fire_max_len,
+                        dev_bwt,
+                        dev_sa,
+                        dev_pac,
+                        dev_coff,
+                        dev_clen,
+                        n_contigs,
+                        index.primary,
+                        index.seq_len,
+                        index.l_pac,
+                        index.L2[0],
+                        index.L2[1],
+                        index.L2[2],
+                        index.L2[3],
+                        index.L2[4],
+                        index.sa_intv,
+                        index.n_sa,
+                        seed_len,
+                        seed_stride,
+                        max_occ,
+                        max_diff,
+                        max_soft,
+                        max_adj,
+                        rescue_win,
+                        paired,
+                    )
+            do_fire = False
             var t_ov0 = time_mod.perf_counter()
             var fut = Python.none()
             if not emit_bam:
                 fut = fq_reader.read_batch_async(batch_size)
-            var t_emit_ov = time_mod.perf_counter() * 0
-            var n1_next = 0
-            var py_next = Python.none()
+            t_emit_ov = time_mod.perf_counter() * 0
             if emit_bam and have_ready:
                 var ov_packed = List[Int](length=1, fill=0)
                 var ov_fail = List[Int](length=2, fill=0)
@@ -2326,40 +2564,240 @@ def map_fastq_fm_gpu(
                         )
                 py_next = fut.result()
                 n1_next = Int(py=py_next.n1)
-            var t_overlap = time_mod.perf_counter() - t_ov0
+            t_overlap = time_mod.perf_counter() - t_ov0
             if not emit_bam:
                 var t_fq_part = t_overlap - t_emit_ov
                 if t_fq_part < 0:
                     t_fq_part = 0
                 t_fastq = t_fastq + t_fq_part
+            if emit_bam and n1_next > 0:
+                gpu_g2 = 1 - gpu_g
+                var max_len_n = arena_spare.max_len
+                if max_len_n < seed_len:
+                    max_len_n = seed_len
+                if max_len_n > max_len_cap:
+                    raise Error("read longer than FM base cap (1024)")
+                if n1_next > ptr_cap:
+                    raise Error("FASTQ batch larger than pointer tables")
+                var n_seq_n = n1_next
+                if paired:
+                    n_seq_n = n1_next * 2
+                if n_seq_n > cap_n:
+                    raise Error("FASTQ batch larger than GPU buffers")
+                var n_bases_n = n_seq_n * max_len_n
+                if gpu_g2 == 0:
+                    fq_pack_bases(
+                        arena_spare,
+                        paired,
+                        Int(host_bases.unsafe_ptr()),
+                        max_len_n,
+                        Int(host_lens.unsafe_ptr()),
+                    )
+                else:
+                    fq_pack_bases(
+                        arena_spare,
+                        paired,
+                        Int(host_bases1.unsafe_ptr()),
+                        max_len_n,
+                        Int(host_lens1.unsafe_ptr()),
+                    )
+                do_fire = True
+                fire_g = gpu_g2
+                fire_n_seq = n_seq_n
+                fire_max_len = max_len_n
+                fire_n_bases = n_bases_n
+                n_seq_next = n_seq_n
+                next_live = True
 
-            ctx.synchronize()
-            t_gpu = t_gpu + (time_mod.perf_counter() - t_g0) - t_overlap
-            _copy_bytes(
-                Int(emit_rid.unsafe_ptr()), Int(host_rid.unsafe_ptr()), n_seq * 4
-            )
-            _copy_bytes(
-                Int(emit_pos.unsafe_ptr()), Int(host_pos.unsafe_ptr()), n_seq * 4
-            )
-            _copy_bytes(
-                Int(emit_mapq.unsafe_ptr()),
-                Int(host_mapq.unsafe_ptr()),
-                n_seq * 4,
-            )
-            _copy_bytes(
-                Int(emit_flag.unsafe_ptr()),
-                Int(host_flag.unsafe_ptr()),
-                n_seq * 4,
-            )
-            _copy_bytes(
-                Int(emit_sl.unsafe_ptr()), Int(host_sl.unsafe_ptr()), n_seq * 4
-            )
-            _copy_bytes(
-                Int(emit_sr.unsafe_ptr()), Int(host_sr.unsafe_ptr()), n_seq * 4
-            )
-            _copy_bytes(
-                Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq * 4
-            )
+            if do_fire:
+                if fire_g == 0:
+                    _fm_fire_batch(
+                        ctx,
+                        gpu_st,
+                        k_pack,
+                        k_seed,
+                        k_rescue,
+                        host_bases,
+                        host_lens,
+                        host_rid,
+                        host_pos,
+                        host_mapq,
+                        host_flag,
+                        host_sl,
+                        host_sr,
+                        host_nm,
+                        dev_bases,
+                        dev_codes,
+                        dev_lens,
+                        dev_rid,
+                        dev_pos,
+                        dev_mapq,
+                        dev_flag,
+                        dev_sl,
+                        dev_sr,
+                        dev_nm,
+                        ev0,
+                        fire_n_bases,
+                        fire_n_seq,
+                        fire_max_len,
+                        dev_bwt,
+                        dev_sa,
+                        dev_pac,
+                        dev_coff,
+                        dev_clen,
+                        n_contigs,
+                        index.primary,
+                        index.seq_len,
+                        index.l_pac,
+                        index.L2[0],
+                        index.L2[1],
+                        index.L2[2],
+                        index.L2[3],
+                        index.L2[4],
+                        index.sa_intv,
+                        index.n_sa,
+                        seed_len,
+                        seed_stride,
+                        max_occ,
+                        max_diff,
+                        max_soft,
+                        max_adj,
+                        rescue_win,
+                        paired,
+                    )
+                else:
+                    _fm_fire_batch(
+                        ctx,
+                        gpu_st,
+                        k_pack,
+                        k_seed,
+                        k_rescue,
+                        host_bases1,
+                        host_lens1,
+                        host_rid1,
+                        host_pos1,
+                        host_mapq1,
+                        host_flag1,
+                        host_sl1,
+                        host_sr1,
+                        host_nm1,
+                        dev_bases1,
+                        dev_codes1,
+                        dev_lens1,
+                        dev_rid1,
+                        dev_pos1,
+                        dev_mapq1,
+                        dev_flag1,
+                        dev_sl1,
+                        dev_sr1,
+                        dev_nm1,
+                        ev1,
+                        fire_n_bases,
+                        fire_n_seq,
+                        fire_max_len,
+                        dev_bwt,
+                        dev_sa,
+                        dev_pac,
+                        dev_coff,
+                        dev_clen,
+                        n_contigs,
+                        index.primary,
+                        index.seq_len,
+                        index.l_pac,
+                        index.L2[0],
+                        index.L2[1],
+                        index.L2[2],
+                        index.L2[3],
+                        index.L2[4],
+                        index.sa_intv,
+                        index.n_sa,
+                        seed_len,
+                        seed_stride,
+                        max_occ,
+                        max_diff,
+                        max_soft,
+                        max_adj,
+                        rescue_win,
+                        paired,
+                    )
+
+            var t_w0 = time_mod.perf_counter()
+            if emit_bam:
+                if gpu_g == 0:
+                    ev0.synchronize()
+                    _copy_bytes(
+                        Int(emit_rid.unsafe_ptr()), Int(host_rid.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_pos.unsafe_ptr()), Int(host_pos.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_mapq.unsafe_ptr()), Int(host_mapq.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_flag.unsafe_ptr()), Int(host_flag.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_sl.unsafe_ptr()), Int(host_sl.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_sr.unsafe_ptr()), Int(host_sr.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq_g * 4
+                    )
+                else:
+                    ev1.synchronize()
+                    _copy_bytes(
+                        Int(emit_rid.unsafe_ptr()), Int(host_rid1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_pos.unsafe_ptr()), Int(host_pos1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_mapq.unsafe_ptr()), Int(host_mapq1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_flag.unsafe_ptr()), Int(host_flag1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_sl.unsafe_ptr()), Int(host_sl1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_sr.unsafe_ptr()), Int(host_sr1.unsafe_ptr()), n_seq_g * 4
+                    )
+                    _copy_bytes(
+                        Int(emit_nm.unsafe_ptr()), Int(host_nm1.unsafe_ptr()), n_seq_g * 4
+                    )
+                t_gpu = t_gpu + (time_mod.perf_counter() - t_w0)
+                gpu_live = next_live
+                if next_live:
+                    gpu_g = gpu_g2
+                    n_seq_g = n_seq_next
+            else:
+                ctx.synchronize()
+                t_gpu = t_gpu + (time_mod.perf_counter() - t_g0) - t_overlap
+                _copy_bytes(
+                    Int(emit_rid.unsafe_ptr()), Int(host_rid.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_pos.unsafe_ptr()), Int(host_pos.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_mapq.unsafe_ptr()), Int(host_mapq.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_flag.unsafe_ptr()), Int(host_flag.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_sl.unsafe_ptr()), Int(host_sl.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_sr.unsafe_ptr()), Int(host_sr.unsafe_ptr()), n_seq * 4
+                )
+                _copy_bytes(
+                    Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq * 4
+                )
             if emit_bam:
                 var tmp = arena_ready^
                 arena_ready = arena_cur^
