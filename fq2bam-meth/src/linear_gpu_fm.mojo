@@ -5,10 +5,12 @@
 # gapless/softclip extend on the forward pac (f*/r* contigs). Default remains
 # parity until Clara gates pass.
 
+from std.algorithm import parallelize
 from std.collections import Dict, List
 from std.memory import UnsafePointer, memcpy
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
+from std.time import perf_counter as _tick
 
 from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
@@ -512,7 +514,6 @@ def _emit_bam_from_batch(
     n2_qual_n: Int,
     bam_p: UnsafePointer[UInt8, MutAnyOrigin],
     bam_cap: Int,
-    bam_arena: PythonObject,
     rid_to_tid: List[Int],
     rg_p: UnsafePointer[UInt8, ...],
     rg_n: Int,
@@ -527,7 +528,7 @@ def _emit_bam_from_batch(
     mut n_mapped: Int,
     n_batches: Int,
     meta_cap: Int,
-) raises:
+) raises -> Int:
     fq_export_ptrs(
         arena,
         paired,
@@ -800,7 +801,7 @@ def _emit_bam_from_batch(
                 n_mapped += 1
             n_reads += 2
         pj += 1
-    _ = bam_arena.append_raw(Int(bam_p), off)
+    return off
 
 
 def _hit_from_fm(
@@ -1959,11 +1960,13 @@ def map_fastq_fm_gpu(
         var fq_stream = FastqPairStream()
         var arena_cur = FastqArena()
         var arena_ready = FastqArena()
+        var arena_spare = FastqArena()
         if emit_bam:
             fq_stream = fq_open(fq1, fq2, bs_r1, bs_r2)
             fq_reserve(arena_cur, batch_size, paired)
             fq_reserve(arena_ready, batch_size, paired)
-            print("MojoLinear GPU-fm FASTQ=mojo-bulk")
+            fq_reserve(arena_spare, batch_size, paired)
+            print("MojoLinear GPU-fm FASTQ=mojo-bulk overlap=pack||fq")
         else:
             fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
 
@@ -2177,51 +2180,91 @@ def map_fastq_fm_gpu(
             if not emit_bam:
                 fut = fq_reader.read_batch_async(batch_size)
             var t_emit_ov = time_mod.perf_counter() * 0
-            if have_ready:
-                var t_e0 = time_mod.perf_counter()
-                if emit_bam:
-                    _emit_bam_from_batch(
-                        arena_ready,
-                        paired,
-                        n1_ready,
-                        Int(emit_rid.unsafe_ptr()),
-                        Int(emit_pos.unsafe_ptr()),
-                        Int(emit_mapq.unsafe_ptr()),
-                        Int(emit_flag.unsafe_ptr()),
-                        Int(emit_sl.unsafe_ptr()),
-                        Int(emit_sr.unsafe_ptr()),
-                        Int(emit_nm.unsafe_ptr()),
-                        Int(h_n1_name_a.unsafe_ptr()),
-                        Int(h_n1_name_n.unsafe_ptr()),
-                        Int(h_n1_orig_a.unsafe_ptr()),
-                        Int(h_n1_orig_n.unsafe_ptr()),
-                        Int(h_n1_qual_a.unsafe_ptr()),
-                        Int(h_n1_qual_n.unsafe_ptr()),
-                        Int(h_n2_name_a.unsafe_ptr()),
-                        Int(h_n2_name_n.unsafe_ptr()),
-                        Int(h_n2_orig_a.unsafe_ptr()),
-                        Int(h_n2_orig_n.unsafe_ptr()),
-                        Int(h_n2_qual_a.unsafe_ptr()),
-                        Int(h_n2_qual_n.unsafe_ptr()),
-                        bam_blob.unsafe_ptr(),
-                        bam_cap,
-                        bam_arena,
-                        rid_to_tid,
-                        rg_p,
-                        rg_n,
-                        Int(h_coord.unsafe_ptr()),
-                        Int(h_dhi.unsafe_ptr()),
-                        Int(h_dlo.unsafe_ptr()),
-                        Int(h_rec.unsafe_ptr()),
-                        Int(h_len.unsafe_ptr()),
-                        Int(h_score.unsafe_ptr()),
-                        Int(h_pair.unsafe_ptr()),
-                        n_reads,
-                        n_mapped,
+            var n1_next = 0
+            var py_next = Python.none()
+            if emit_bam and have_ready:
+                var ov_packed = List[Int](length=1, fill=0)
+                var ov_fail = List[Int](length=2, fill=0)
+                var ov_t = List[Float64](length=2, fill=Float64(0))
+
+                @parameter
+                def ov_work(i: Int):
+                    var tw = _tick()
+                    try:
+                        if i == 0:
+                            ov_packed[0] = _emit_bam_from_batch(
+                                arena_ready,
+                                paired,
+                                n1_ready,
+                                Int(emit_rid.unsafe_ptr()),
+                                Int(emit_pos.unsafe_ptr()),
+                                Int(emit_mapq.unsafe_ptr()),
+                                Int(emit_flag.unsafe_ptr()),
+                                Int(emit_sl.unsafe_ptr()),
+                                Int(emit_sr.unsafe_ptr()),
+                                Int(emit_nm.unsafe_ptr()),
+                                Int(h_n1_name_a.unsafe_ptr()),
+                                Int(h_n1_name_n.unsafe_ptr()),
+                                Int(h_n1_orig_a.unsafe_ptr()),
+                                Int(h_n1_orig_n.unsafe_ptr()),
+                                Int(h_n1_qual_a.unsafe_ptr()),
+                                Int(h_n1_qual_n.unsafe_ptr()),
+                                Int(h_n2_name_a.unsafe_ptr()),
+                                Int(h_n2_name_n.unsafe_ptr()),
+                                Int(h_n2_orig_a.unsafe_ptr()),
+                                Int(h_n2_orig_n.unsafe_ptr()),
+                                Int(h_n2_qual_a.unsafe_ptr()),
+                                Int(h_n2_qual_n.unsafe_ptr()),
+                                bam_blob.unsafe_ptr(),
+                                bam_cap,
+                                rid_to_tid,
+                                rg_p,
+                                rg_n,
+                                Int(h_coord.unsafe_ptr()),
+                                Int(h_dhi.unsafe_ptr()),
+                                Int(h_dlo.unsafe_ptr()),
+                                Int(h_rec.unsafe_ptr()),
+                                Int(h_len.unsafe_ptr()),
+                                Int(h_score.unsafe_ptr()),
+                                Int(h_pair.unsafe_ptr()),
+                                n_reads,
+                                n_mapped,
+                                n_batches,
+                                meta_cap,
+                            )
+                        else:
+                            fq_read_batch(fq_stream, arena_spare, batch_size)
+                    except e:
+                        ov_fail[i] = 1
+                        print("MojoLinear GPU-fm overlap worker", i, e)
+                    ov_t[i] = _tick() - tw
+
+                parallelize[ov_work](2, 2)
+                if ov_fail[0] != 0 or ov_fail[1] != 0:
+                    raise Error("FM pack||FASTQ overlap worker failed")
+                _ = bam_arena.append_raw(
+                    Int(bam_blob.unsafe_ptr()), ov_packed[0]
+                )
+                t_emit_ov = ov_t[0]
+                t_emit = t_emit + t_emit_ov
+                t_fastq = t_fastq + ov_t[1]
+                n1_next = arena_spare.n1
+                n_batches += 1
+                if n_batches == 1 or n_batches % 5 == 0:
+                    print(
+                        "MojoLinear GPU-fm progress batches=",
                         n_batches,
-                        meta_cap,
+                        " gpu_reads≈",
+                        n_reads,
                     )
-                else:
+            elif emit_bam:
+                var t_f1 = time_mod.perf_counter()
+                fq_read_batch(fq_stream, arena_spare, batch_size)
+                n1_next = arena_spare.n1
+                t_fastq = t_fastq + (time_mod.perf_counter() - t_f1)
+            else:
+                if have_ready:
+                    var t_e0 = time_mod.perf_counter()
                     var batch1 = List[FastqRec]()
                     var batch2 = List[FastqRec]()
                     _ = _py_batch_to_recs(py_ready, paired, batch1, batch2)
@@ -2271,25 +2314,16 @@ def map_fastq_fm_gpu(
                             fh.write(_sam_with_rg_fm(p2) + "\n")
                             n_reads += 2
                         pj += 1
-                t_emit_ov = time_mod.perf_counter() - t_e0
-                t_emit = t_emit + t_emit_ov
-                n_batches += 1
-                if n_batches == 1 or n_batches % 5 == 0:
-                    print(
-                        "MojoLinear GPU-fm progress batches=",
-                        n_batches,
-                        " gpu_reads≈",
-                        n_reads,
-                    )
-
-            var n1_next = 0
-            var py_next = Python.none()
-            if emit_bam:
-                var t_f1 = time_mod.perf_counter()
-                fq_read_batch(fq_stream, arena_ready, batch_size)
-                n1_next = arena_ready.n1
-                t_fastq = t_fastq + (time_mod.perf_counter() - t_f1)
-            else:
+                    t_emit_ov = time_mod.perf_counter() - t_e0
+                    t_emit = t_emit + t_emit_ov
+                    n_batches += 1
+                    if n_batches == 1 or n_batches % 5 == 0:
+                        print(
+                            "MojoLinear GPU-fm progress batches=",
+                            n_batches,
+                            " gpu_reads≈",
+                            n_reads,
+                        )
                 py_next = fut.result()
                 n1_next = Int(py=py_next.n1)
             var t_overlap = time_mod.perf_counter() - t_ov0
@@ -2327,9 +2361,10 @@ def map_fastq_fm_gpu(
                 Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq * 4
             )
             if emit_bam:
-                var tmp = arena_cur^
-                arena_cur = arena_ready^
-                arena_ready = tmp^
+                var tmp = arena_ready^
+                arena_ready = arena_cur^
+                arena_cur = arena_spare^
+                arena_spare = tmp^
             else:
                 py_ready = py_cur
                 py_cur = py_next
@@ -2340,7 +2375,7 @@ def map_fastq_fm_gpu(
         if have_ready:
             var t_e1 = time_mod.perf_counter()
             if emit_bam:
-                _emit_bam_from_batch(
+                var packed_last = _emit_bam_from_batch(
                     arena_ready,
                     paired,
                     n1_ready,
@@ -2365,7 +2400,6 @@ def map_fastq_fm_gpu(
                     Int(h_n2_qual_n.unsafe_ptr()),
                     bam_blob.unsafe_ptr(),
                     bam_cap,
-                    bam_arena,
                     rid_to_tid,
                     rg_p,
                     rg_n,
@@ -2380,6 +2414,9 @@ def map_fastq_fm_gpu(
                     n_mapped,
                     n_batches,
                     meta_cap,
+                )
+                _ = bam_arena.append_raw(
+                    Int(bam_blob.unsafe_ptr()), packed_last
                 )
             else:
                 var batch1 = List[FastqRec]()

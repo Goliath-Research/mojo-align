@@ -105,14 +105,16 @@ the frozen engine.
 | fm (pigz FASTQ + parallel BGZF) | **98.34%** | **0.013** | **1.00** | kernel hidden under FASTQ 143 / emit 84 (BGZF 26) / sort 2.1 / **map 237 s** | **~380 s** script (BAM+index ~4 min) | **pass** |
 | fm (bytearray FASTQ + Mojo pack + async pigz) | **98.34%** | **0.013** | **1.00** | kernel 9.4 (hidden) / emit 114 (BGZF 28) / fastq 96 / sort 2.2 / **map 222 s** | **~367 s** script | **pass** |
 | fm (Mojo bulk FASTQ / pigz fd) | **98.33%** | **0.014** | **1.00** | kernel 1.9 (hidden) / emit **66** (BGZF 28) / fastq **32** / sort 2.2 / **map 103 s** | **~256 s** script | **pass** |
+| fm (pack ∥ FASTQ `parallelize`) | **98.33%** | **0.014** | **1.00** | kernel **24** (exposed) / emit **64** (BGZF 28) / fastq 32 (hidden under pack) / **map 94 s** | **~249 s** script | **pass** |
 
-GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k) and is **hidden
-under emit+FASTQ**. Replacing Python `readline` with Mojo bulk ingest
-(`src/linear_fastq.mojo`: pigz fd + libc `read` + C2T/G2A arena) cut full-sample
-**map 222 s → 103 s** (100k **0.95 s → 0.51 s**). FASTQ is now pigz-bound
-(~32 s). Remaining wall is Mojo BAM pack + Python BGZF (~66 s emit). Overlapping
-those two (Mojo thread or process) is the next cut toward Clara's ~84 s mem /
-~122 s E2E. Default stays **parity**.
+GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k). Mojo
+`parallelize` runs BAM pack and FASTQ parse on two workers (third arena so
+they do not alias; Python `append_raw` stays on the main thread). Full-sample
+**map 103 s → 94 s**. FASTQ (~32 s) is hidden under pack; that made per-batch
+CPU shorter than the GPU kernel, so **~24 s of GPU wait is now visible**.
+Remaining wall is that GPU bubble plus final gather/BGZF (~28 s). Next cut is
+a 2-deep GPU pipeline (keep the next kernel in flight during emit) toward
+Clara's ~84 s mem / ~122 s E2E. Default stays **parity**.
 
 Mate-rescue recovered the good one-end-mapped mates. Remaining Δ vs Clara is mostly 2–4 bp indels and low-quality extras we are not chasing.
 
