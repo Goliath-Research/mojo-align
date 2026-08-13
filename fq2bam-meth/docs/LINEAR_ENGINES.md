@@ -1,21 +1,18 @@
-# Linear GPU engines: parity vs speed vs fm
+# Linear GPU engines: fm vs parity vs speed
 
 Three Mojo GPU mappers share the orchestrator and SAM/BAM consumer path.
-They are **not** interchangeable until promotion gates pass.
 
 | Engine | Env | Module | Index | Role |
 |--------|-----|--------|-------|------|
-| **parity** (default) | `METHYLGRAPHER_LINEAR_ENGINE=parity` | `src/linear_gpu_locate.mojo` | dense-v1 k-mer pack | Frozen science path vs Clara |
+| **fm** (default) | `METHYLGRAPHER_LINEAR_ENGINE=fm` | `src/linear_gpu_fm.mojo` | BWA `.bwt/.sa/.pac` | Clara-shaped FM-index path |
+| **parity** | `METHYLGRAPHER_LINEAR_ENGINE=parity` | `src/linear_gpu_locate.mojo` | dense-v1 k-mer pack | Frozen k-mer science path |
 | **speed** (opt-in) | `METHYLGRAPHER_LINEAR_ENGINE=speed` | `src/linear_gpu_speed.mojo` | dense-v1 k-mer pack | K-mer consensus experiments |
-| **fm** (opt-in) | `METHYLGRAPHER_LINEAR_ENGINE=fm` | `src/linear_gpu_fm.mojo` | BWA `.bwt/.sa/.pac` | BWA-MEM-style FM-index path |
 
 ## Why separate engines
 
-Parity exists to stay a valid Clara `fq2bam_meth` replacement on the k-mer
-path. Speed may tune that index. **fm** is the real Clara-shaped replacement:
-GPU FM-index seed + extend on the same `bwameth.c2t` BWA index Clara uses.
-
-None becomes the default until promotion gates pass.
+**fm** is the Clara-shaped replacement: GPU FM-index seed + extend on the same
+`bwameth.c2t` BWA index Clara uses. Parity stays as a frozen k-mer fallback
+(`science` alias). Speed may still tune that k-mer index.
 
 ## Science gates (vs Clara)
 
@@ -26,28 +23,20 @@ Same report as [`LINEAR_PARITY.md`](LINEAR_PARITY.md):
 | Mapped rate \|Δ\| | ≤ 0.02 |
 | Primary idxstats Spearman | ≥ 0.95 |
 
-## Promotion (fm or speed → default)
-
-An opt-in engine may replace parity as the default **only if all** hold on
-the Parabricks sample (100k smoke **and** full sample):
-
-1. Clara gates above **pass**
-2. Mojo mapped rate **≥** frozen parity mapped rate (match or improve)
-3. Idxstats Spearman vs Clara **≥** 0.95
-4. BAM still GATK/Picard consumable (`@RG`, original SEQ, coordinate sort)
-
-Until then: production / bakeoff stay on **parity**.
+FM cleared these on the Parabricks 100k smoke and the full ~53M-read sample
+(mapped 98.33% vs Clara 99.68%, Δ 0.014; Spearman 1.00; above frozen parity
+97.79%). Production default is **fm**.
 
 ## Run
 
 ```bash
-# Science default (k-mer)
+# Default (FM-index)
 fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --skip-clara --max-pairs 100000
 
-# FM-index engine (opt-in; uses ${REF}.bwameth.c2t.{bwt,sa,pac})
-METHYLGRAPHER_LINEAR_ENGINE=fm \
+# Frozen k-mer engine
+METHYLGRAPHER_LINEAR_ENGINE=parity \
   fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \
-    --engine fm --sample-dir /tmp/parity_100k_fm --skip-clara --max-pairs 100000
+    --engine parity --skip-clara --max-pairs 100000
 ```
 
 ### FM knobs (do not change parity)
@@ -63,8 +52,8 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 | `METHYLGRAPHER_FM_RESCUE_WIN` | 512 | Mate-rescue window (bp) when exactly one end mapped |
 | `METHYLGRAPHER_BAM_LEVEL` | 1 | BGZF level for native BAM emit |
 | `METHYLGRAPHER_BAM_THREADS` | 32 | Parallel BGZF deflate workers |
-| `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for GPU sort/markdup host tables (still a hard cap; 53M fits, ~800M 30× does not) |
-| `METHYLGRAPHER_FM_SORT_TILE` | 0 (one tile = n) | GPU radix working set in records. `0` / unset / `≥ n` = one shot. Smaller tiles (e.g. `65536` on 100k, `1048576` on the full sample) keep device buffers O(tile); host **min-heap** k-way merge rebuilds global order in O(n log n_tiles). Markdup is the same Picard-style scan on the merged dup-key order. |
+| `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for the one-shot GPU sort (`SORT_TILE=0`). ~53M fits; ~800M 30× does not. |
+| `METHYLGRAPHER_FM_SORT_TILE` | `auto` (no flag) | From `nvidia-smi` **total** HBM (worker owns the GPU) + FASTQ-size `n`. One-shot when uncompressed BAM + sort keys fit in 90% of HBM after the FM index (Parabricks ~53M on 96 GiB). Otherwise SSD tiles — Clara `--low-memory` analog, no operator switch. Override only for debug (`0` / `oneshot` / N). |
 | `METHYLGRAPHER_BAM_ARENA_DIR` | `{work}/bam_arena` | SSD mmap for uncompressed BAM chunks (`ram` to keep in memory) |
 | `METHYLGRAPHER_LINEAR_MARKDUP` | 1 | GPU (fm) / samtools (parity) duplicate marking |
 
@@ -93,6 +82,7 @@ the frozen engine.
 | fm (GPU sort + markdup) | **98.24%** | **0.015** | 1.00 | kernel 0.35 / sort **0.016** / gather 0.57 / map 2.09; 246 dups; `samtools index` only | **pass** (100k) |
 | fm (no Mojo `String` copies + GPU/emit overlap) | **98.24%** | **0.015** | 1.00 | kernel 0.16 / emit 0.43 / fastq 0.34 / **map 0.95** | **pass** (100k) |
 | fm (Mojo bulk FASTQ / pigz fd) | **98.23%** | **0.015** | 1.00 | kernel 0.14 / emit 0.24 / fastq **0.12** / **map 0.51** | **pass** (100k) |
+| fm (SSD tile merge `SORT_TILE=65536`) | **98.23%** | **0.015** | 1.00 | 4 runs (incl. leftover 3392); 246 dups; **map 1.41**; `samtools index` OK | **pass** (100k) |
 
 ## Full sample (~53.3M reads)
 
@@ -110,6 +100,7 @@ the frozen engine.
 | fm (pack ∥ FASTQ `parallelize`) | **98.33%** | **0.014** | **1.00** | kernel **24** (exposed) / emit **64** (BGZF 28) / fastq 32 (hidden under pack) / **map 94 s** | **~249 s** script | **pass** |
 | fm (2-deep GPU + event wait) | **98.33%** | **0.014** | **1.00** | kernel wait **22** / emit **64** (BGZF 28) / fastq 32 (hidden) / sort 2.2 / **map 92 s** | **~251 s** script | **pass** |
 | fm (2-deep + copy-lite BGZF) | **98.33%** | **0.014** | **1.00** | kernel wait **22** / emit **60** (BGZF **25**) / fastq 32 (hidden) / sort 2.2 / **map 88 s** | **~242 s** script | **pass** |
+| fm (SSD tile merge `SORT_TILE=auto` 4M) | **98.33%** | **0.014** | **1.00** | 13 runs; kernel 8.9 / emit 193 / sort 17 / **map 485 s**; 9.96M dups; index OK | **pass** (30×-safe default) |
 
 GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k). Mojo
 `parallelize` runs BAM pack and FASTQ parse on two workers (third arena so
@@ -121,7 +112,7 @@ wait** stays exposed. Copy-lite BGZF (`write_from_addr`, one copy per 65 KiB
 block, deeper zlib in-flight) cut gather **28 s → 25 s**. Full-sample **map
 94 s → 92 s → 88 s** vs Clara mem **83.8 s**. Leftover vs Clara is that GPU
 bubble plus gather/BGZF; a second host `parallelize` in `linear_gpu_fm.mojo`
-OOMs the kernel compile (~436 GiB). Default stays **parity**.
+OOMs the kernel compile (~436 GiB). Default engine is **fm**.
 
 Mate-rescue recovered the good one-end-mapped mates. Remaining Δ vs Clara is mostly 2–4 bp indels and low-quality extras we are not chasing.
 

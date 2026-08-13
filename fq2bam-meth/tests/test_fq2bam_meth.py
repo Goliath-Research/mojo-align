@@ -49,10 +49,29 @@ def test_resolve_linear_mapper_default(monkeypatch: pytest.MonkeyPatch):
     assert resolve_linear_mapper("cpu") == "bwa"
 
 
-def test_resolve_linear_engine_default_is_parity(monkeypatch: pytest.MonkeyPatch):
+def test_estimate_fastq_reads(tmp_path: Path):
+    from engine.fq2bam_meth import estimate_bam_records, estimate_fastq_reads
+
+    fq = tmp_path / "r.fq"
+    rec = "@r1\n" + ("A" * 150) + "\n+\n" + ("I" * 150) + "\n"
+    fq.write_text(rec * 10)
+    # Size heuristic, not an exact parser — just in the right decade.
+    n = estimate_fastq_reads(fq)
+    assert 1 <= n <= 40
+    assert estimate_bam_records(fq, "") == n
+    assert estimate_fastq_reads(tmp_path / "missing.fq") == 0
+
+
+def test_resolve_linear_engine_default_is_fm(monkeypatch: pytest.MonkeyPatch):
+    from engine.fq2bam_meth import choose_fm_sort_tile
+
     monkeypatch.delenv("METHYLGRAPHER_LINEAR_ENGINE", raising=False)
-    assert resolve_linear_engine() == "parity"
+    assert resolve_linear_engine() == "fm"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "default")
+    assert resolve_linear_engine() == "fm"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "science")
+    assert resolve_linear_engine() == "parity"
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "parity")
     assert resolve_linear_engine() == "parity"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "speed")
     assert resolve_linear_engine() == "speed"
@@ -63,8 +82,52 @@ def test_resolve_linear_engine_default_is_parity(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "bwa-mem")
     assert resolve_linear_engine() == "fm"
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "vote")
-    with pytest.raises(RuntimeError, match="parity.*speed.*fm"):
+    with pytest.raises(RuntimeError, match="fm.*parity.*speed"):
         resolve_linear_engine()
+
+    monkeypatch.delenv("METHYLGRAPHER_FM_SORT_TILE", raising=False)
+    host = 256 << 30
+    # Dedicated 96 GiB + Parabricks-scale n → one-shot (no --low-memory analog).
+    assert (
+        choose_fm_sort_tile(
+            batch_records=32768,
+            total_bytes=96 << 30,
+            estimated_records=53_000_000,
+            host_bytes=host,
+        )
+        == 0
+    )
+    # 30× (~800M) uncompressed BAM does not fit in 96 GiB → auto tiles.
+    tile_30x = choose_fm_sort_tile(
+        batch_records=131072,
+        total_bytes=96 << 30,
+        estimated_records=800_000_000,
+        host_bytes=host,
+    )
+    assert 131072 <= tile_30x < 800_000_000
+    # Small GPU: Clara --low-memory analog, even for 53M.
+    tile_small = choose_fm_sort_tile(
+        batch_records=32768,
+        total_bytes=16 << 30,
+        estimated_records=53_000_000,
+        host_bytes=host,
+    )
+    assert tile_small > 0
+    assert choose_fm_sort_tile(batch_records=32768, explicit="0") == 0
+    assert choose_fm_sort_tile(batch_records=131072, explicit="65536") == 131072
+    # No n estimate: recommended HBM → one-shot; tiny card → tiles.
+    assert (
+        choose_fm_sort_tile(
+            batch_records=32768, total_bytes=96 << 30, host_bytes=host
+        )
+        == 0
+    )
+    assert (
+        choose_fm_sort_tile(
+            batch_records=32768, total_bytes=16 << 30, host_bytes=host
+        )
+        > 0
+    )
 
 
 def test_metrics_marks_placeholders(tmp_path: Path):
@@ -100,6 +163,7 @@ def test_parse_flagstat_and_stats():
 @pytest.mark.skipif(shutil.which("samtools") is None, reason="samtools required")
 def test_end_to_end_mojo_mapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("METHYLGRAPHER_LINEAR_MAPPER", "mojo")
+    monkeypatch.setenv("METHYLGRAPHER_LINEAR_ENGINE", "parity")
     out_bam = tmp_path / "out.bam"
     qc = tmp_path / "qc"
     result = run_mojo_fq2bam_meth(

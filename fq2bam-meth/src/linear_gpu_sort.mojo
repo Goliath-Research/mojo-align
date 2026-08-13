@@ -3,7 +3,8 @@
 # LSD 8-bit radix on 64-bit keys, tiled so device working set is O(tile) not
 # O(n). Default tile = n (one shot, same as before). METHYLGRAPHER_FM_SORT_TILE
 # forces smaller tiles; host k-way merge reconstructs global order. Markdup is
-# a host scan on the merged dup-key order (same rule as the old GPU kernel).
+# a host scan on the merged dup-key order
+# (same rule as the old GPU kernel).
 
 from std.collections import List
 from std.memory import UnsafePointer, memcpy
@@ -31,6 +32,7 @@ def gpu_sort_markdup(
     is_dup_addr: Int,
     perm_addr: Int,
     do_markdup: Bool,
+    dup_perm_addr: Int,
 ) raises:
     """Sort ``n`` records. Writes original-order ``is_dup`` and coord ``perm``.
 
@@ -439,6 +441,14 @@ def gpu_sort_markdup(
                         h_dup[ok2] = 0
                     gk += 1
                 gi = gj
+            if dup_perm_addr != 0:
+                var dpi = 0
+                var dp = UnsafePointer[UInt32, MutAnyOrigin](
+                    unsafe_from_address=dup_perm_addr
+                )
+                while dpi < n:
+                    dp[dpi] = merged[dpi]
+                    dpi += 1
 
         t = 0
         while t < n_tiles:
@@ -515,3 +525,11 @@ def gpu_sort_markdup(
             src=h_dup.unsafe_ptr(),
             count=n,
         )
+        if dup_perm_addr != 0 and not do_markdup:
+            var dp2 = UnsafePointer[UInt32, MutAnyOrigin](
+                unsafe_from_address=dup_perm_addr
+            )
+            var ii = 0
+            while ii < n:
+                dp2[ii] = UInt32(ii)
+                ii += 1

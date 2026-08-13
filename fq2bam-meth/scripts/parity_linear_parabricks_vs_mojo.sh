@@ -22,7 +22,7 @@
 #   --skip-clara         Only run Mojo (compare against existing Clara BAM)
 #   --skip-mojo          Only run Clara
 #   --compare-only       Skip both aligners; only score existing BAMs
-#   --engine parity|speed|fm  Mojo GPU engine (default parity = science path)
+#   --engine fm|parity|speed  Mojo GPU engine (default fm)
 #   --toy                Use fq2bam-meth toy fixture (no Clara sample / no pbrun)
 #
 # Layout written:
@@ -51,7 +51,7 @@ RUN_MOJO=1
 COMPARE=1
 USE_TOY=0
 THREADS="${THREADS:-16}"
-LINEAR_ENGINE="${METHYLGRAPHER_LINEAR_ENGINE:-parity}"
+LINEAR_ENGINE="${METHYLGRAPHER_LINEAR_ENGINE:-fm}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -286,8 +286,8 @@ run_mojo() {
   export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
   export METHYLGRAPHER_GPU_REQUIRE="${METHYLGRAPHER_GPU_REQUIRE:-1}"
   export METHYLGRAPHER_LINEAR_MAPPER=mojo
-  export METHYLGRAPHER_LINEAR_ENGINE="${LINEAR_ENGINE:-parity}"
-  echo "Mojo GPU engine=${METHYLGRAPHER_LINEAR_ENGINE} (parity=science default; speed|fm=opt-in)"
+  export METHYLGRAPHER_LINEAR_ENGINE="${LINEAR_ENGINE:-fm}"
+  echo "Mojo GPU engine=${METHYLGRAPHER_LINEAR_ENGINE} (fm=default; parity=frozen k-mer; speed=opt-in)"
   # Rare-kmer locate: skip ultra-repetitive C2T keys (max occ ~7.7M otherwise).
   export METHYLGRAPHER_LINEAR_MAX_OCC="${METHYLGRAPHER_LINEAR_MAX_OCC:-16384}"
   export METHYLGRAPHER_LINEAR_VOTE_OCC="${METHYLGRAPHER_LINEAR_VOTE_OCC:-256}"

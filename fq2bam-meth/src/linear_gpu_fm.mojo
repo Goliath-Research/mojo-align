@@ -169,6 +169,183 @@ def _open_bam_arena() raises -> PythonObject:
     return bam_mod.BamArena()
 
 
+def _open_bam_run_store() raises -> PythonObject:
+    var bam_mod = Python.import_module("bam_emit")
+    return bam_mod.BamRunStore()
+
+
+def _gather_perm_to_writer(
+    writer: PythonObject,
+    n: Int,
+    bam_arena: PythonObject,
+    perm_addr: Int,
+    rec_addr: Int,
+    len_addr: Int,
+    dup_addr: Int,
+    bam_blob_addr: Int,
+    bam_cap: Int,
+    apply_dup: Bool,
+) raises:
+    var h_perm = _u32_at(perm_addr)
+    var h_rec = _u64_at(rec_addr)
+    var h_len = _u32_at(len_addr)
+    var h_dup = _u32_at(dup_addr)
+    var n_chunks = Int(py=bam_arena.n_chunks())
+    var chunk_addrs = List[Int]()
+    var cii = 0
+    while cii < n_chunks:
+        chunk_addrs.append(Int(py=bam_arena.chunk_addr(cii)))
+        cii += 1
+    var gout = 0
+    var gi = 0
+    var bp_out = _u8_at(bam_blob_addr)
+    while gi < n:
+        var orig = Int(h_perm[gi])
+        var packed = h_rec[orig]
+        var cid = Int(packed >> 32)
+        var loc = Int(packed & 4294967295)
+        var rlen = Int(h_len[orig])
+        if gout + rlen > bam_cap:
+            writer.write_raw(bam_blob_addr, gout)
+            gout = 0
+        if rlen > bam_cap:
+            raise Error("BAM record larger than batch buffer")
+        var src = UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=chunk_addrs[cid] + loc
+        )
+        var dst = UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=bam_blob_addr + gout
+        )
+        memcpy(dest=dst, src=src, count=rlen)
+        if apply_dup and Int(h_dup[orig]) != 0:
+            _or_dup_flag(bp_out, gout)
+        gout += rlen
+        gi += 1
+    if gout > 0:
+        writer.write_raw(bam_blob_addr, gout)
+
+
+def _flush_sorted_bam_run(
+    api: String,
+    n_tile: Int,
+    do_markdup: Bool,
+    bam_arena: PythonObject,
+    run_store: PythonObject,
+    coord_addr: Int,
+    dhi_addr: Int,
+    dlo_addr: Int,
+    score_addr: Int,
+    pair_addr: Int,
+    dup_addr: Int,
+    perm_addr: Int,
+    dupperm_addr: Int,
+    rec_addr: Int,
+    len_addr: Int,
+    bam_blob_addr: Int,
+    bam_cap: Int,
+) raises:
+    if n_tile <= 0:
+        return
+    gpu_sort_markdup(
+        api,
+        n_tile,
+        coord_addr,
+        dhi_addr,
+        dlo_addr,
+        score_addr,
+        pair_addr,
+        dup_addr,
+        perm_addr,
+        do_markdup,
+        dupperm_addr,
+    )
+    var bam_mod = Python.import_module("bam_emit")
+    bam_mod.order_run_perms(
+        n_tile,
+        coord_addr,
+        dhi_addr,
+        dlo_addr,
+        perm_addr,
+        dupperm_addr,
+    )
+    _ = run_store.write_sorted_from_arena(
+        n_tile,
+        bam_arena,
+        rec_addr,
+        len_addr,
+        perm_addr,
+    )
+    _ = run_store.write_keys(
+        n_tile,
+        coord_addr,
+        dhi_addr,
+        dlo_addr,
+        score_addr,
+        pair_addr,
+        len_addr,
+        perm_addr,
+        dupperm_addr,
+    )
+    bam_arena.clear()
+    print("MojoLinear GPU-fm flushed sorted BAM run records=", n_tile)
+
+
+def _maybe_flush_tile(
+    use_runs: Bool,
+    paired: Bool,
+    n1: Int,
+    mut n_reads: Int,
+    mut n_total: Int,
+    mut tile_chunks: Int,
+    meta_cap: Int,
+    api: String,
+    do_markdup: Bool,
+    bam_arena: PythonObject,
+    run_store: PythonObject,
+    coord_addr: Int,
+    dhi_addr: Int,
+    dlo_addr: Int,
+    score_addr: Int,
+    pair_addr: Int,
+    dup_addr: Int,
+    perm_addr: Int,
+    dupperm_addr: Int,
+    rec_addr: Int,
+    len_addr: Int,
+    bam_blob_addr: Int,
+    bam_cap: Int,
+) raises:
+    if not use_runs or n1 <= 0:
+        return
+    var need = n1
+    if paired:
+        need = n1 * 2
+    if n_reads + need <= meta_cap:
+        return
+    _flush_sorted_bam_run(
+        api,
+        n_reads,
+        do_markdup,
+        bam_arena,
+        run_store,
+        coord_addr,
+        dhi_addr,
+        dlo_addr,
+        score_addr,
+        pair_addr,
+        dup_addr,
+        perm_addr,
+        dupperm_addr,
+        rec_addr,
+        len_addr,
+        bam_blob_addr,
+        bam_cap,
+    )
+    n_total += n_reads
+    n_reads = 0
+    tile_chunks = 0
+
+
 def _u8_at(addr: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
     return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
 
@@ -1926,13 +2103,27 @@ def map_fastq_fm_gpu(
         var fh = Python.none()
         var bam_w = Python.none()
         var bam_arena = Python.none()
+        var bam_runs = Python.none()
         var rid_to_tid = List[Int]()
         var bam_cap = 1
         var bam_blob = ctx.enqueue_create_host_buffer[DType.uint8](1)
         var rg_s = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+        var sort_tile = 0
         var meta_cap = 1
+        var use_runs = False
         if emit_bam:
+            sort_tile = _env_int("METHYLGRAPHER_FM_SORT_TILE", 0)
             meta_cap = _env_int("METHYLGRAPHER_FM_SORT_CAP", 67108864)
+            if sort_tile > 0:
+                use_runs = True
+                meta_cap = sort_tile
+                var min_tile = batch_size
+                if paired:
+                    min_tile = batch_size * 2
+                if meta_cap < min_tile:
+                    raise Error(
+                        "METHYLGRAPHER_FM_SORT_TILE must be >= records per FASTQ batch"
+                    )
         var h_coord = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
         var h_dhi = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
         var h_dlo = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
@@ -1942,6 +2133,10 @@ def map_fastq_fm_gpu(
         var h_pair = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
         var h_perm = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
         var h_dup = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var dupperm_n = 1
+        if use_runs:
+            dupperm_n = meta_cap
+        var h_dupperm = ctx.enqueue_create_host_buffer[DType.uint32](dupperm_n)
         var md_raw = _env_str("METHYLGRAPHER_LINEAR_MARKDUP", "1").lower()
         var do_markdup = True
         if md_raw == "0" or md_raw == "false" or md_raw == "no" or md_raw == "off":
@@ -1949,6 +2144,8 @@ def map_fastq_fm_gpu(
         if emit_bam:
             bam_w = _open_bam_writer(index, out_sam)
             bam_arena = _open_bam_arena()
+            if use_runs:
+                bam_runs = _open_bam_run_store()
             rid_to_tid = _rid_to_tid_table(index)
             bam_cap = batch_size * 2 * 512
             if bam_cap < 1 << 20:
@@ -1957,6 +2154,10 @@ def map_fastq_fm_gpu(
             print(
                 "MojoLinear GPU-fm native BAM coordinate-sort cap=",
                 meta_cap,
+                " sort_tile=",
+                sort_tile,
+                " runs=",
+                use_runs,
                 " markdup=",
                 do_markdup,
             )
@@ -2057,7 +2258,9 @@ def map_fastq_fm_gpu(
 
         var n_mapped = 0
         var n_reads = 0
+        var n_total = 0
         var n_batches = 0
+        var tile_chunks = 0
         var t_map0 = time_mod.perf_counter()
         var t_gpu = time_mod.perf_counter() * 0
         var t_emit = time_mod.perf_counter() * 0
@@ -2421,6 +2624,31 @@ def map_fastq_fm_gpu(
                 fut = fq_reader.read_batch_async(batch_size)
             t_emit_ov = time_mod.perf_counter() * 0
             if emit_bam and have_ready:
+                _maybe_flush_tile(
+                    use_runs,
+                    paired,
+                    n1_ready,
+                    n_reads,
+                    n_total,
+                    tile_chunks,
+                    meta_cap,
+                    api,
+                    do_markdup,
+                    bam_arena,
+                    bam_runs,
+                    Int(h_coord.unsafe_ptr()),
+                    Int(h_dhi.unsafe_ptr()),
+                    Int(h_dlo.unsafe_ptr()),
+                    Int(h_score.unsafe_ptr()),
+                    Int(h_pair.unsafe_ptr()),
+                    Int(h_dup.unsafe_ptr()),
+                    Int(h_perm.unsafe_ptr()),
+                    Int(h_dupperm.unsafe_ptr()),
+                    Int(h_rec.unsafe_ptr()),
+                    Int(h_len.unsafe_ptr()),
+                    Int(bam_blob.unsafe_ptr()),
+                    bam_cap,
+                )
                 var ov_packed = List[Int](length=1, fill=0)
                 var ov_fail = List[Int](length=2, fill=0)
                 var ov_t = List[Float64](length=2, fill=Float64(0))
@@ -2467,7 +2695,7 @@ def map_fastq_fm_gpu(
                                 Int(h_pair.unsafe_ptr()),
                                 n_reads,
                                 n_mapped,
-                                n_batches,
+                                tile_chunks,
                                 meta_cap,
                             )
                         else:
@@ -2483,6 +2711,7 @@ def map_fastq_fm_gpu(
                 _ = bam_arena.append_raw(
                     Int(bam_blob.unsafe_ptr()), ov_packed[0]
                 )
+                tile_chunks += 1
                 t_emit_ov = ov_t[0]
                 t_emit = t_emit + t_emit_ov
                 t_fastq = t_fastq + ov_t[1]
@@ -2493,7 +2722,7 @@ def map_fastq_fm_gpu(
                         "MojoLinear GPU-fm progress batches=",
                         n_batches,
                         " gpu_reads≈",
-                        n_reads,
+                        n_total + n_reads,
                     )
             elif emit_bam:
                 var t_f1 = time_mod.perf_counter()
@@ -2813,6 +3042,31 @@ def map_fastq_fm_gpu(
         if have_ready:
             var t_e1 = time_mod.perf_counter()
             if emit_bam:
+                _maybe_flush_tile(
+                    use_runs,
+                    paired,
+                    n1_ready,
+                    n_reads,
+                    n_total,
+                    tile_chunks,
+                    meta_cap,
+                    api,
+                    do_markdup,
+                    bam_arena,
+                    bam_runs,
+                    Int(h_coord.unsafe_ptr()),
+                    Int(h_dhi.unsafe_ptr()),
+                    Int(h_dlo.unsafe_ptr()),
+                    Int(h_score.unsafe_ptr()),
+                    Int(h_pair.unsafe_ptr()),
+                    Int(h_dup.unsafe_ptr()),
+                    Int(h_perm.unsafe_ptr()),
+                    Int(h_dupperm.unsafe_ptr()),
+                    Int(h_rec.unsafe_ptr()),
+                    Int(h_len.unsafe_ptr()),
+                    Int(bam_blob.unsafe_ptr()),
+                    bam_cap,
+                )
                 var packed_last = _emit_bam_from_batch(
                     arena_ready,
                     paired,
@@ -2850,12 +3104,13 @@ def map_fastq_fm_gpu(
                     Int(h_pair.unsafe_ptr()),
                     n_reads,
                     n_mapped,
-                    n_batches,
+                    tile_chunks,
                     meta_cap,
                 )
                 _ = bam_arena.append_raw(
                     Int(bam_blob.unsafe_ptr()), packed_last
                 )
+                tile_chunks += 1
             else:
                 var batch1 = List[FastqRec]()
                 var batch2 = List[FastqRec]()
@@ -2913,7 +3168,7 @@ def map_fastq_fm_gpu(
                     "MojoLinear GPU-fm progress batches=",
                     n_batches,
                     " gpu_reads≈",
-                    n_reads,
+                    n_total + n_reads,
                 )
 
         if emit_bam:
@@ -2923,56 +3178,71 @@ def map_fastq_fm_gpu(
         var t_sort = time_mod.perf_counter() * 0
         if emit_bam:
             var t_s0 = time_mod.perf_counter()
-            if n_reads > 0:
-                gpu_sort_markdup(
-                    api,
-                    n_reads,
-                    Int(h_coord.unsafe_ptr()),
-                    Int(h_dhi.unsafe_ptr()),
-                    Int(h_dlo.unsafe_ptr()),
-                    Int(h_score.unsafe_ptr()),
-                    Int(h_pair.unsafe_ptr()),
-                    Int(h_dup.unsafe_ptr()),
-                    Int(h_perm.unsafe_ptr()),
-                    do_markdup,
-                )
-            t_sort = time_mod.perf_counter() - t_s0
             var t_g0s = time_mod.perf_counter()
-            var n_chunks = Int(py=bam_arena.n_chunks())
-            var chunk_addrs = List[Int]()
-            var cii = 0
-            while cii < n_chunks:
-                chunk_addrs.append(Int(py=bam_arena.chunk_addr(cii)))
-                cii += 1
-            var gout = 0
-            var gi = 0
-            var bp_out = bam_blob.unsafe_ptr()
-            while gi < n_reads:
-                var orig = Int(h_perm[gi])
-                var packed = h_rec[orig]
-                var cid = Int(packed >> 32)
-                var loc = Int(packed & 4294967295)
-                var rlen = Int(h_len[orig])
-                if gout + rlen > bam_cap:
-                    bam_w.write_raw(Int(bp_out), gout)
-                    gout = 0
-                if rlen > bam_cap:
-                    raise Error("BAM record larger than batch buffer")
-                var src = UnsafePointer[UInt8, MutAnyOrigin](
-                    unsafe_from_address=chunk_addrs[cid] + loc
-                )
-                var dst = UnsafePointer[UInt8, MutAnyOrigin](
-                    unsafe_from_address=Int(bp_out) + gout
-                )
-                memcpy(dest=dst, src=src, count=rlen)
-                if Int(h_dup[orig]) != 0:
-                    _or_dup_flag(bp_out, gout)
-                gout += rlen
-                gi += 1
-            if gout > 0:
-                bam_w.write_raw(Int(bp_out), gout)
-            bam_w.close()
+            var n_dups = 0
+            if use_runs:
+                if n_reads > 0:
+                    _flush_sorted_bam_run(
+                        api,
+                        n_reads,
+                        do_markdup,
+                        bam_arena,
+                        bam_runs,
+                        Int(h_coord.unsafe_ptr()),
+                        Int(h_dhi.unsafe_ptr()),
+                        Int(h_dlo.unsafe_ptr()),
+                        Int(h_score.unsafe_ptr()),
+                        Int(h_pair.unsafe_ptr()),
+                        Int(h_dup.unsafe_ptr()),
+                        Int(h_perm.unsafe_ptr()),
+                        Int(h_dupperm.unsafe_ptr()),
+                        Int(h_rec.unsafe_ptr()),
+                        Int(h_len.unsafe_ptr()),
+                        Int(bam_blob.unsafe_ptr()),
+                        bam_cap,
+                    )
+                    n_total += n_reads
+                    n_reads = 0
+                t_sort = time_mod.perf_counter() - t_s0
+                t_g0s = time_mod.perf_counter()
+                n_dups = Int(py=bam_runs.merge_into(bam_w, do_markdup))
+                bam_w.close()
+            else:
+                if n_reads > 0:
+                    gpu_sort_markdup(
+                        api,
+                        n_reads,
+                        Int(h_coord.unsafe_ptr()),
+                        Int(h_dhi.unsafe_ptr()),
+                        Int(h_dlo.unsafe_ptr()),
+                        Int(h_score.unsafe_ptr()),
+                        Int(h_pair.unsafe_ptr()),
+                        Int(h_dup.unsafe_ptr()),
+                        Int(h_perm.unsafe_ptr()),
+                        do_markdup,
+                        0,
+                    )
+                t_sort = time_mod.perf_counter() - t_s0
+                t_g0s = time_mod.perf_counter()
+                if n_reads > 0:
+                    _gather_perm_to_writer(
+                        bam_w,
+                        n_reads,
+                        bam_arena,
+                        Int(h_perm.unsafe_ptr()),
+                        Int(h_rec.unsafe_ptr()),
+                        Int(h_len.unsafe_ptr()),
+                        Int(h_dup.unsafe_ptr()),
+                        Int(bam_blob.unsafe_ptr()),
+                        bam_cap,
+                        True,
+                    )
+                n_total = n_reads
+                bam_w.close()
             t_emit = t_emit + (time_mod.perf_counter() - t_g0s)
+            var n_run_out = 0
+            if use_runs:
+                n_run_out = Int(py=bam_runs.n_runs())
             print(
                 "MojoLinear GPU-fm sort_markdup_s=",
                 t_sort,
@@ -2980,8 +3250,10 @@ def map_fastq_fm_gpu(
                 time_mod.perf_counter() - t_g0s,
                 " arena_bytes=",
                 Int(py=bam_arena.nbytes()),
+                " runs=",
+                n_run_out,
                 " dups_marked=",
-                do_markdup,
+                n_dups,
             )
         else:
             fh.close()
@@ -2992,7 +3264,7 @@ def map_fastq_fm_gpu(
             " mapped_records=",
             n_mapped,
             " reads=",
-            n_reads,
+            n_total,
             " backend=gpu-fm",
         )
         print(

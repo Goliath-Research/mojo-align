@@ -22,11 +22,14 @@ fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
 ```
 
 See [`LINEAR_PARITY.md`](LINEAR_PARITY.md) and [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)
-(parity = frozen science default; `speed` / `fm` = opt-in until promotion gates pass).
+(parity = frozen k-mer fallback; `fm` = default; `speed` = opt-in).
 
 Output is **BAM only**. Parity/speed stream SAM through a FIFO into
 `samtools view -u`, then `fixmate` / `sort -l 1` / `markdup`. FM writes native
-BGZF, GPU coordinate-sorts and markdups, then `samtools index` only.
+BGZF. Sort/emit is automatic from `nvidia-smi` total HBM (dedicated Align
+worker) plus a FASTQ-size `n` estimate: one-shot when the uncompressed BAM
+fits, SSD tiles when it would not (30× or a small GPU). No `--low-memory`
+flag. Python `heapq` merges tiled runs.
 
 | Backend | Device | Fixture | Notes |
 |---------|--------|---------|-------|

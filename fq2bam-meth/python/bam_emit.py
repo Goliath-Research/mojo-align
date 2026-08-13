@@ -6,7 +6,9 @@ flag 0x10 reverse-complements SEQ and QUAL.
 
 from __future__ import annotations
 
+import array
 import ctypes
+import heapq
 import mmap
 import os
 import struct
@@ -283,6 +285,26 @@ class BamArena:
             return self._lens[i]
         return len(self._chunks[i])
 
+    def clear(self) -> None:
+        """Drop chunks so the next tile can reuse this arena."""
+        if self._spill is not None:
+            self._headers.clear()
+            for mm in self._maps:
+                if mm is not None:
+                    mm.close()
+            self._maps.clear()
+            for i in range(len(self._lens)):
+                p = self._spill / f"chunk_{i:06d}.bin"
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+        self._chunks.clear()
+        self._lens.clear()
+        self._n = 0
+        self._sorted = bytearray()
+        self._sorted_hdr = None
+
 
 class BamWriter:
     """Stream BAM records to ``path`` (BGZF)."""
@@ -449,8 +471,333 @@ class BamWriter:
             return
         self._bgzf.write_from_addr(int(addr), int(n))
 
+    def write_bytes(self, data: bytes | bytearray | memoryview) -> None:
+        if not data:
+            return
+        self._bgzf.write(data)
+
     def close(self) -> None:
         self._bgzf.close()
+
+
+_RUN_MAGIC = b"MJRN\x01\x00\x00\x00"
+_DUP_SENTINEL = (1 << 64) - 1
+
+
+def _or_dup_flag_bytes(buf: bytearray, rec_off: int = 0) -> None:
+    """Set BAM flag 0x400 (duplicate). ``buf[rec_off]`` is block_size."""
+    flag_nc = int.from_bytes(buf[rec_off + 16 : rec_off + 20], "little")
+    flag = (flag_nc >> 16) | 1024
+    nc = flag_nc & 65535
+    buf[rec_off + 16 : rec_off + 20] = ((flag << 16) | nc).to_bytes(4, "little")
+
+
+class _RawRunWriter:
+    """Uncompressed concatenated BAM records (one sorted tile)."""
+
+    def __init__(self, path: str) -> None:
+        self._fh = open(path, "wb", buffering=8 * 1024 * 1024)
+
+    def write_raw(self, addr: int, n: int) -> None:
+        n = int(n)
+        if n <= 0:
+            return
+        self._fh.write(ctypes.string_at(int(addr), n))
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+class _RunKeys:
+    __slots__ = ("n", "coord", "dhi", "dlo", "score", "pair", "rec_len", "perm", "dupperm")
+
+    def __init__(self, path: Path) -> None:
+        data = path.read_bytes()
+        if data[:8] != _RUN_MAGIC:
+            raise ValueError(f"bad run keys magic: {path}")
+        n = struct.unpack_from("<Q", data, 8)[0]
+        off = 16
+
+        def take_q() -> array.array:
+            nonlocal off
+            a = array.array("Q")
+            a.frombytes(data[off : off + n * 8])
+            off += n * 8
+            return a
+
+        def take_i() -> array.array:
+            nonlocal off
+            a = array.array("I")
+            a.frombytes(data[off : off + n * 4])
+            off += n * 4
+            return a
+
+        self.n = n
+        self.coord = take_q()
+        self.dhi = take_q()
+        self.dlo = take_q()
+        self.score = take_i()
+        self.pair = take_i()
+        self.rec_len = take_i()
+        self.perm = take_i()
+        self.dupperm = take_i()
+
+
+def _dump_u(fh, addr: int, n: int, width: int) -> None:
+    fh.write(ctypes.string_at(int(addr), int(n) * width))
+
+
+def _bam_coord_key(rec: bytes) -> tuple[int, int]:
+    tid, pos = struct.unpack_from("<ii", rec, 4)
+    if tid < 0:
+        return (1 << 31, 0)
+    return (tid, pos)
+
+
+def _read_bam_rec(fh) -> bytes | None:
+    hdr = fh.read(4)
+    if not hdr or len(hdr) < 4:
+        return None
+    block = int.from_bytes(hdr, "little", signed=True)
+    body = fh.read(block)
+    if len(body) != block:
+        raise ValueError("truncated uncompressed BAM record")
+    return hdr + body
+
+
+def order_run_perms(
+    n: int,
+    coord_addr: int,
+    dhi_addr: int,
+    dlo_addr: int,
+    perm_addr: int,
+    dupperm_addr: int,
+) -> None:
+    """Host argsort of one tile. GPU radix left leftover n (not a multiple of
+    256) unsorted; these perms are what gather + k-way merge must follow."""
+    n = int(n)
+    if n <= 0:
+        return
+    coord = (ctypes.c_uint64 * n).from_address(int(coord_addr))
+    dhi = (ctypes.c_uint64 * n).from_address(int(dhi_addr))
+    dlo = (ctypes.c_uint64 * n).from_address(int(dlo_addr))
+    perm = (ctypes.c_uint32 * n).from_address(int(perm_addr))
+    dupperm = (ctypes.c_uint32 * n).from_address(int(dupperm_addr))
+    idx = list(range(n))
+    idx.sort(key=coord.__getitem__)
+    for j, i in enumerate(idx):
+        perm[j] = i
+    idx.sort(key=lambda i: (dhi[i], dlo[i], i))
+    for j, i in enumerate(idx):
+        dupperm[j] = i
+
+
+class BamRunStore:
+    """SSD merge-sort runs: GPU-sorted BAM tiles, then Python k-way merge.
+
+    Each run is one GPU-sorted tile (``METHYLGRAPHER_FM_SORT_TILE`` records).
+    Host RAM and HBM stay O(tile); the 30× BAM lives on NVMe. Merge uses
+    ``heapq`` (Mojo min-heap inside the FM mapper OOMs the kernel compile).
+    """
+
+    def __init__(self, spill_dir: str | os.PathLike[str] | None = None) -> None:
+        raw = (
+            str(spill_dir)
+            if spill_dir is not None
+            else os.environ.get("METHYLGRAPHER_BAM_ARENA_DIR", "")
+        )
+        if not raw or raw.strip().lower() in {"", "ram", "0", "false", "off", "none"}:
+            raw = os.environ.get("METHYLGRAPHER_BAM_RUN_DIR", "")
+        if not raw or raw.strip().lower() in {"", "ram", "0", "false", "off", "none"}:
+            raise ValueError(
+                "BamRunStore needs METHYLGRAPHER_BAM_ARENA_DIR or an explicit spill_dir"
+            )
+        self._dir = Path(raw) / "sorted_runs"
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._n = 0
+        self._runs: list[tuple[Path, Path]] = []
+
+    def n_runs(self) -> int:
+        return self._n
+
+    def open_raw_writer(self) -> _RawRunWriter:
+        bam = self._dir / f"run_{self._n:06d}.bam.bin"
+        return _RawRunWriter(str(bam))
+
+    def write_sorted_from_arena(
+        self,
+        n: int,
+        arena: BamArena,
+        rec_addr: int,
+        len_addr: int,
+        perm_addr: int,
+    ) -> None:
+        """Parse arena chunks (pack order) and write a coord-sorted run BAM.
+
+        Sort key is the packed record's refID/pos, not the Mojo ``h_coord``
+        sidecar (leftover tiles can disagree). ``perm`` is updated to that order
+        so markdup orig indices still line up.
+        """
+        n = int(n)
+        _ = (rec_addr, len_addr)
+        perm = (ctypes.c_uint32 * n).from_address(int(perm_addr))
+        n_chunks = int(arena.n_chunks())
+        addrs = [int(arena.chunk_addr(cid)) for cid in range(n_chunks)]
+        # (tid_key, pos, orig, cid, off, rlen) — do not copy record bodies.
+        entries: list[tuple[int, int, int, int, int, int]] = []
+        orig = 0
+        for cid in range(n_chunks):
+            clen = int(arena.chunk_len(cid))
+            if clen <= 0:
+                continue
+            addr = addrs[cid]
+            off = 0
+            while off + 4 <= clen:
+                hdr = ctypes.string_at(addr + off, 12)
+                block, tid, pos = struct.unpack_from("<iii", hdr, 0)
+                rlen = 4 + block
+                if rlen < 36 or off + rlen > clen:
+                    raise ValueError("corrupt uncompressed BAM chunk")
+                tidk = tid if tid >= 0 else (1 << 31)
+                entries.append((tidk, pos, orig, cid, off, rlen))
+                orig += 1
+                off += rlen
+        if orig != n:
+            raise ValueError(f"arena records {orig} != tile n {n}")
+        entries.sort()
+        bam = self._dir / f"run_{self._n:06d}.bam.bin"
+        with open(bam, "wb", buffering=8 * 1024 * 1024) as fh:
+            for j, (_k, _p, orig_i, cid, loc, rlen) in enumerate(entries):
+                perm[j] = orig_i
+                fh.write(ctypes.string_at(addrs[cid] + loc, rlen))
+
+    def write_keys(
+        self,
+        n: int,
+        coord_addr: int,
+        dhi_addr: int,
+        dlo_addr: int,
+        score_addr: int,
+        pair_addr: int,
+        len_addr: int,
+        perm_addr: int,
+        dupperm_addr: int,
+    ) -> int:
+        """Columnar keys for run ``n`` records; call after ``open_raw_writer`` close."""
+        n = int(n)
+        bam = self._dir / f"run_{self._n:06d}.bam.bin"
+        keys = self._dir / f"run_{self._n:06d}.keys"
+        with open(keys, "wb") as fh:
+            fh.write(_RUN_MAGIC)
+            fh.write(struct.pack("<Q", n))
+            _dump_u(fh, coord_addr, n, 8)
+            _dump_u(fh, dhi_addr, n, 8)
+            _dump_u(fh, dlo_addr, n, 8)
+            _dump_u(fh, score_addr, n, 4)
+            _dump_u(fh, pair_addr, n, 4)
+            _dump_u(fh, len_addr, n, 4)
+            _dump_u(fh, perm_addr, n, 4)
+            _dump_u(fh, dupperm_addr, n, 4)
+        self._runs.append((bam, keys))
+        idx = self._n
+        self._n += 1
+        return idx
+
+    def merge_into(self, writer: BamWriter, do_markdup: bool = True) -> int:
+        """K-way merge coord-sorted runs into ``writer``. Returns dups marked."""
+        if not self._runs:
+            return 0
+        loaded = [(_RunKeys(k), bam) for bam, k in self._runs]
+        dups_marked = 0
+        flags: list[array.array] = [
+            array.array("B", bytes(keys.n)) for keys, _ in loaded
+        ]
+        if do_markdup:
+            dups_marked = _markdup_runs(loaded, flags)
+        heap: list[tuple[tuple[int, int], int, int]] = []
+        fhs: list[object] = []
+        heads: list[bytes | None] = []
+        for rid, (_keys, bam) in enumerate(loaded):
+            fh = open(bam, "rb", buffering=8 * 1024 * 1024)
+            fhs.append(fh)
+            rec = _read_bam_rec(fh)
+            heads.append(rec)
+            if rec is not None:
+                heapq.heappush(heap, (_bam_coord_key(rec), rid, 0))
+        while heap:
+            _key, rid, j = heapq.heappop(heap)
+            rec = heads[rid]
+            if rec is None:
+                continue
+            orig = loaded[rid][0].perm[j]
+            buf = bytearray(rec)
+            if flags[rid][orig]:
+                _or_dup_flag_bytes(buf)
+            writer.write_bytes(buf)
+            nxt = _read_bam_rec(fhs[rid])
+            heads[rid] = nxt
+            j += 1
+            if nxt is not None:
+                heapq.heappush(heap, (_bam_coord_key(nxt), rid, j))
+        for fh in fhs:
+            fh.close()
+        return dups_marked
+
+
+def _markdup_runs(
+    loaded: Sequence[tuple[_RunKeys, Path]],
+    flags: list[array.array],
+) -> int:
+    """Same Picard-style rule as ``gpu_sort_markdup`` over k run heads."""
+    heap: list[tuple[int, int, int, int, int]] = []
+    for rid, (keys, _bam) in enumerate(loaded):
+        if keys.n:
+            orig = keys.dupperm[0]
+            heapq.heappush(heap, (keys.dhi[orig], keys.dlo[orig], orig, rid, 0))
+    marked = 0
+    pending: list[tuple[int, int]] = []  # (rid, orig)
+    cur_hi = 0
+    cur_lo = 0
+
+    def flush_group() -> None:
+        nonlocal marked
+        if not pending:
+            return
+        rid0, orig0 = pending[0]
+        k0 = loaded[rid0][0]
+        if k0.dhi[orig0] == _DUP_SENTINEL:
+            pending.clear()
+            return
+        best_pair = k0.pair[orig0]
+        best_score = k0.score[orig0]
+        for rid, orig in pending:
+            k = loaded[rid][0]
+            sc = k.score[orig]
+            pid = k.pair[orig]
+            if sc > best_score or (sc == best_score and pid < best_pair):
+                best_score = sc
+                best_pair = pid
+        for rid, orig in pending:
+            if loaded[rid][0].pair[orig] != best_pair:
+                flags[rid][orig] = 1
+                marked += 1
+        pending.clear()
+
+    while heap:
+        dhi, dlo, orig, rid, i = heapq.heappop(heap)
+        if pending and (dhi != cur_hi or dlo != cur_lo):
+            flush_group()
+        if not pending:
+            cur_hi = dhi
+            cur_lo = dlo
+        pending.append((rid, orig))
+        i += 1
+        keys = loaded[rid][0]
+        if i < keys.n:
+            norig = keys.dupperm[i]
+            heapq.heappush(heap, (keys.dhi[norig], keys.dlo[norig], norig, rid, i))
+    flush_group()
+    return marked
 
 
 def looks_bam_path(path: str) -> bool:

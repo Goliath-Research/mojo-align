@@ -13,10 +13,9 @@ Mapper selection (``METHYLGRAPHER_LINEAR_MAPPER``):
 
 Mojo GPU engine (``METHYLGRAPHER_LINEAR_ENGINE``):
 
-- ``parity`` (default) — frozen k-mer science mapper (``linear_gpu_locate.mojo``)
+- ``fm`` (default) — BWA-MEM-style FM-index mapper (``linear_gpu_fm.mojo``)
+- ``parity`` / ``science`` — frozen k-mer mapper (``linear_gpu_locate.mojo``)
 - ``speed`` — experimental k-mer consensus mapper
-- ``fm`` — BWA-MEM-style FM-index mapper (``linear_gpu_fm.mojo``); promote
-  only when Clara gates pass (see ``docs/LINEAR_ENGINES.md``)
 
 Device selection mirrors Giraffe: ``-device auto|cpu|nvidia|amd`` /
 ``METHYLGRAPHER_ALIGN_DEVICE``.
@@ -34,7 +33,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 
 def _open_text(path: Path):
@@ -315,19 +314,199 @@ def resolve_linear_mapper(device: str) -> str:
     )
 
 
+# FM index (bwt+sa+pac) ~10.1 GiB on GRCh38. The Align worker owns the GPU,
+# so we budget from nvidia-smi *total* HBM (not leftover free).
+_FM_INDEX_RESERVE = 12 * 1024**3
+_FM_MAP_SLACK = 2 * 1024**3  # 2-deep map kernels only
+_FM_SORT_BYTES_PER_REC = 64  # GPU radix double buffers + hist
+_FM_BAM_BYTES_PER_REC = 384  # uncompressed BAM if it lived in HBM
+_FM_HOST_SIDECAR_PER_REC = 48
+_FM_HBM_FRACTION = 0.90
+_FM_DEFAULT_SORT_CAP = 67_108_864
+_FM_RECOMMENDED_HBM = 48 * 1024**3  # Clara-class card; below this → auto low-mem
+
+
 def resolve_linear_engine() -> str:
-    """Return ``parity``, ``speed``, or ``fm``. Default is frozen science."""
+    """Return ``fm``, ``parity``, or ``speed``. Default is the FM mapper."""
     raw = os.environ.get("METHYLGRAPHER_LINEAR_ENGINE", "").strip().lower()
-    if raw in {"", "parity", "science", "default"}:
+    if raw in {"", "fm", "bwa-mem", "bwamem", "default"}:
+        return "fm"
+    if raw in {"parity", "science", "kmer", "k-mer"}:
         return "parity"
     if raw in {"speed", "fast"}:
         return "speed"
-    if raw in {"fm", "bwa-mem", "bwamem"}:
-        return "fm"
     raise RuntimeError(
-        "METHYLGRAPHER_LINEAR_ENGINE must be 'parity', 'speed', or 'fm' "
+        "METHYLGRAPHER_LINEAR_ENGINE must be 'fm', 'parity', or 'speed' "
         f"(got {raw!r})"
     )
+
+
+class FmSortPlan(NamedTuple):
+    tile: int  # 0 = one-shot
+    cap: int
+    reason: str
+
+
+def _host_available_bytes() -> int:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return 0
+    return 0
+
+
+def _gzip_uncompressed_hint(path: Path) -> Optional[int]:
+    """Last-member ISIZE if it looks plausible (wrong when uncompressed > 4 GiB)."""
+    try:
+        on_disk = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(-4, os.SEEK_END)
+            isize = int.from_bytes(fh.read(4), "little")
+    except OSError:
+        return None
+    # ISIZE is uncompressed mod 2^32 — reject unless the ratio looks like gzip.
+    if on_disk * 2 <= isize <= on_disk * 8:
+        return isize
+    return None
+
+
+def estimate_fastq_reads(path: Path) -> int:
+    """Approximate read count from file size (no full parse)."""
+    p = Path(path)
+    if not p.is_file():
+        return 0
+    raw = p.stat().st_size
+    name = p.name.lower()
+    if name.endswith(".gz") or name.endswith(".bgz"):
+        hint = _gzip_uncompressed_hint(p)
+        raw = hint if hint is not None else int(raw * 4.0)
+    # 150 bp FASTQ record ≈ name + seq + '+' + qual + newlines.
+    return max(0, raw // 360)
+
+
+def estimate_bam_records(fq1: Path, fq2: Path | str = "") -> int:
+    """PE records = R1 reads + R2 reads; SE is R1 only."""
+    n1 = estimate_fastq_reads(Path(fq1))
+    n2 = estimate_fastq_reads(Path(fq2)) if fq2 else 0
+    return n1 + n2
+
+
+def _hbm_total_bytes(device: str = "auto") -> int:
+    try:
+        from gpu_mem import hbm_info
+
+        return int(hbm_info(device).total_bytes)
+    except Exception:
+        return 0
+
+
+def choose_fm_sort_plan(
+    *,
+    batch_records: int = 32768,
+    estimated_records: int = 0,
+    total_bytes: Optional[int] = None,
+    host_bytes: Optional[int] = None,
+    explicit: Optional[str] = None,
+    device: str = "auto",
+) -> FmSortPlan:
+    """Pick one-shot vs SSD tiles from dedicated-GPU HBM (nvidia-smi total).
+
+    No operator flag. Same idea as Clara ``--low-memory``: only leave the
+    fast path when the whole uncompressed BAM + sort keys would not fit.
+    """
+    raw = (
+        explicit
+        if explicit is not None
+        else os.environ.get("METHYLGRAPHER_FM_SORT_TILE", "")
+    ).strip().lower()
+    min_tile = max(int(batch_records), 1)
+    if raw in {"0", "oneshot", "one-shot", "off"}:
+        return FmSortPlan(0, _FM_DEFAULT_SORT_CAP, "explicit one-shot")
+    if raw not in {"", "auto"}:
+        n = int(raw)
+        if n < 0:
+            raise ValueError(f"METHYLGRAPHER_FM_SORT_TILE must be >= 0 (got {n})")
+        if n == 0:
+            return FmSortPlan(0, _FM_DEFAULT_SORT_CAP, "explicit one-shot")
+        tile = max(n, min_tile)
+        return FmSortPlan(tile, tile, f"explicit tile={tile}")
+
+    if total_bytes is None:
+        total_bytes = _hbm_total_bytes(device)
+    if host_bytes is None:
+        host_bytes = _host_available_bytes()
+    total = max(int(total_bytes), 0)
+    host = max(int(host_bytes), 0)
+    budget = int(total * _FM_HBM_FRACTION)
+    remain = budget - _FM_INDEX_RESERVE - _FM_MAP_SLACK
+    n = max(int(estimated_records), 0)
+
+    def _lowmem_tile() -> int:
+        per = _FM_SORT_BYTES_PER_REC + _FM_BAM_BYTES_PER_REC
+        if remain < (1 << 30):
+            return min_tile
+        tile = remain // per
+        if host > 0:
+            tile = min(tile, max(host // (2 * _FM_HOST_SIDECAR_PER_REC), min_tile))
+        return max(tile, min_tile)
+
+    if n > 0:
+        gpu_keys = _FM_INDEX_RESERVE + _FM_MAP_SLACK + n * _FM_SORT_BYTES_PER_REC
+        gpu_bam = n * _FM_BAM_BYTES_PER_REC
+        host_need = n * _FM_HOST_SIDECAR_PER_REC
+        host_ok = host == 0 or host_need <= host // 2
+        if gpu_keys <= budget and gpu_bam <= max(remain, 0) and host_ok:
+            cap = max(_FM_DEFAULT_SORT_CAP, int(n * 1.25) + min_tile)
+            return FmSortPlan(
+                0,
+                cap,
+                f"one-shot n≈{n} keys+BAM fit in {total / 1024**3:.1f} GiB HBM",
+            )
+        tile = _lowmem_tile()
+        return FmSortPlan(
+            tile,
+            tile,
+            f"low-memory n≈{n} BAM would need {gpu_bam / 1024**3:.1f} GiB "
+            f"on {total / 1024**3:.1f} GiB HBM; tile={tile}",
+        )
+
+    if total >= _FM_RECOMMENDED_HBM:
+        return FmSortPlan(
+            0,
+            _FM_DEFAULT_SORT_CAP,
+            f"one-shot (no n estimate; {total / 1024**3:.1f} GiB ≥ recommended)",
+        )
+    tile = _lowmem_tile()
+    return FmSortPlan(
+        tile,
+        tile,
+        f"low-memory (no n estimate; {total / 1024**3:.1f} GiB < recommended); tile={tile}",
+    )
+
+
+def choose_fm_sort_tile(
+    *,
+    batch_records: int = 32768,
+    free_bytes: Optional[int] = None,
+    total_bytes: Optional[int] = None,
+    estimated_records: int = 0,
+    host_bytes: Optional[int] = None,
+    explicit: Optional[str] = None,
+    device: str = "auto",
+) -> int:
+    """Return ``SORT_TILE`` (0 = one-shot). ``free_bytes`` is accepted as total."""
+    tot = total_bytes if total_bytes is not None else free_bytes
+    return choose_fm_sort_plan(
+        batch_records=batch_records,
+        estimated_records=estimated_records,
+        total_bytes=tot,
+        host_bytes=host_bytes,
+        explicit=explicit,
+        device=device,
+    ).tile
 
 
 def _mojo_bin() -> List[str]:
@@ -366,7 +545,11 @@ def run_mojo_linear_map(
     map_path = out_sam
     view_proc: subprocess.Popen[str] | None = None
     fifo: Path | None = None
-    native_bam = out_bam is not None and resolve_linear_engine() == "fm"
+    native_bam = (
+        out_bam is not None
+        and resolve_linear_engine() == "fm"
+        and str(device).lower() not in {"cpu", "host"}
+    )
     if native_bam:
         map_path = out_bam
     elif out_bam is not None:
@@ -428,8 +611,27 @@ def run_mojo_linear_map(
             handle.write(f"STREAM_BAM: {out_bam} (no on-disk SAM)\n")
         handle.flush()
         env = os.environ.copy()
+        eng = resolve_linear_engine()
+        if str(device).lower() in {"cpu", "host"} and eng == "fm":
+            eng = "parity"
+        env["METHYLGRAPHER_LINEAR_ENGINE"] = eng
         py = str(root / "fq2bam-meth" / "python")
         env["PYTHONPATH"] = py + os.pathsep + env.get("PYTHONPATH", "")
+        if eng == "fm":
+            batch = int(env.get("METHYLGRAPHER_LINEAR_READ_BATCH") or "16384")
+            recs = batch * 2 if str(g2a_r2) else batch
+            n_est = estimate_bam_records(Path(c2t_r1), g2a_r2)
+            plan = choose_fm_sort_plan(
+                batch_records=recs,
+                estimated_records=n_est,
+                device=device,
+            )
+            env["METHYLGRAPHER_FM_SORT_TILE"] = str(plan.tile)
+            env["METHYLGRAPHER_FM_SORT_CAP"] = str(plan.cap)
+            handle.write(
+                f"FM_SORT_TILE={plan.tile} SORT_CAP={plan.cap} "
+                f"estimated_records={n_est} ({plan.reason})\n"
+            )
         if not env.get("METHYLGRAPHER_BAM_ARENA_DIR"):
             arena = log.parent / "bam_arena"
             arena.mkdir(parents=True, exist_ok=True)
