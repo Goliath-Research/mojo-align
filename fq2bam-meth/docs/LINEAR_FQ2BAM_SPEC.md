@@ -79,6 +79,7 @@ bin/methylGrapher MojoFq2bamMeth \
 | `src/linear_gpu_speed.mojo` | **Speed** GPU engine (opt-in k-mer consensus) |
 | `src/linear_fm_index.mojo` | BWA 0.7 FM-index mmap (`.bwt/.sa/.pac/.ann`) |
 | `src/linear_gpu_fm.mojo` | **FM** GPU engine (BWA-MEM-style; promote per [`LINEAR_ENGINES.md`](LINEAR_ENGINES.md)) |
+| `src/linear_fastq.mojo` | FM BAM-path bulk FASTQ (pigz fd + libc `read` + C2T/G2A arena) |
 | `src/linear_mapper.mojo` | streaming map; dispatches parity / speed / fm; orchestrator writes BAM |
 | `engine/fq2bam_meth.py` | convert, invoke Mojo, BWA fallback, samtools, QC |
 

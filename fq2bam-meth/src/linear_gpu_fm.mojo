@@ -14,6 +14,16 @@ from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
 from linear_extend import hit_to_sam_line, pair_hits, LinearHit
 from linear_fm_index import FmIndex, fm_prefix_from_ref
+from linear_fastq import (
+    FastqArena,
+    FastqPairStream,
+    fq_close,
+    fq_export_ptrs,
+    fq_open,
+    fq_pack_bases,
+    fq_read_batch,
+    fq_reserve,
+)
 from linear_gpu_sort import gpu_sort_markdup
 from linear_gpu_locate import (
     FastqRec,
@@ -478,7 +488,7 @@ def _pack_bam_aln(
 
 
 def _emit_bam_from_batch(
-    py_b: PythonObject,
+    mut arena: FastqArena,
     paired: Bool,
     n1: Int,
     rid_addr: Int,
@@ -518,11 +528,9 @@ def _emit_bam_from_batch(
     n_batches: Int,
     meta_cap: Int,
 ) raises:
-    var paired_i = 0
-    if paired:
-        paired_i = 1
-    py_b.export_ptrs(
-        paired_i,
+    fq_export_ptrs(
+        arena,
+        paired,
         n1_name_a,
         n1_name_n,
         n1_orig_a,
@@ -1947,7 +1955,17 @@ def map_fastq_fm_gpu(
         else:
             fh = open_text_write(out_sam)
             _write_sam_header_fm(fh, index)
-        var fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
+        var fq_reader = Python.none()
+        var fq_stream = FastqPairStream()
+        var arena_cur = FastqArena()
+        var arena_ready = FastqArena()
+        if emit_bam:
+            fq_stream = fq_open(fq1, fq2, bs_r1, bs_r2)
+            fq_reserve(arena_cur, batch_size, paired)
+            fq_reserve(arena_ready, batch_size, paired)
+            print("MojoLinear GPU-fm FASTQ=mojo-bulk")
+        else:
+            fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
 
         var cap_n = batch_size * 2
         if cap_n < 2:
@@ -2013,16 +2031,26 @@ def map_fastq_fm_gpu(
         comptime BLOCK = 256
 
         var t_f0 = time_mod.perf_counter()
-        var py_cur = fq_reader.read_batch(batch_size)
+        var py_cur = Python.none()
+        var n1_cur = 0
+        if emit_bam:
+            fq_read_batch(fq_stream, arena_cur, batch_size)
+            n1_cur = arena_cur.n1
+        else:
+            py_cur = fq_reader.read_batch(batch_size)
+            n1_cur = Int(py=py_cur.n1)
         t_fastq = t_fastq + (time_mod.perf_counter() - t_f0)
-        var n1_cur = Int(py=py_cur.n1)
         var py_ready = Python.none()
         var n1_ready = 0
         var have_ready = False
 
         while n1_cur > 0:
             var t_g0 = time_mod.perf_counter()
-            var max_len = Int(py=py_cur.max_len)
+            var max_len = 0
+            if emit_bam:
+                max_len = arena_cur.max_len
+            else:
+                max_len = Int(py=py_cur.max_len)
             if max_len < seed_len:
                 max_len = seed_len
             if max_len > max_len_cap:
@@ -2035,22 +2063,33 @@ def map_fastq_fm_gpu(
             if n_seq > cap_n:
                 raise Error("FASTQ batch larger than GPU buffers")
             var n_bases = n_seq * max_len
-            py_cur.zero_align(Int(host_bases.unsafe_ptr()), n_bases)
-            py_cur.export_seq_ptrs(
-                Int(h_seq_a.unsafe_ptr()), Int(host_lens.unsafe_ptr()), paired_i
-            )
-            var bases_addr = Int(host_bases.unsafe_ptr())
-            var seq_ap = _u64_at(Int(h_seq_a.unsafe_ptr()))
-            var si = 0
-            while si < n_seq:
-                var ln = Int(host_lens[si])
-                if ln > 0:
-                    memcpy(
-                        dest=_u8_at(bases_addr + si * max_len),
-                        src=_u8_at(Int(seq_ap[si])),
-                        count=ln,
-                    )
-                si += 1
+            if emit_bam:
+                fq_pack_bases(
+                    arena_cur,
+                    paired,
+                    Int(host_bases.unsafe_ptr()),
+                    max_len,
+                    Int(host_lens.unsafe_ptr()),
+                )
+            else:
+                py_cur.zero_align(Int(host_bases.unsafe_ptr()), n_bases)
+                py_cur.export_seq_ptrs(
+                    Int(h_seq_a.unsafe_ptr()),
+                    Int(host_lens.unsafe_ptr()),
+                    paired_i,
+                )
+                var bases_addr = Int(host_bases.unsafe_ptr())
+                var seq_ap = _u64_at(Int(h_seq_a.unsafe_ptr()))
+                var si = 0
+                while si < n_seq:
+                    var ln = Int(host_lens[si])
+                    if ln > 0:
+                        memcpy(
+                            dest=_u8_at(bases_addr + si * max_len),
+                            src=_u8_at(Int(seq_ap[si])),
+                            count=ln,
+                        )
+                    si += 1
             ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
             ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
             var grid_b = (n_bases + BLOCK - 1) // BLOCK
@@ -2134,13 +2173,15 @@ def map_fastq_fm_gpu(
             ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
 
             var t_ov0 = time_mod.perf_counter()
-            var fut = fq_reader.read_batch_async(batch_size)
+            var fut = Python.none()
+            if not emit_bam:
+                fut = fq_reader.read_batch_async(batch_size)
             var t_emit_ov = time_mod.perf_counter() * 0
             if have_ready:
                 var t_e0 = time_mod.perf_counter()
                 if emit_bam:
                     _emit_bam_from_batch(
-                        py_ready,
+                        arena_ready,
                         paired,
                         n1_ready,
                         Int(emit_rid.unsafe_ptr()),
@@ -2241,13 +2282,22 @@ def map_fastq_fm_gpu(
                         n_reads,
                     )
 
-            var py_next = fut.result()
-            var n1_next = Int(py=py_next.n1)
+            var n1_next = 0
+            var py_next = Python.none()
+            if emit_bam:
+                var t_f1 = time_mod.perf_counter()
+                fq_read_batch(fq_stream, arena_ready, batch_size)
+                n1_next = arena_ready.n1
+                t_fastq = t_fastq + (time_mod.perf_counter() - t_f1)
+            else:
+                py_next = fut.result()
+                n1_next = Int(py=py_next.n1)
             var t_overlap = time_mod.perf_counter() - t_ov0
-            var t_fq_part = t_overlap - t_emit_ov
-            if t_fq_part < 0:
-                t_fq_part = 0
-            t_fastq = t_fastq + t_fq_part
+            if not emit_bam:
+                var t_fq_part = t_overlap - t_emit_ov
+                if t_fq_part < 0:
+                    t_fq_part = 0
+                t_fastq = t_fastq + t_fq_part
 
             ctx.synchronize()
             t_gpu = t_gpu + (time_mod.perf_counter() - t_g0) - t_overlap
@@ -2276,17 +2326,22 @@ def map_fastq_fm_gpu(
             _copy_bytes(
                 Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq * 4
             )
-            py_ready = py_cur
+            if emit_bam:
+                var tmp = arena_cur^
+                arena_cur = arena_ready^
+                arena_ready = tmp^
+            else:
+                py_ready = py_cur
+                py_cur = py_next
             n1_ready = n1_cur
             have_ready = True
-            py_cur = py_next
             n1_cur = n1_next
 
         if have_ready:
             var t_e1 = time_mod.perf_counter()
             if emit_bam:
                 _emit_bam_from_batch(
-                    py_ready,
+                    arena_ready,
                     paired,
                     n1_ready,
                     Int(emit_rid.unsafe_ptr()),
@@ -2386,7 +2441,10 @@ def map_fastq_fm_gpu(
                     n_reads,
                 )
 
-        fq_reader.close()
+        if emit_bam:
+            fq_close(fq_stream)
+        else:
+            fq_reader.close()
         var t_sort = time_mod.perf_counter() * 0
         if emit_bam:
             var t_s0 = time_mod.perf_counter()

@@ -90,6 +90,7 @@ the frozen engine.
 | fm (native BAM + mate-rescue) | **98.24%** | **0.015** | 1.00 | kernel 0.34 / emit **0.75** / map 2.1 | **pass** (100k) |
 | fm (GPU sort + markdup) | **98.24%** | **0.015** | 1.00 | kernel 0.35 / sort **0.016** / gather 0.57 / map 2.09; 246 dups; `samtools index` only | **pass** (100k) |
 | fm (no Mojo `String` copies + GPU/emit overlap) | **98.24%** | **0.015** | 1.00 | kernel 0.16 / emit 0.43 / fastq 0.34 / **map 0.95** | **pass** (100k) |
+| fm (Mojo bulk FASTQ / pigz fd) | **98.23%** | **0.015** | 1.00 | kernel 0.14 / emit 0.24 / fastq **0.12** / **map 0.51** | **pass** (100k) |
 
 ## Full sample (~53.3M reads)
 
@@ -103,15 +104,17 @@ the frozen engine.
 | fm (GPU sort + markdup) | **98.34%** | **0.013** | **1.00** | **88.0 / emit 168 / sort 2.1 / map 528 s** | **~705 s** (incl. compare; BAM+index ~9 min) | **pass** |
 | fm (pigz FASTQ + parallel BGZF) | **98.34%** | **0.013** | **1.00** | kernel hidden under FASTQ 143 / emit 84 (BGZF 26) / sort 2.1 / **map 237 s** | **~380 s** script (BAM+index ~4 min) | **pass** |
 | fm (bytearray FASTQ + Mojo pack + async pigz) | **98.34%** | **0.013** | **1.00** | kernel 9.4 (hidden) / emit 114 (BGZF 28) / fastq 96 / sort 2.2 / **map 222 s** | **~367 s** script | **pass** |
+| fm (Mojo bulk FASTQ / pigz fd) | **98.33%** | **0.014** | **1.00** | kernel 1.9 (hidden) / emit **66** (BGZF 28) / fastq **32** / sort 2.2 / **map 103 s** | **~256 s** script | **pass** |
 
 GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k) and is **hidden
-under emit+FASTQ**. Dropping Mojo `String` copies and overlapping the next
-FASTQ batch with BAM pack cut full-sample **map 237 s → 222 s** (100k **2.1 s →
-0.95 s**). Remaining wall is Python GIL: `readline` ingest and BAM pack cannot
-run at the same time in one process (~96 s + ~86 s pack + 28 s BGZF). Next cut
-is a separate-process FASTQ reader. Default stays **parity** until E2E is in
-Clara's ballpark (~122 s).
+under emit+FASTQ**. Replacing Python `readline` with Mojo bulk ingest
+(`src/linear_fastq.mojo`: pigz fd + libc `read` + C2T/G2A arena) cut full-sample
+**map 222 s → 103 s** (100k **0.95 s → 0.51 s**). FASTQ is now pigz-bound
+(~32 s). Remaining wall is Mojo BAM pack + Python BGZF (~66 s emit). Overlapping
+those two (Mojo thread or process) is the next cut toward Clara's ~84 s mem /
+~122 s E2E. Default stays **parity**.
 
 Mate-rescue recovered the good one-end-mapped mates. Remaining Δ vs Clara is mostly 2–4 bp indels and low-quality extras we are not chasing.
 
 Round-trip unit: `fq2bam-meth/tests/fm_roundtrip.mojo` (unique 32-mer BWT+SA).
+FASTQ unit: `fq2bam-meth/tests/test_linear_fastq.mojo`.
