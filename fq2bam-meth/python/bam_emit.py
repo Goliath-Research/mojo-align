@@ -211,9 +211,9 @@ class BamWriter:
         } else "unsorted"
         self._rg = rg_id.encode("ascii")
         try:
-            threads = int(os.environ.get("METHYLGRAPHER_BAM_THREADS", "16"))
+            threads = int(os.environ.get("METHYLGRAPHER_BAM_THREADS", "32"))
         except ValueError:
-            threads = 16
+            threads = 32
         if threads < 1:
             threads = 1
         self._bgzf = _BgzfWriter(path, level=level, threads=threads)

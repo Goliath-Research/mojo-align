@@ -6,7 +6,7 @@
 # parity until Clara gates pass.
 
 from std.collections import Dict, List
-from std.memory import UnsafePointer
+from std.memory import UnsafePointer, memcpy
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
@@ -134,18 +134,18 @@ def _py_batch_to_recs(
         batch1.append(
             FastqRec(
                 String(b.names1[i]),
-                String(b.seq1[i]),
-                String(b.qual1[i]),
-                String(b.orig1[i]),
+                String(b.seq1[i].decode()),
+                String(b.qual1[i].decode()),
+                String(b.orig1[i].decode()),
             )
         )
         if paired:
             batch2.append(
                 FastqRec(
                     String(b.names2[i]),
-                    String(b.seq2[i]),
-                    String(b.qual2[i]),
-                    String(b.orig2[i]),
+                    String(b.seq2[i].decode()),
+                    String(b.qual2[i].decode()),
+                    String(b.orig2[i].decode()),
                 )
             )
         i += 1
@@ -155,6 +155,28 @@ def _py_batch_to_recs(
 def _open_bam_arena() raises -> PythonObject:
     var bam_mod = Python.import_module("bam_emit")
     return bam_mod.BamArena()
+
+
+def _u8_at(addr: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+    return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _i32_at(addr: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
+    return UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _u32_at(addr: Int) -> UnsafePointer[UInt32, MutAnyOrigin]:
+    return UnsafePointer[UInt32, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _u64_at(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
+    return UnsafePointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _copy_bytes(dst: Int, src: Int, nbytes: Int):
+    if nbytes <= 0:
+        return
+    memcpy(dest=_u8_at(dst), src=_u8_at(src), count=nbytes)
 
 
 def _unclipped5(flag: Int, pos0: Int, sl: Int, sr: Int, qlen: Int) -> Int:
@@ -287,7 +309,7 @@ def _pack_bam_aln(
     p: UnsafePointer[UInt8, MutAnyOrigin],
     off0: Int,
     cap: Int,
-    name: UnsafePointer[UInt8, ...],
+    name_addr: Int,
     name_len: Int,
     flag: Int,
     tid: Int,
@@ -295,15 +317,15 @@ def _pack_bam_aln(
     mapq: Int,
     sl: Int,
     sr: Int,
-    seq: UnsafePointer[UInt8, ...],
+    seq_addr: Int,
     qlen: Int,
-    qual: UnsafePointer[UInt8, ...],
+    qual_addr: Int,
     qual_len: Int,
     ntid: Int,
     npos: Int,
     tlen: Int,
     nm: Int,
-    rg: UnsafePointer[UInt8, ...],
+    rg_addr: Int,
     rg_n: Int,
 ) raises -> Int:
     var rev = (flag & 16) != 0
@@ -369,6 +391,10 @@ def _pack_bam_aln(
     _put_i32(p, off0 + 24, ntid_w)
     _put_i32(p, off0 + 28, npos_w)
     _put_i32(p, off0 + 32, tlen)
+    var name = _u8_at(name_addr)
+    var seq = _u8_at(seq_addr)
+    var qual = _u8_at(qual_addr)
+    var rg = _u8_at(rg_addr)
     var off = off0 + 36
     var ni = 0
     while ni < name_len:
@@ -411,7 +437,7 @@ def _pack_bam_aln(
         p[off] = c << 4
         off += 1
     var qi2 = 0
-    if qual_len == qlen:
+    if qual_len == qlen and qual_addr != 0:
         while qi2 < qlen:
             var srcq = qi2
             if rev:
@@ -448,6 +474,325 @@ def _pack_bam_aln(
     p[off + 3] = UInt8(nmv)
     off += 4
     return off
+
+
+
+def _emit_bam_from_batch(
+    py_b: PythonObject,
+    paired: Bool,
+    n1: Int,
+    rid_addr: Int,
+    pos_addr: Int,
+    mapq_addr: Int,
+    flag_addr: Int,
+    sl_addr: Int,
+    sr_addr: Int,
+    nm_addr: Int,
+    n1_name_a: Int,
+    n1_name_n: Int,
+    n1_orig_a: Int,
+    n1_orig_n: Int,
+    n1_qual_a: Int,
+    n1_qual_n: Int,
+    n2_name_a: Int,
+    n2_name_n: Int,
+    n2_orig_a: Int,
+    n2_orig_n: Int,
+    n2_qual_a: Int,
+    n2_qual_n: Int,
+    bam_p: UnsafePointer[UInt8, MutAnyOrigin],
+    bam_cap: Int,
+    bam_arena: PythonObject,
+    rid_to_tid: List[Int],
+    rg_p: UnsafePointer[UInt8, ...],
+    rg_n: Int,
+    coord_addr: Int,
+    dhi_addr: Int,
+    dlo_addr: Int,
+    rec_addr: Int,
+    len_addr: Int,
+    score_addr: Int,
+    pair_addr: Int,
+    mut n_reads: Int,
+    mut n_mapped: Int,
+    n_batches: Int,
+    meta_cap: Int,
+) raises:
+    var paired_i = 0
+    if paired:
+        paired_i = 1
+    py_b.export_ptrs(
+        paired_i,
+        n1_name_a,
+        n1_name_n,
+        n1_orig_a,
+        n1_orig_n,
+        n1_qual_a,
+        n1_qual_n,
+        n2_name_a,
+        n2_name_n,
+        n2_orig_a,
+        n2_orig_n,
+        n2_qual_a,
+        n2_qual_n,
+    )
+    var host_rid = _i32_at(rid_addr)
+    var host_pos = _u32_at(pos_addr)
+    var host_mapq = _u32_at(mapq_addr)
+    var host_flag = _i32_at(flag_addr)
+    var host_sl = _u32_at(sl_addr)
+    var host_sr = _u32_at(sr_addr)
+    var host_nm = _u32_at(nm_addr)
+    var name1_a = _u64_at(n1_name_a)
+    var name1_n = _u32_at(n1_name_n)
+    var orig1_a = _u64_at(n1_orig_a)
+    var orig1_n = _u32_at(n1_orig_n)
+    var qual1_a = _u64_at(n1_qual_a)
+    var qual1_n = _u32_at(n1_qual_n)
+    var name2_a = _u64_at(n2_name_a)
+    var name2_n = _u32_at(n2_name_n)
+    var orig2_a = _u64_at(n2_orig_a)
+    var orig2_n = _u32_at(n2_orig_n)
+    var qual2_a = _u64_at(n2_qual_a)
+    var qual2_n = _u32_at(n2_qual_n)
+    var h_coord = _u64_at(coord_addr)
+    var h_dhi = _u64_at(dhi_addr)
+    var h_dlo = _u64_at(dlo_addr)
+    var h_rec = _u64_at(rec_addr)
+    var h_len = _u32_at(len_addr)
+    var h_score = _u32_at(score_addr)
+    var h_pair = _u32_at(pair_addr)
+    var rg_addr = Int(rg_p)
+    var off = 0
+    var pj = 0
+    while pj < n1:
+        var rid1 = Int(host_rid[pj])
+        var pos1 = Int(host_pos[pj])
+        var mq1 = Int(host_mapq[pj])
+        var fl1 = Int(host_flag[pj]) | 1 | 64
+        var sl1 = Int(host_sl[pj])
+        var sr1 = Int(host_sr[pj])
+        var nm1 = Int(host_nm[pj])
+        var tid1 = -1
+        if rid1 >= 0 and rid1 < len(rid_to_tid):
+            tid1 = rid_to_tid[rid1]
+        else:
+            fl1 = fl1 | 4
+        var qlen1 = Int(orig1_n[pj])
+        var q1n = Int(qual1_n[pj])
+        var n1len = Int(name1_n[pj])
+        if not paired:
+            if n_reads >= meta_cap:
+                raise Error(
+                    "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
+                )
+            var rec_start = off
+            off = _pack_bam_aln(
+                bam_p,
+                off,
+                bam_cap,
+                Int(name1_a[pj]),
+                n1len,
+                fl1,
+                tid1,
+                pos1,
+                mq1,
+                sl1,
+                sr1,
+                Int(orig1_a[pj]),
+                qlen1,
+                Int(qual1_a[pj]),
+                q1n,
+                -1,
+                -1,
+                0,
+                nm1,
+                rg_addr,
+                rg_n,
+            )
+            h_coord[n_reads] = _coord_key(tid1, pos1, n_reads)
+            if tid1 >= 0:
+                h_dhi[n_reads] = _pack_end(
+                    tid1,
+                    _unclipped5(fl1, pos1, sl1, sr1, qlen1),
+                    (fl1 >> 4) & 1,
+                )
+                h_dlo[n_reads] = 0
+            else:
+                h_dhi[n_reads] = ~UInt64(0)
+                h_dlo[n_reads] = UInt64(n_reads)
+            h_rec[n_reads] = (UInt64(n_batches) << 32) | UInt64(rec_start)
+            h_len[n_reads] = UInt32(off - rec_start)
+            var nm_c = nm1
+            if nm_c < 0:
+                nm_c = 0
+            if nm_c > 255:
+                nm_c = 255
+            h_score[n_reads] = UInt32((mq1 << 8) | (255 - nm_c))
+            h_pair[n_reads] = UInt32(n_reads)
+            if tid1 >= 0:
+                n_mapped += 1
+            n_reads += 1
+        else:
+            var r2i = n1 + pj
+            var rid2 = Int(host_rid[r2i])
+            var pos2 = Int(host_pos[r2i])
+            var mq2 = Int(host_mapq[r2i])
+            var fl2 = Int(host_flag[r2i]) | 1 | 128
+            var sl2 = Int(host_sl[r2i])
+            var sr2 = Int(host_sr[r2i])
+            var nm2 = Int(host_nm[r2i])
+            var tid2 = -1
+            if rid2 >= 0 and rid2 < len(rid_to_tid):
+                tid2 = rid_to_tid[rid2]
+            else:
+                fl2 = fl2 | 4
+            if tid1 < 0:
+                fl2 = fl2 | 8
+            if tid2 < 0:
+                fl1 = fl1 | 8
+            var ntid1 = -1
+            var npos1 = -1
+            var ntid2 = -1
+            var npos2 = -1
+            var tlen1 = 0
+            var tlen2 = 0
+            var qlen2 = Int(orig2_n[pj])
+            if tid1 >= 0 and tid2 >= 0 and tid1 == tid2:
+                fl1 = fl1 | 2
+                fl2 = fl2 | 2
+                ntid1 = tid1
+                ntid2 = tid2
+                npos1 = pos2
+                npos2 = pos1
+                var tl = pos2 - pos1
+                if tl < 0:
+                    tl = -tl
+                tl = tl + qlen2
+                if pos1 <= pos2:
+                    tlen1 = tl
+                    tlen2 = -tl
+                else:
+                    tlen1 = -tl
+                    tlen2 = tl
+            else:
+                if tid1 >= 0:
+                    ntid2 = tid1
+                    npos2 = pos1
+                if tid2 >= 0:
+                    ntid1 = tid2
+                    npos1 = pos2
+            var q2n = Int(qual2_n[pj])
+            var n2len = Int(name2_n[pj])
+            if n_reads + 1 >= meta_cap:
+                raise Error(
+                    "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
+                )
+            var rec_start1 = off
+            off = _pack_bam_aln(
+                bam_p,
+                off,
+                bam_cap,
+                Int(name1_a[pj]),
+                n1len,
+                fl1,
+                tid1,
+                pos1,
+                mq1,
+                sl1,
+                sr1,
+                Int(orig1_a[pj]),
+                qlen1,
+                Int(qual1_a[pj]),
+                q1n,
+                ntid1,
+                npos1,
+                tlen1,
+                nm1,
+                rg_addr,
+                rg_n,
+            )
+            var rec_len1 = off - rec_start1
+            var rec_start2 = off
+            off = _pack_bam_aln(
+                bam_p,
+                off,
+                bam_cap,
+                Int(name2_a[pj]),
+                n2len,
+                fl2,
+                tid2,
+                pos2,
+                mq2,
+                sl2,
+                sr2,
+                Int(orig2_a[pj]),
+                qlen2,
+                Int(qual2_a[pj]),
+                q2n,
+                ntid2,
+                npos2,
+                tlen2,
+                nm2,
+                rg_addr,
+                rg_n,
+            )
+            var rec_len2 = off - rec_start2
+            var i1 = n_reads
+            var i2 = n_reads + 1
+            var pid = UInt32(n_reads // 2)
+            var nm_sum = nm1 + nm2
+            if nm_sum < 0:
+                nm_sum = 0
+            if nm_sum > 255:
+                nm_sum = 255
+            var pscore = UInt32(((mq1 + mq2) << 8) | (255 - nm_sum))
+            var dhi = ~UInt64(0)
+            var dlo = UInt64(i1)
+            if tid1 >= 0 or tid2 >= 0:
+                var e1 = _pack_end(
+                    tid1,
+                    _unclipped5(fl1, pos1, sl1, sr1, qlen1),
+                    (fl1 >> 4) & 1,
+                )
+                var e2 = _pack_end(
+                    tid2,
+                    _unclipped5(fl2, pos2, sl2, sr2, qlen2),
+                    (fl2 >> 4) & 1,
+                )
+                if tid1 < 0:
+                    dhi = e2
+                    dlo = 0
+                elif tid2 < 0:
+                    dhi = e1
+                    dlo = 0
+                elif e1 <= e2:
+                    dhi = e1
+                    dlo = e2
+                else:
+                    dhi = e2
+                    dlo = e1
+            h_coord[i1] = _coord_key(tid1, pos1, i1)
+            h_coord[i2] = _coord_key(tid2, pos2, i2)
+            h_dhi[i1] = dhi
+            h_dhi[i2] = dhi
+            h_dlo[i1] = dlo
+            h_dlo[i2] = dlo
+            h_rec[i1] = (UInt64(n_batches) << 32) | UInt64(rec_start1)
+            h_rec[i2] = (UInt64(n_batches) << 32) | UInt64(rec_start2)
+            h_len[i1] = UInt32(rec_len1)
+            h_len[i2] = UInt32(rec_len2)
+            h_score[i1] = pscore
+            h_score[i2] = pscore
+            h_pair[i1] = pid
+            h_pair[i2] = pid
+            if tid1 >= 0:
+                n_mapped += 1
+            if tid2 >= 0:
+                n_mapped += 1
+            n_reads += 2
+        pj += 1
+    _ = bam_arena.append_raw(Int(bam_p), off)
 
 
 def _hit_from_fm(
@@ -1604,6 +1949,60 @@ def map_fastq_fm_gpu(
             _write_sam_header_fm(fh, index)
         var fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
 
+        var cap_n = batch_size * 2
+        if cap_n < 2:
+            cap_n = 2
+        var max_len_cap = 1024
+        var bases_cap = cap_n * max_len_cap
+        var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](bases_cap)
+        var host_lens = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var dev_bases = ctx.enqueue_create_buffer[DType.uint8](bases_cap)
+        var dev_codes = ctx.enqueue_create_buffer[DType.uint8](bases_cap)
+        var dev_lens = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_rid = ctx.enqueue_create_buffer[DType.int32](cap_n)
+        var dev_pos = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_mapq = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_flag = ctx.enqueue_create_buffer[DType.int32](cap_n)
+        var dev_sl = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_sr = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var dev_nm = ctx.enqueue_create_buffer[DType.uint32](cap_n)
+        var host_rid = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var host_pos = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_mapq = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_flag = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var host_sl = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_sr = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var host_nm = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var emit_rid = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var emit_pos = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var emit_mapq = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var emit_flag = ctx.enqueue_create_host_buffer[DType.int32](cap_n)
+        var emit_sl = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var emit_sr = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var emit_nm = ctx.enqueue_create_host_buffer[DType.uint32](cap_n)
+        var ptr_cap = batch_size
+        if ptr_cap < 1:
+            ptr_cap = 1
+        var h_n1_name_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n1_name_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_n1_orig_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n1_orig_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_n1_qual_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n1_qual_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_n2_name_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n2_name_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_n2_orig_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n2_orig_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_n2_qual_a = ctx.enqueue_create_host_buffer[DType.uint64](ptr_cap)
+        var h_n2_qual_n = ctx.enqueue_create_host_buffer[DType.uint32](ptr_cap)
+        var h_seq_a = ctx.enqueue_create_host_buffer[DType.uint64](cap_n)
+        var rg_bytes = rg_s.as_bytes()
+        var rg_p = rg_bytes.unsafe_ptr()
+        var rg_n = rg_s.byte_length()
+        var paired_i = 0
+        if paired:
+            paired_i = 1
+
         var n_mapped = 0
         var n_reads = 0
         var n_batches = 0
@@ -1611,62 +2010,47 @@ def map_fastq_fm_gpu(
         var t_gpu = time_mod.perf_counter() * 0
         var t_emit = time_mod.perf_counter() * 0
         var t_fastq = time_mod.perf_counter() * 0
-        var batch1 = List[FastqRec]()
-        var batch2 = List[FastqRec]()
-        var t_f0 = time_mod.perf_counter()
-        _ = _py_batch_to_recs(
-            fq_reader.read_batch(batch_size), paired, batch1, batch2
-        )
-        t_fastq = t_fastq + (time_mod.perf_counter() - t_f0)
         comptime BLOCK = 256
 
-        while len(batch1) > 0:
+        var t_f0 = time_mod.perf_counter()
+        var py_cur = fq_reader.read_batch(batch_size)
+        t_fastq = t_fastq + (time_mod.perf_counter() - t_f0)
+        var n1_cur = Int(py=py_cur.n1)
+        var py_ready = Python.none()
+        var n1_ready = 0
+        var have_ready = False
+
+        while n1_cur > 0:
             var t_g0 = time_mod.perf_counter()
-            var seqs = List[String]()
-            for r in batch1:
-                seqs.append(r.seq)
-            if paired:
-                for r in batch2:
-                    seqs.append(r.seq)
-            var n_seq = len(seqs)
-            var max_len = 0
-            var ri0 = 0
-            while ri0 < n_seq:
-                var L0 = seqs[ri0].byte_length()
-                if L0 > max_len:
-                    max_len = L0
-                ri0 += 1
+            var max_len = Int(py=py_cur.max_len)
             if max_len < seed_len:
                 max_len = seed_len
+            if max_len > max_len_cap:
+                raise Error("read longer than FM base cap (1024)")
+            if n1_cur > ptr_cap:
+                raise Error("FASTQ batch larger than pointer tables")
+            var n_seq = n1_cur
+            if paired:
+                n_seq = n1_cur * 2
+            if n_seq > cap_n:
+                raise Error("FASTQ batch larger than GPU buffers")
             var n_bases = n_seq * max_len
-            var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
-            var host_lens = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+            py_cur.zero_align(Int(host_bases.unsafe_ptr()), n_bases)
+            py_cur.export_seq_ptrs(
+                Int(h_seq_a.unsafe_ptr()), Int(host_lens.unsafe_ptr()), paired_i
+            )
+            var bases_addr = Int(host_bases.unsafe_ptr())
+            var seq_ap = _u64_at(Int(h_seq_a.unsafe_ptr()))
             var si = 0
             while si < n_seq:
-                var s = seqs[si]
-                var L = s.byte_length()
-                host_lens[si] = UInt32(L)
-                var base = si * max_len
-                var sp = s.as_bytes().unsafe_ptr()
-                var di = 0
-                while di < L:
-                    host_bases[base + di] = sp[di]
-                    di += 1
-                while di < max_len:
-                    host_bases[base + di] = 78
-                    di += 1
+                var ln = Int(host_lens[si])
+                if ln > 0:
+                    memcpy(
+                        dest=_u8_at(bases_addr + si * max_len),
+                        src=_u8_at(Int(seq_ap[si])),
+                        count=ln,
+                    )
                 si += 1
-
-            var dev_bases = ctx.enqueue_create_buffer[DType.uint8](n_bases)
-            var dev_codes = ctx.enqueue_create_buffer[DType.uint8](n_bases)
-            var dev_lens = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_rid = ctx.enqueue_create_buffer[DType.int32](n_seq)
-            var dev_pos = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_mapq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_flag = ctx.enqueue_create_buffer[DType.int32](n_seq)
-            var dev_sl = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_sr = ctx.enqueue_create_buffer[DType.uint32](n_seq)
-            var dev_nm = ctx.enqueue_create_buffer[DType.uint32](n_seq)
             ctx.enqueue_copy(src_buf=host_bases, dst_buf=dev_bases)
             ctx.enqueue_copy(src_buf=host_lens, dst_buf=dev_lens)
             var grid_b = (n_bases + BLOCK - 1) // BLOCK
@@ -1741,13 +2125,6 @@ def map_fastq_fm_gpu(
                     grid_dim=grid_p,
                     block_dim=BLOCK,
                 )
-            var host_rid = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
-            var host_pos = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var host_mapq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var host_flag = ctx.enqueue_create_host_buffer[DType.int32](n_seq)
-            var host_sl = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var host_sr = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-            var host_nm = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
             ctx.enqueue_copy(src_buf=dev_rid, dst_buf=host_rid)
             ctx.enqueue_copy(src_buf=dev_pos, dst_buf=host_pos)
             ctx.enqueue_copy(src_buf=dev_mapq, dst_buf=host_mapq)
@@ -1755,288 +2132,217 @@ def map_fastq_fm_gpu(
             ctx.enqueue_copy(src_buf=dev_sl, dst_buf=host_sl)
             ctx.enqueue_copy(src_buf=dev_sr, dst_buf=host_sr)
             ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
-            var next1 = List[FastqRec]()
-            var next2 = List[FastqRec]()
+
             var t_ov0 = time_mod.perf_counter()
-            _ = _py_batch_to_recs(
-                fq_reader.read_batch(batch_size), paired, next1, next2
-            )
+            var fut = fq_reader.read_batch_async(batch_size)
+            var t_emit_ov = time_mod.perf_counter() * 0
+            if have_ready:
+                var t_e0 = time_mod.perf_counter()
+                if emit_bam:
+                    _emit_bam_from_batch(
+                        py_ready,
+                        paired,
+                        n1_ready,
+                        Int(emit_rid.unsafe_ptr()),
+                        Int(emit_pos.unsafe_ptr()),
+                        Int(emit_mapq.unsafe_ptr()),
+                        Int(emit_flag.unsafe_ptr()),
+                        Int(emit_sl.unsafe_ptr()),
+                        Int(emit_sr.unsafe_ptr()),
+                        Int(emit_nm.unsafe_ptr()),
+                        Int(h_n1_name_a.unsafe_ptr()),
+                        Int(h_n1_name_n.unsafe_ptr()),
+                        Int(h_n1_orig_a.unsafe_ptr()),
+                        Int(h_n1_orig_n.unsafe_ptr()),
+                        Int(h_n1_qual_a.unsafe_ptr()),
+                        Int(h_n1_qual_n.unsafe_ptr()),
+                        Int(h_n2_name_a.unsafe_ptr()),
+                        Int(h_n2_name_n.unsafe_ptr()),
+                        Int(h_n2_orig_a.unsafe_ptr()),
+                        Int(h_n2_orig_n.unsafe_ptr()),
+                        Int(h_n2_qual_a.unsafe_ptr()),
+                        Int(h_n2_qual_n.unsafe_ptr()),
+                        bam_blob.unsafe_ptr(),
+                        bam_cap,
+                        bam_arena,
+                        rid_to_tid,
+                        rg_p,
+                        rg_n,
+                        Int(h_coord.unsafe_ptr()),
+                        Int(h_dhi.unsafe_ptr()),
+                        Int(h_dlo.unsafe_ptr()),
+                        Int(h_rec.unsafe_ptr()),
+                        Int(h_len.unsafe_ptr()),
+                        Int(h_score.unsafe_ptr()),
+                        Int(h_pair.unsafe_ptr()),
+                        n_reads,
+                        n_mapped,
+                        n_batches,
+                        meta_cap,
+                    )
+                else:
+                    var batch1 = List[FastqRec]()
+                    var batch2 = List[FastqRec]()
+                    _ = _py_batch_to_recs(py_ready, paired, batch1, batch2)
+                    var pj = 0
+                    while pj < n1_ready:
+                        var h1 = _hit_from_fm(
+                            index,
+                            batch1[pj].name,
+                            batch1[pj].seq,
+                            batch1[pj].original_seq,
+                            Int(emit_rid[pj]),
+                            Int(emit_pos[pj]),
+                            Int(emit_mapq[pj]),
+                            Int(emit_flag[pj]),
+                            Int(emit_sl[pj]),
+                            Int(emit_sr[pj]),
+                        )
+                        h1.qual = batch1[pj].qual
+                        if not paired:
+                            if h1.contig != "*":
+                                n_mapped += 1
+                            fh.write(_sam_with_rg_fm(h1) + "\n")
+                            n_reads += 1
+                        else:
+                            var r2i = n1_ready + pj
+                            var h2 = _hit_from_fm(
+                                index,
+                                batch2[pj].name,
+                                batch2[pj].seq,
+                                batch2[pj].original_seq,
+                                Int(emit_rid[r2i]),
+                                Int(emit_pos[r2i]),
+                                Int(emit_mapq[r2i]),
+                                Int(emit_flag[r2i]),
+                                Int(emit_sl[r2i]),
+                                Int(emit_sr[r2i]),
+                            )
+                            h2.qual = batch2[pj].qual
+                            var paired_hits = pair_hits(h1, h2)
+                            var p1 = paired_hits.r1.copy()
+                            var p2 = paired_hits.r2.copy()
+                            if p1.contig != "*":
+                                n_mapped += 1
+                            if p2.contig != "*":
+                                n_mapped += 1
+                            fh.write(_sam_with_rg_fm(p1) + "\n")
+                            fh.write(_sam_with_rg_fm(p2) + "\n")
+                            n_reads += 2
+                        pj += 1
+                t_emit_ov = time_mod.perf_counter() - t_e0
+                t_emit = t_emit + t_emit_ov
+                n_batches += 1
+                if n_batches == 1 or n_batches % 5 == 0:
+                    print(
+                        "MojoLinear GPU-fm progress batches=",
+                        n_batches,
+                        " gpu_reads≈",
+                        n_reads,
+                    )
+
+            var py_next = fut.result()
+            var n1_next = Int(py=py_next.n1)
             var t_overlap = time_mod.perf_counter() - t_ov0
-            t_fastq = t_fastq + t_overlap
+            var t_fq_part = t_overlap - t_emit_ov
+            if t_fq_part < 0:
+                t_fq_part = 0
+            t_fastq = t_fastq + t_fq_part
+
             ctx.synchronize()
             t_gpu = t_gpu + (time_mod.perf_counter() - t_g0) - t_overlap
+            _copy_bytes(
+                Int(emit_rid.unsafe_ptr()), Int(host_rid.unsafe_ptr()), n_seq * 4
+            )
+            _copy_bytes(
+                Int(emit_pos.unsafe_ptr()), Int(host_pos.unsafe_ptr()), n_seq * 4
+            )
+            _copy_bytes(
+                Int(emit_mapq.unsafe_ptr()),
+                Int(host_mapq.unsafe_ptr()),
+                n_seq * 4,
+            )
+            _copy_bytes(
+                Int(emit_flag.unsafe_ptr()),
+                Int(host_flag.unsafe_ptr()),
+                n_seq * 4,
+            )
+            _copy_bytes(
+                Int(emit_sl.unsafe_ptr()), Int(host_sl.unsafe_ptr()), n_seq * 4
+            )
+            _copy_bytes(
+                Int(emit_sr.unsafe_ptr()), Int(host_sr.unsafe_ptr()), n_seq * 4
+            )
+            _copy_bytes(
+                Int(emit_nm.unsafe_ptr()), Int(host_nm.unsafe_ptr()), n_seq * 4
+            )
+            py_ready = py_cur
+            n1_ready = n1_cur
+            have_ready = True
+            py_cur = py_next
+            n1_cur = n1_next
 
-            var t_e0 = time_mod.perf_counter()
-            var n1 = len(batch1)
+        if have_ready:
+            var t_e1 = time_mod.perf_counter()
             if emit_bam:
-                var bp = bam_blob.unsafe_ptr()
-                var off = 0
-                var rg_bytes = rg_s.as_bytes()
-                var rg_p = rg_bytes.unsafe_ptr()
-                var rg_n = rg_s.byte_length()
-                var pj = 0
-                while pj < n1:
-                    var rid1 = Int(host_rid[pj])
-                    var pos1 = Int(host_pos[pj])
-                    var mq1 = Int(host_mapq[pj])
-                    var fl1 = Int(host_flag[pj]) | 1 | 64
-                    var sl1 = Int(host_sl[pj])
-                    var sr1 = Int(host_sr[pj])
-                    var nm1 = Int(host_nm[pj])
-                    var tid1 = -1
-                    if rid1 >= 0 and rid1 < len(rid_to_tid):
-                        tid1 = rid_to_tid[rid1]
-                    else:
-                        fl1 = fl1 | 4
-                    var seq1 = batch1[pj].original_seq
-                    if seq1.byte_length() == 0:
-                        seq1 = batch1[pj].seq
-                    var q1 = batch1[pj].qual
-                    var q1n = q1.byte_length()
-                    if q1n == 1 and q1 == "*":
-                        q1n = 0
-                    if not paired:
-                        if n_reads >= meta_cap:
-                            raise Error(
-                                "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
-                            )
-                        var rec_start = off
-                        off = _pack_bam_aln(
-                            bp,
-                            off,
-                            bam_cap,
-                            batch1[pj].name.as_bytes().unsafe_ptr(),
-                            batch1[pj].name.byte_length(),
-                            fl1,
-                            tid1,
-                            pos1,
-                            mq1,
-                            sl1,
-                            sr1,
-                            seq1.as_bytes().unsafe_ptr(),
-                            seq1.byte_length(),
-                            q1.as_bytes().unsafe_ptr(),
-                            q1n,
-                            -1,
-                            -1,
-                            0,
-                            nm1,
-                            rg_p,
-                            rg_n,
-                        )
-                        h_coord[n_reads] = _coord_key(tid1, pos1, n_reads)
-                        if tid1 >= 0:
-                            h_dhi[n_reads] = _pack_end(
-                                tid1,
-                                _unclipped5(
-                                    fl1, pos1, sl1, sr1, seq1.byte_length()
-                                ),
-                                (fl1 >> 4) & 1,
-                            )
-                            h_dlo[n_reads] = 0
-                        else:
-                            h_dhi[n_reads] = ~UInt64(0)
-                            h_dlo[n_reads] = UInt64(n_reads)
-                        h_rec[n_reads] = (UInt64(n_batches) << 32) | UInt64(
-                            rec_start
-                        )
-                        h_len[n_reads] = UInt32(off - rec_start)
-                        var nm_c = nm1
-                        if nm_c < 0:
-                            nm_c = 0
-                        if nm_c > 255:
-                            nm_c = 255
-                        h_score[n_reads] = UInt32((mq1 << 8) | (255 - nm_c))
-                        h_pair[n_reads] = UInt32(n_reads)
-                        if tid1 >= 0:
-                            n_mapped += 1
-                        n_reads += 1
-                    else:
-                        var r2i = n1 + pj
-                        var rid2 = Int(host_rid[r2i])
-                        var pos2 = Int(host_pos[r2i])
-                        var mq2 = Int(host_mapq[r2i])
-                        var fl2 = Int(host_flag[r2i]) | 1 | 128
-                        var sl2 = Int(host_sl[r2i])
-                        var sr2 = Int(host_sr[r2i])
-                        var nm2 = Int(host_nm[r2i])
-                        var tid2 = -1
-                        if rid2 >= 0 and rid2 < len(rid_to_tid):
-                            tid2 = rid_to_tid[rid2]
-                        else:
-                            fl2 = fl2 | 4
-                        if tid1 < 0:
-                            fl2 = fl2 | 8
-                        if tid2 < 0:
-                            fl1 = fl1 | 8
-                        var ntid1 = -1
-                        var npos1 = -1
-                        var ntid2 = -1
-                        var npos2 = -1
-                        var tlen1 = 0
-                        var tlen2 = 0
-                        if tid1 >= 0 and tid2 >= 0 and tid1 == tid2:
-                            fl1 = fl1 | 2
-                            fl2 = fl2 | 2
-                            ntid1 = tid1
-                            ntid2 = tid2
-                            npos1 = pos2
-                            npos2 = pos1
-                            var tl = pos2 - pos1
-                            if tl < 0:
-                                tl = -tl
-                            tl = tl + batch2[pj].seq.byte_length()
-                            if pos1 <= pos2:
-                                tlen1 = tl
-                                tlen2 = -tl
-                            else:
-                                tlen1 = -tl
-                                tlen2 = tl
-                        else:
-                            if tid1 >= 0:
-                                ntid2 = tid1
-                                npos2 = pos1
-                            if tid2 >= 0:
-                                ntid1 = tid2
-                                npos1 = pos2
-                        var seq2 = batch2[pj].original_seq
-                        if seq2.byte_length() == 0:
-                            seq2 = batch2[pj].seq
-                        var q2 = batch2[pj].qual
-                        var q2n = q2.byte_length()
-                        if q2n == 1 and q2 == "*":
-                            q2n = 0
-                        if n_reads + 1 >= meta_cap:
-                            raise Error(
-                                "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
-                            )
-                        var rec_start1 = off
-                        off = _pack_bam_aln(
-                            bp,
-                            off,
-                            bam_cap,
-                            batch1[pj].name.as_bytes().unsafe_ptr(),
-                            batch1[pj].name.byte_length(),
-                            fl1,
-                            tid1,
-                            pos1,
-                            mq1,
-                            sl1,
-                            sr1,
-                            seq1.as_bytes().unsafe_ptr(),
-                            seq1.byte_length(),
-                            q1.as_bytes().unsafe_ptr(),
-                            q1n,
-                            ntid1,
-                            npos1,
-                            tlen1,
-                            nm1,
-                            rg_p,
-                            rg_n,
-                        )
-                        var rec_len1 = off - rec_start1
-                        var rec_start2 = off
-                        off = _pack_bam_aln(
-                            bp,
-                            off,
-                            bam_cap,
-                            batch2[pj].name.as_bytes().unsafe_ptr(),
-                            batch2[pj].name.byte_length(),
-                            fl2,
-                            tid2,
-                            pos2,
-                            mq2,
-                            sl2,
-                            sr2,
-                            seq2.as_bytes().unsafe_ptr(),
-                            seq2.byte_length(),
-                            q2.as_bytes().unsafe_ptr(),
-                            q2n,
-                            ntid2,
-                            npos2,
-                            tlen2,
-                            nm2,
-                            rg_p,
-                            rg_n,
-                        )
-                        var rec_len2 = off - rec_start2
-                        var i1 = n_reads
-                        var i2 = n_reads + 1
-                        var pid = UInt32(n_reads // 2)
-                        var nm_sum = nm1 + nm2
-                        if nm_sum < 0:
-                            nm_sum = 0
-                        if nm_sum > 255:
-                            nm_sum = 255
-                        var pscore = UInt32(((mq1 + mq2) << 8) | (255 - nm_sum))
-                        var dhi = ~UInt64(0)
-                        var dlo = UInt64(i1)
-                        if tid1 >= 0 or tid2 >= 0:
-                            var e1 = _pack_end(
-                                tid1,
-                                _unclipped5(
-                                    fl1, pos1, sl1, sr1, seq1.byte_length()
-                                ),
-                                (fl1 >> 4) & 1,
-                            )
-                            var e2 = _pack_end(
-                                tid2,
-                                _unclipped5(
-                                    fl2, pos2, sl2, sr2, seq2.byte_length()
-                                ),
-                                (fl2 >> 4) & 1,
-                            )
-                            if tid1 < 0:
-                                dhi = e2
-                                dlo = 0
-                            elif tid2 < 0:
-                                dhi = e1
-                                dlo = 0
-                            elif e1 <= e2:
-                                dhi = e1
-                                dlo = e2
-                            else:
-                                dhi = e2
-                                dlo = e1
-                        h_coord[i1] = _coord_key(tid1, pos1, i1)
-                        h_coord[i2] = _coord_key(tid2, pos2, i2)
-                        h_dhi[i1] = dhi
-                        h_dhi[i2] = dhi
-                        h_dlo[i1] = dlo
-                        h_dlo[i2] = dlo
-                        h_rec[i1] = (UInt64(n_batches) << 32) | UInt64(
-                            rec_start1
-                        )
-                        h_rec[i2] = (UInt64(n_batches) << 32) | UInt64(
-                            rec_start2
-                        )
-                        h_len[i1] = UInt32(rec_len1)
-                        h_len[i2] = UInt32(rec_len2)
-                        h_score[i1] = pscore
-                        h_score[i2] = pscore
-                        h_pair[i1] = pid
-                        h_pair[i2] = pid
-                        if tid1 >= 0:
-                            n_mapped += 1
-                        if tid2 >= 0:
-                            n_mapped += 1
-                        n_reads += 2
-                    pj += 1
-                _ = bam_arena.append_raw(Int(bp), off)
+                _emit_bam_from_batch(
+                    py_ready,
+                    paired,
+                    n1_ready,
+                    Int(emit_rid.unsafe_ptr()),
+                    Int(emit_pos.unsafe_ptr()),
+                    Int(emit_mapq.unsafe_ptr()),
+                    Int(emit_flag.unsafe_ptr()),
+                    Int(emit_sl.unsafe_ptr()),
+                    Int(emit_sr.unsafe_ptr()),
+                    Int(emit_nm.unsafe_ptr()),
+                    Int(h_n1_name_a.unsafe_ptr()),
+                    Int(h_n1_name_n.unsafe_ptr()),
+                    Int(h_n1_orig_a.unsafe_ptr()),
+                    Int(h_n1_orig_n.unsafe_ptr()),
+                    Int(h_n1_qual_a.unsafe_ptr()),
+                    Int(h_n1_qual_n.unsafe_ptr()),
+                    Int(h_n2_name_a.unsafe_ptr()),
+                    Int(h_n2_name_n.unsafe_ptr()),
+                    Int(h_n2_orig_a.unsafe_ptr()),
+                    Int(h_n2_orig_n.unsafe_ptr()),
+                    Int(h_n2_qual_a.unsafe_ptr()),
+                    Int(h_n2_qual_n.unsafe_ptr()),
+                    bam_blob.unsafe_ptr(),
+                    bam_cap,
+                    bam_arena,
+                    rid_to_tid,
+                    rg_p,
+                    rg_n,
+                    Int(h_coord.unsafe_ptr()),
+                    Int(h_dhi.unsafe_ptr()),
+                    Int(h_dlo.unsafe_ptr()),
+                    Int(h_rec.unsafe_ptr()),
+                    Int(h_len.unsafe_ptr()),
+                    Int(h_score.unsafe_ptr()),
+                    Int(h_pair.unsafe_ptr()),
+                    n_reads,
+                    n_mapped,
+                    n_batches,
+                    meta_cap,
+                )
             else:
+                var batch1 = List[FastqRec]()
+                var batch2 = List[FastqRec]()
+                _ = _py_batch_to_recs(py_ready, paired, batch1, batch2)
                 var pj = 0
-                while pj < n1:
+                while pj < n1_ready:
                     var h1 = _hit_from_fm(
                         index,
                         batch1[pj].name,
                         batch1[pj].seq,
                         batch1[pj].original_seq,
-                        Int(host_rid[pj]),
-                        Int(host_pos[pj]),
-                        Int(host_mapq[pj]),
-                        Int(host_flag[pj]),
-                        Int(host_sl[pj]),
-                        Int(host_sr[pj]),
+                        Int(emit_rid[pj]),
+                        Int(emit_pos[pj]),
+                        Int(emit_mapq[pj]),
+                        Int(emit_flag[pj]),
+                        Int(emit_sl[pj]),
+                        Int(emit_sr[pj]),
                     )
                     h1.qual = batch1[pj].qual
                     if not paired:
@@ -2045,18 +2351,18 @@ def map_fastq_fm_gpu(
                         fh.write(_sam_with_rg_fm(h1) + "\n")
                         n_reads += 1
                     else:
-                        var r2i = n1 + pj
+                        var r2i = n1_ready + pj
                         var h2 = _hit_from_fm(
                             index,
                             batch2[pj].name,
                             batch2[pj].seq,
                             batch2[pj].original_seq,
-                            Int(host_rid[r2i]),
-                            Int(host_pos[r2i]),
-                            Int(host_mapq[r2i]),
-                            Int(host_flag[r2i]),
-                            Int(host_sl[r2i]),
-                            Int(host_sr[r2i]),
+                            Int(emit_rid[r2i]),
+                            Int(emit_pos[r2i]),
+                            Int(emit_mapq[r2i]),
+                            Int(emit_flag[r2i]),
+                            Int(emit_sl[r2i]),
+                            Int(emit_sr[r2i]),
                         )
                         h2.qual = batch2[pj].qual
                         var paired_hits = pair_hits(h1, h2)
@@ -2070,8 +2376,7 @@ def map_fastq_fm_gpu(
                         fh.write(_sam_with_rg_fm(p2) + "\n")
                         n_reads += 2
                     pj += 1
-            t_emit = t_emit + (time_mod.perf_counter() - t_e0)
-
+            t_emit = t_emit + (time_mod.perf_counter() - t_e1)
             n_batches += 1
             if n_batches == 1 or n_batches % 5 == 0:
                 print(
@@ -2080,8 +2385,6 @@ def map_fastq_fm_gpu(
                     " gpu_reads≈",
                     n_reads,
                 )
-            batch1 = next1^
-            batch2 = next2^
 
         fq_reader.close()
         var t_sort = time_mod.perf_counter() * 0
