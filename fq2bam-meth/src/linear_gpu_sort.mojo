@@ -1,12 +1,23 @@
 # GPU coordinate sort + Picard-style PE markdup for native FM BAM.
 #
-# LSD 8-bit radix on 64-bit (or 128-bit) keys. Each GPU thread owns 256
-# records so histogram/scatter stays stable without atomics. Markdup is a
-# segmented scan: group-start threads walk the equal-key run and flag every
-# record whose pair_id is not the best in that run.
+# LSD 8-bit radix on 64-bit keys, tiled so device working set is O(tile) not
+# O(n). Default tile = n (one shot, same as before). METHYLGRAPHER_FM_SORT_TILE
+# forces smaller tiles; host k-way merge reconstructs global order. Markdup is
+# a host scan on the merged dup-key order (same rule as the old GPU kernel).
 
-from std.sys import has_accelerator
+from std.collections import List
 from std.memory import UnsafePointer, memcpy
+from std.python import Python
+from std.sys import has_accelerator
+
+
+def _sort_tile_size(n: Int) raises -> Int:
+    var os_mod = Python.import_module("os")
+    var raw = String(os_mod.environ.get("METHYLGRAPHER_FM_SORT_TILE", "0"))
+    var t = Int(raw)
+    if t < 1 or t >= n:
+        return n
+    return t
 
 
 def gpu_sort_markdup(
@@ -32,7 +43,7 @@ def gpu_sort_markdup(
         raise Error("gpu_sort_markdup requires accelerator build")
     else:
         from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
+        from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
         comptime RADIX_R = 256
         comptime BINS = 256
@@ -44,13 +55,6 @@ def gpu_sort_markdup(
             var i = Int(block_idx.x * block_dim.x + thread_idx.x)
             if i < n0:
                 idx[i] = UInt32(i)
-
-        def zero_u32_kernel(
-            p: UnsafePointer[UInt32, MutAnyOrigin], n0: Int
-        ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
-            if i < n0:
-                p[i] = 0
 
         def hist_kernel(
             keys: UnsafePointer[UInt64, MutAnyOrigin],
@@ -73,7 +77,7 @@ def gpu_sort_markdup(
                 end = n0
             var i = start
             while i < end:
-                var digit = Int((keys[i] >> UInt64(shift)) & 255)
+                var digit = Int((keys[i] >> shift) & 255)
                 hist[base + digit] = hist[base + digit] + 1
                 i += 1
 
@@ -130,7 +134,7 @@ def gpu_sort_markdup(
                 end = n0
             var i = start
             while i < end:
-                var digit = Int((keys_in[i] >> UInt64(shift)) & 255)
+                var digit = Int((keys_in[i] >> shift) & 255)
                 var pos = Int(offsets[t * BINS + digit] + local[digit])
                 local[digit] = local[digit] + 1
                 keys_out[pos] = keys_in[i]
@@ -147,70 +151,91 @@ def gpu_sort_markdup(
             if i < n0:
                 dst[i] = src[Int(perm[i])]
 
-        def gather_u32_kernel(
-            src: UnsafePointer[UInt32, MutAnyOrigin],
-            perm: UnsafePointer[UInt32, MutAnyOrigin],
-            dst: UnsafePointer[UInt32, MutAnyOrigin],
-            n0: Int,
-        ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
-            if i < n0:
-                dst[i] = src[Int(perm[i])]
+        def radix8(
+            ctx: DeviceContext,
+            mut ka: DeviceBuffer[DType.uint64],
+            mut kb: DeviceBuffer[DType.uint64],
+            mut ia: DeviceBuffer[DType.uint32],
+            mut ib: DeviceBuffer[DType.uint32],
+            mut hist: DeviceBuffer[DType.uint32],
+            mut offb: DeviceBuffer[DType.uint32],
+            mut tot: DeviceBuffer[DType.uint32],
+            mut h_tot: HostBuffer[DType.uint32],
+            mut h_base: HostBuffer[DType.uint32],
+            n_t: Int,
+        ) raises:
+            var n_threads = (n_t + RADIX_R - 1) // RADIX_R
+            var grid_t = (n_threads + BLOCK - 1) // BLOCK
+            var p = 0
+            while p < 8:
+                var shift = p * 8
+                var keys_in = ka.unsafe_ptr()
+                var keys_out = kb.unsafe_ptr()
+                var idx_in = ia.unsafe_ptr()
+                var idx_out = ib.unsafe_ptr()
+                if (p & 1) == 1:
+                    keys_in = kb.unsafe_ptr()
+                    keys_out = ka.unsafe_ptr()
+                    idx_in = ib.unsafe_ptr()
+                    idx_out = ia.unsafe_ptr()
+                ctx.enqueue_function[hist_kernel](
+                    keys_in,
+                    n_t,
+                    shift,
+                    n_threads,
+                    hist.unsafe_ptr(),
+                    grid_dim=grid_t,
+                    block_dim=BLOCK,
+                )
+                ctx.enqueue_function[col_sum_kernel](
+                    hist.unsafe_ptr(),
+                    n_threads,
+                    tot.unsafe_ptr(),
+                    grid_dim=1,
+                    block_dim=BINS,
+                )
+                ctx.enqueue_copy(src_buf=tot, dst_buf=h_tot)
+                ctx.synchronize()
+                var run: UInt32 = 0
+                var d = 0
+                while d < BINS:
+                    h_base[d] = run
+                    run = run + h_tot[d]
+                    d += 1
+                ctx.enqueue_copy(src_buf=h_base, dst_buf=tot)
+                ctx.enqueue_function[scan_hist_kernel](
+                    hist.unsafe_ptr(),
+                    n_threads,
+                    tot.unsafe_ptr(),
+                    offb.unsafe_ptr(),
+                    grid_dim=1,
+                    block_dim=BINS,
+                )
+                ctx.enqueue_function[scatter_kernel](
+                    keys_in,
+                    idx_in,
+                    keys_out,
+                    idx_out,
+                    n_t,
+                    shift,
+                    n_threads,
+                    offb.unsafe_ptr(),
+                    grid_dim=grid_t,
+                    block_dim=BLOCK,
+                )
+                p += 1
 
-        def scatter_u32_kernel(
-            src: UnsafePointer[UInt32, MutAnyOrigin],
-            perm: UnsafePointer[UInt32, MutAnyOrigin],
-            dst: UnsafePointer[UInt32, MutAnyOrigin],
-            n0: Int,
-        ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
-            if i < n0:
-                dst[Int(perm[i])] = src[i]
-
-        def markdup_kernel(
-            key_hi: UnsafePointer[UInt64, MutAnyOrigin],
-            key_lo: UnsafePointer[UInt64, MutAnyOrigin],
-            scores: UnsafePointer[UInt32, MutAnyOrigin],
-            pair_ids: UnsafePointer[UInt32, MutAnyOrigin],
-            n0: Int,
-            is_dup: UnsafePointer[UInt32, MutAnyOrigin],
-        ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
-            if i >= n0:
-                return
-            var sentinel = ~UInt64(0)
-            if i > 0:
-                if key_hi[i] == key_hi[i - 1] and key_lo[i] == key_lo[i - 1]:
-                    return
-            if key_hi[i] == sentinel:
-                is_dup[i] = 0
-                return
-            var best_pair = pair_ids[i]
-            var best_score = scores[i]
-            var j = i
-            while j < n0:
-                if key_hi[j] != key_hi[i] or key_lo[j] != key_lo[i]:
-                    break
-                var sc = scores[j]
-                var pid = pair_ids[j]
-                if sc > best_score or (sc == best_score and pid < best_pair):
-                    best_score = sc
-                    best_pair = pid
-                j += 1
-            var k = i
-            while k < j:
-                if pair_ids[k] != best_pair:
-                    is_dup[k] = 1
-                else:
-                    is_dup[k] = 0
-                k += 1
-
+        var tile = _sort_tile_size(n)
+        var n_tiles = (n + tile - 1) // tile
+        print(
+            "MojoLinear GPU-fm sort n=",
+            n,
+            " tile=",
+            tile,
+            " tiles=",
+            n_tiles,
+        )
         var ctx = DeviceContext(api=api)
-        var n_threads = (n + RADIX_R - 1) // RADIX_R
-        var hist_n = n_threads * BINS
-        var grid_n = (n + BLOCK - 1) // BLOCK
-        var grid_t = (n_threads + BLOCK - 1) // BLOCK
-
         var h_coord = ctx.enqueue_create_host_buffer[DType.uint64](n)
         var h_dhi = ctx.enqueue_create_host_buffer[DType.uint64](n)
         var h_dlo = ctx.enqueue_create_host_buffer[DType.uint64](n)
@@ -252,293 +277,230 @@ def gpu_sort_markdup(
             count=n,
         )
 
-        var d_key_a = ctx.enqueue_create_buffer[DType.uint64](n)
-        var d_key_b = ctx.enqueue_create_buffer[DType.uint64](n)
-        var d_idx_a = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_idx_b = ctx.enqueue_create_buffer[DType.uint32](n)
+        var hist_n = ((tile + RADIX_R - 1) // RADIX_R) * BINS
+        var d_key_a = ctx.enqueue_create_buffer[DType.uint64](tile)
+        var d_key_b = ctx.enqueue_create_buffer[DType.uint64](tile)
+        var d_idx_a = ctx.enqueue_create_buffer[DType.uint32](tile)
+        var d_idx_b = ctx.enqueue_create_buffer[DType.uint32](tile)
         var d_hist = ctx.enqueue_create_buffer[DType.uint32](hist_n)
         var d_off = ctx.enqueue_create_buffer[DType.uint32](hist_n)
         var d_tot = ctx.enqueue_create_buffer[DType.uint32](BINS)
+        var d_hi_src = ctx.enqueue_create_buffer[DType.uint64](tile)
         var h_tot = ctx.enqueue_create_host_buffer[DType.uint32](BINS)
         var h_base = ctx.enqueue_create_host_buffer[DType.uint32](BINS)
+        var h_tile_key = ctx.enqueue_create_host_buffer[DType.uint64](tile)
+        var h_tile_hi = ctx.enqueue_create_host_buffer[DType.uint64](tile)
+        var h_tile_idx = ctx.enqueue_create_host_buffer[DType.uint32](tile)
+        var run_orig = ctx.enqueue_create_host_buffer[DType.uint32](n)
+        var tlen = List[Int](length=n_tiles, fill=0)
+        var ti = 0
+        while ti < n_tiles:
+            var b = ti * tile
+            var nt = tile
+            if b + nt > n:
+                nt = n - b
+            tlen[ti] = nt
+            ti += 1
 
-        # --- dup-key sort (LSD lo then hi) + markdup ---
-        ctx.enqueue_copy(src_buf=h_dlo, dst_buf=d_key_a)
-        ctx.enqueue_function[init_idx_kernel](
-            d_idx_a.unsafe_ptr(),
-            n,
-            grid_dim=grid_n,
-            block_dim=BLOCK,
-        )
-        var p = 0
-        while p < 8:
-            var shift = p * 8
-            var keys_in = d_key_a.unsafe_ptr()
-            var keys_out = d_key_b.unsafe_ptr()
-            var idx_in = d_idx_a.unsafe_ptr()
-            var idx_out = d_idx_b.unsafe_ptr()
-            if (p & 1) == 1:
-                keys_in = d_key_b.unsafe_ptr()
-                keys_out = d_key_a.unsafe_ptr()
-                idx_in = d_idx_b.unsafe_ptr()
-                idx_out = d_idx_a.unsafe_ptr()
-            ctx.enqueue_function[hist_kernel](
-                keys_in,
-                n,
-                shift,
-                n_threads,
-                d_hist.unsafe_ptr(),
-                grid_dim=grid_t,
-                block_dim=BLOCK,
+        var t = 0
+        while t < n_tiles:
+            var base = t * tile
+            var n_t = tlen[t]
+            var grid_n = (n_t + BLOCK - 1) // BLOCK
+            memcpy(
+                dest=h_tile_key.unsafe_ptr(),
+                src=h_dlo.unsafe_ptr() + base,
+                count=n_t,
             )
-            ctx.enqueue_function[col_sum_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
-            )
-            ctx.enqueue_copy(src_buf=d_tot, dst_buf=h_tot)
-            ctx.synchronize()
-            var run: UInt32 = 0
-            var d = 0
-            while d < BINS:
-                h_base[d] = run
-                run = run + h_tot[d]
-                d += 1
-            ctx.enqueue_copy(src_buf=h_base, dst_buf=d_tot)
-            ctx.enqueue_function[scan_hist_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                d_off.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
-            )
-            ctx.enqueue_function[scatter_kernel](
-                keys_in,
-                idx_in,
-                keys_out,
-                idx_out,
-                n,
-                shift,
-                n_threads,
-                d_off.unsafe_ptr(),
-                grid_dim=grid_t,
-                block_dim=BLOCK,
-            )
-            p += 1
-        # After 8 passes last odd → idx in d_idx_a. Permute dup_hi by that perm,
-        # then radix-sort hi (stable wrt previous lo order via carrying idx).
-        var d_hi_src = ctx.enqueue_create_buffer[DType.uint64](n)
-        ctx.enqueue_copy(src_buf=h_dhi, dst_buf=d_hi_src)
-        ctx.enqueue_function[permute_u64_kernel](
-            d_hi_src.unsafe_ptr(),
-            d_idx_a.unsafe_ptr(),
-            d_key_a.unsafe_ptr(),
-            n,
-            grid_dim=grid_n,
-            block_dim=BLOCK,
-        )
-        p = 0
-        while p < 8:
-            var shift2 = p * 8
-            var keys_in2 = d_key_a.unsafe_ptr()
-            var keys_out2 = d_key_b.unsafe_ptr()
-            var idx_in2 = d_idx_a.unsafe_ptr()
-            var idx_out2 = d_idx_b.unsafe_ptr()
-            if (p & 1) == 1:
-                keys_in2 = d_key_b.unsafe_ptr()
-                keys_out2 = d_key_a.unsafe_ptr()
-                idx_in2 = d_idx_b.unsafe_ptr()
-                idx_out2 = d_idx_a.unsafe_ptr()
-            ctx.enqueue_function[hist_kernel](
-                keys_in2,
-                n,
-                shift2,
-                n_threads,
-                d_hist.unsafe_ptr(),
-                grid_dim=grid_t,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[col_sum_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
-            )
-            ctx.enqueue_copy(src_buf=d_tot, dst_buf=h_tot)
-            ctx.synchronize()
-            var run2: UInt32 = 0
-            var d2 = 0
-            while d2 < BINS:
-                h_base[d2] = run2
-                run2 = run2 + h_tot[d2]
-                d2 += 1
-            ctx.enqueue_copy(src_buf=h_base, dst_buf=d_tot)
-            ctx.enqueue_function[scan_hist_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                d_off.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
-            )
-            ctx.enqueue_function[scatter_kernel](
-                keys_in2,
-                idx_in2,
-                keys_out2,
-                idx_out2,
-                n,
-                shift2,
-                n_threads,
-                d_off.unsafe_ptr(),
-                grid_dim=grid_t,
-                block_dim=BLOCK,
-            )
-            p += 1
-        # idx in d_idx_a is original-index perm sorted by (dup_hi, dup_lo).
-        var d_score = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_pair = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_score_s = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_pair_s = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_dup_s = ctx.enqueue_create_buffer[DType.uint32](n)
-        var d_dup = ctx.enqueue_create_buffer[DType.uint32](n)
-        ctx.enqueue_copy(src_buf=h_score, dst_buf=d_score)
-        ctx.enqueue_copy(src_buf=h_pair, dst_buf=d_pair)
-        ctx.enqueue_function[zero_u32_kernel](
-            d_dup.unsafe_ptr(),
-            n,
-            grid_dim=grid_n,
-            block_dim=BLOCK,
-        )
-        if do_markdup:
-            ctx.enqueue_function[gather_u32_kernel](
-                d_score.unsafe_ptr(),
+            ctx.enqueue_copy(src_buf=h_tile_key, dst_buf=d_key_a)
+            ctx.enqueue_function[init_idx_kernel](
                 d_idx_a.unsafe_ptr(),
-                d_score_s.unsafe_ptr(),
-                n,
+                n_t,
                 grid_dim=grid_n,
                 block_dim=BLOCK,
             )
-            ctx.enqueue_function[gather_u32_kernel](
-                d_pair.unsafe_ptr(),
-                d_idx_a.unsafe_ptr(),
-                d_pair_s.unsafe_ptr(),
-                n,
-                grid_dim=grid_n,
-                block_dim=BLOCK,
+            radix8(
+                ctx,
+                d_key_a,
+                d_key_b,
+                d_idx_a,
+                d_idx_b,
+                d_hist,
+                d_off,
+                d_tot,
+                h_tot,
+                h_base,
+                n_t,
             )
-            # Sorted dup_hi is in d_key_a. Need sorted dup_lo too.
-            var d_lo_src = ctx.enqueue_create_buffer[DType.uint64](n)
-            var d_lo_s = ctx.enqueue_create_buffer[DType.uint64](n)
-            ctx.enqueue_copy(src_buf=h_dlo, dst_buf=d_lo_src)
+            memcpy(
+                dest=h_tile_hi.unsafe_ptr(),
+                src=h_dhi.unsafe_ptr() + base,
+                count=n_t,
+            )
+            ctx.enqueue_copy(src_buf=h_tile_hi, dst_buf=d_hi_src)
             ctx.enqueue_function[permute_u64_kernel](
-                d_lo_src.unsafe_ptr(),
+                d_hi_src.unsafe_ptr(),
                 d_idx_a.unsafe_ptr(),
-                d_lo_s.unsafe_ptr(),
-                n,
-                grid_dim=grid_n,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[zero_u32_kernel](
-                d_dup_s.unsafe_ptr(),
-                n,
-                grid_dim=grid_n,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[markdup_kernel](
                 d_key_a.unsafe_ptr(),
-                d_lo_s.unsafe_ptr(),
-                d_score_s.unsafe_ptr(),
-                d_pair_s.unsafe_ptr(),
-                n,
-                d_dup_s.unsafe_ptr(),
+                n_t,
                 grid_dim=grid_n,
                 block_dim=BLOCK,
             )
-            ctx.enqueue_function[scatter_u32_kernel](
-                d_dup_s.unsafe_ptr(),
-                d_idx_a.unsafe_ptr(),
-                d_dup.unsafe_ptr(),
-                n,
-                grid_dim=grid_n,
-                block_dim=BLOCK,
+            radix8(
+                ctx,
+                d_key_a,
+                d_key_b,
+                d_idx_a,
+                d_idx_b,
+                d_hist,
+                d_off,
+                d_tot,
+                h_tot,
+                h_base,
+                n_t,
             )
-
-        # --- coordinate sort ---
-        ctx.enqueue_copy(src_buf=h_coord, dst_buf=d_key_a)
-        ctx.enqueue_function[init_idx_kernel](
-            d_idx_a.unsafe_ptr(),
-            n,
-            grid_dim=grid_n,
-            block_dim=BLOCK,
-        )
-        p = 0
-        while p < 8:
-            var shift3 = p * 8
-            var keys_in3 = d_key_a.unsafe_ptr()
-            var keys_out3 = d_key_b.unsafe_ptr()
-            var idx_in3 = d_idx_a.unsafe_ptr()
-            var idx_out3 = d_idx_b.unsafe_ptr()
-            if (p & 1) == 1:
-                keys_in3 = d_key_b.unsafe_ptr()
-                keys_out3 = d_key_a.unsafe_ptr()
-                idx_in3 = d_idx_b.unsafe_ptr()
-                idx_out3 = d_idx_a.unsafe_ptr()
-            ctx.enqueue_function[hist_kernel](
-                keys_in3,
-                n,
-                shift3,
-                n_threads,
-                d_hist.unsafe_ptr(),
-                grid_dim=grid_t,
-                block_dim=BLOCK,
-            )
-            ctx.enqueue_function[col_sum_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
-            )
-            ctx.enqueue_copy(src_buf=d_tot, dst_buf=h_tot)
+            ctx.enqueue_copy(src_buf=d_idx_a, dst_buf=h_tile_idx)
             ctx.synchronize()
-            var run3: UInt32 = 0
-            var d3 = 0
-            while d3 < BINS:
-                h_base[d3] = run3
-                run3 = run3 + h_tot[d3]
-                d3 += 1
-            ctx.enqueue_copy(src_buf=h_base, dst_buf=d_tot)
-            ctx.enqueue_function[scan_hist_kernel](
-                d_hist.unsafe_ptr(),
-                n_threads,
-                d_tot.unsafe_ptr(),
-                d_off.unsafe_ptr(),
-                grid_dim=1,
-                block_dim=BINS,
+            var i = 0
+            while i < n_t:
+                var loc = Int(h_tile_idx[i])
+                run_orig[base + i] = UInt32(base + loc)
+                i += 1
+            t += 1
+
+        var h_dup = ctx.enqueue_create_host_buffer[DType.uint32](n)
+        var zi = 0
+        while zi < n:
+            h_dup[zi] = 0
+            zi += 1
+        if do_markdup:
+            var merged = ctx.enqueue_create_host_buffer[DType.uint32](n)
+            var head = List[Int](length=n_tiles, fill=0)
+            var out_i = 0
+            while out_i < n:
+                var best = -1
+                var t2 = 0
+                while t2 < n_tiles:
+                    if head[t2] < tlen[t2]:
+                        var o = Int(run_orig[t2 * tile + head[t2]])
+                        if best < 0:
+                            best = t2
+                        else:
+                            var bo = Int(run_orig[best * tile + head[best]])
+                            var hi = h_dhi[o]
+                            var bhi = h_dhi[bo]
+                            var lo = h_dlo[o]
+                            var blo = h_dlo[bo]
+                            var take = False
+                            if hi < bhi:
+                                take = True
+                            elif hi == bhi:
+                                if lo < blo:
+                                    take = True
+                                elif lo == blo and o < bo:
+                                    take = True
+                            if take:
+                                best = t2
+                    t2 += 1
+                merged[out_i] = run_orig[best * tile + head[best]]
+                head[best] = head[best] + 1
+                out_i += 1
+            var sentinel = ~UInt64(0)
+            var gi = 0
+            while gi < n:
+                var o0 = Int(merged[gi])
+                if h_dhi[o0] == sentinel:
+                    h_dup[o0] = 0
+                    gi += 1
+                    continue
+                var gj = gi + 1
+                while gj < n:
+                    var oj = Int(merged[gj])
+                    if h_dhi[oj] != h_dhi[o0] or h_dlo[oj] != h_dlo[o0]:
+                        break
+                    gj += 1
+                var best_pair = h_pair[o0]
+                var best_score = h_score[o0]
+                var gk = gi
+                while gk < gj:
+                    var ok = Int(merged[gk])
+                    var sc = h_score[ok]
+                    var pid = h_pair[ok]
+                    if sc > best_score or (sc == best_score and pid < best_pair):
+                        best_score = sc
+                        best_pair = pid
+                    gk += 1
+                gk = gi
+                while gk < gj:
+                    var ok2 = Int(merged[gk])
+                    if h_pair[ok2] != best_pair:
+                        h_dup[ok2] = 1
+                    else:
+                        h_dup[ok2] = 0
+                    gk += 1
+                gi = gj
+
+        t = 0
+        while t < n_tiles:
+            var base2 = t * tile
+            var n_t2 = tlen[t]
+            var grid_n2 = (n_t2 + BLOCK - 1) // BLOCK
+            memcpy(
+                dest=h_tile_key.unsafe_ptr(),
+                src=h_coord.unsafe_ptr() + base2,
+                count=n_t2,
             )
-            ctx.enqueue_function[scatter_kernel](
-                keys_in3,
-                idx_in3,
-                keys_out3,
-                idx_out3,
-                n,
-                shift3,
-                n_threads,
-                d_off.unsafe_ptr(),
-                grid_dim=grid_t,
+            ctx.enqueue_copy(src_buf=h_tile_key, dst_buf=d_key_a)
+            ctx.enqueue_function[init_idx_kernel](
+                d_idx_a.unsafe_ptr(),
+                n_t2,
+                grid_dim=grid_n2,
                 block_dim=BLOCK,
             )
-            p += 1
+            radix8(
+                ctx,
+                d_key_a,
+                d_key_b,
+                d_idx_a,
+                d_idx_b,
+                d_hist,
+                d_off,
+                d_tot,
+                h_tot,
+                h_base,
+                n_t2,
+            )
+            ctx.enqueue_copy(src_buf=d_idx_a, dst_buf=h_tile_idx)
+            ctx.synchronize()
+            var j = 0
+            while j < n_t2:
+                var loc2 = Int(h_tile_idx[j])
+                run_orig[base2 + j] = UInt32(base2 + loc2)
+                j += 1
+            t += 1
 
         var h_perm = ctx.enqueue_create_host_buffer[DType.uint32](n)
-        var h_dup = ctx.enqueue_create_host_buffer[DType.uint32](n)
-        ctx.enqueue_copy(src_buf=d_idx_a, dst_buf=h_perm)
-        ctx.enqueue_copy(src_buf=d_dup, dst_buf=h_dup)
-        ctx.synchronize()
+        var headc = List[Int](length=n_tiles, fill=0)
+        var out_c = 0
+        while out_c < n:
+            var bestc = -1
+            var t3 = 0
+            while t3 < n_tiles:
+                if headc[t3] < tlen[t3]:
+                    var oc = Int(run_orig[t3 * tile + headc[t3]])
+                    if bestc < 0:
+                        bestc = t3
+                    else:
+                        var boc = Int(run_orig[bestc * tile + headc[bestc]])
+                        var ck = h_coord[oc]
+                        var bck = h_coord[boc]
+                        if ck < bck or (ck == bck and oc < boc):
+                            bestc = t3
+                t3 += 1
+            h_perm[out_c] = run_orig[bestc * tile + headc[bestc]]
+            headc[bestc] = headc[bestc] + 1
+            out_c += 1
+
         memcpy(
             dest=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=perm_addr
