@@ -63,7 +63,8 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 | `METHYLGRAPHER_FM_RESCUE_WIN` | 512 | Mate-rescue window (bp) when exactly one end mapped |
 | `METHYLGRAPHER_BAM_LEVEL` | 1 | BGZF level for native BAM emit |
 | `METHYLGRAPHER_BAM_THREADS` | 32 | Parallel BGZF deflate workers |
-| `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for GPU sort/markdup host tables |
+| `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for GPU sort/markdup host tables (tile size later; still a hard cap) |
+| `METHYLGRAPHER_BAM_ARENA_DIR` | `{work}/bam_arena` | SSD mmap for uncompressed BAM chunks (`ram` to keep in memory) |
 | `METHYLGRAPHER_LINEAR_MARKDUP` | 1 | GPU (fm) / samtools (parity) duplicate marking |
 
 ### Speed knobs

@@ -7,9 +7,11 @@ flag 0x10 reverse-complements SEQ and QUAL.
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
 import struct
 import zlib
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Sequence
 
@@ -186,24 +188,67 @@ class BamArena:
 
     Each ``append_raw`` stores one mapper batch as a chunk. After mapping,
     Mojo gathers records by ``(chunk_id, local_off)`` into coordinate order.
+
+    Set ``spill_dir`` or ``METHYLGRAPHER_BAM_ARENA_DIR`` to mmap chunks on
+    SSD (30×-scale). ``ram`` / ``off`` / empty keeps the in-memory path.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, spill_dir: str | os.PathLike[str] | None = None) -> None:
+        raw = (
+            str(spill_dir)
+            if spill_dir is not None
+            else os.environ.get("METHYLGRAPHER_BAM_ARENA_DIR", "")
+        )
+        self._spill: Path | None = None
+        if raw and raw.strip().lower() not in {"", "ram", "0", "false", "off", "none"}:
+            self._spill = Path(raw)
+            self._spill.mkdir(parents=True, exist_ok=True)
         self._chunks: list[bytearray] = []
+        self._maps: list[mmap.mmap | None] = []
+        self._headers: list[object | None] = []
+        self._lens: list[int] = []
         self._n = 0
         self._sorted = bytearray()
         self._sorted_hdr = None
 
     def append_raw(self, addr: int, n: int) -> int:
         """Copy ``n`` bytes at ``addr``; return the new chunk index."""
-        if n <= 0:
-            self._chunks.append(bytearray())
+        n = int(n)
+        if self._spill is None:
+            if n <= 0:
+                self._chunks.append(bytearray())
+                self._lens.append(0)
+                return len(self._chunks) - 1
+            self._chunks.append(bytearray(ctypes.string_at(int(addr), n)))
+            self._lens.append(n)
+            self._n += n
             return len(self._chunks) - 1
-        self._chunks.append(bytearray(ctypes.string_at(int(addr), int(n))))
-        self._n += int(n)
-        return len(self._chunks) - 1
+        idx = len(self._lens)
+        path = self._spill / f"chunk_{idx:06d}.bin"
+        if n <= 0:
+            path.write_bytes(b"")
+            self._maps.append(None)
+            self._headers.append(None)
+            self._lens.append(0)
+            return idx
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.ftruncate(fd, n)
+            mm = mmap.mmap(fd, n)
+        finally:
+            os.close(fd)
+        hdr = (ctypes.c_char * n).from_buffer(mm)
+        ctypes.memmove(ctypes.addressof(hdr), int(addr), n)
+        mm.flush()
+        self._maps.append(mm)
+        self._headers.append(hdr)
+        self._lens.append(n)
+        self._n += n
+        return idx
 
     def n_chunks(self) -> int:
+        if self._spill is not None:
+            return len(self._lens)
         return len(self._chunks)
 
     def nbytes(self) -> int:
@@ -221,14 +266,22 @@ class BamArena:
         return ctypes.addressof(self._sorted_hdr)
 
     def chunk_addr(self, i: int) -> int:
-        c = self._chunks[int(i)]
+        i = int(i)
+        if self._spill is not None:
+            if self._lens[i] <= 0:
+                return 0
+            return ctypes.addressof(self._headers[i])
+        c = self._chunks[i]
         if not c:
             return 0
         buf = (ctypes.c_char * len(c)).from_buffer(c)
         return ctypes.addressof(buf)
 
     def chunk_len(self, i: int) -> int:
-        return len(self._chunks[int(i)])
+        i = int(i)
+        if self._spill is not None:
+            return self._lens[i]
+        return len(self._chunks[i])
 
 
 class BamWriter:

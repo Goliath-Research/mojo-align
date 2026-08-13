@@ -79,3 +79,18 @@ def test_bam_arena_chunks():
     assert arena.chunk_len(0) == 5
     assert arena.nbytes() == 5
     assert ctypes.string_at(arena.chunk_addr(0), 5) == b"defgh"
+
+
+def test_bam_arena_spill_mmap(tmp_path: Path):
+    payload = bytearray(b"spillok")
+    buf = (ctypes.c_char * 7).from_buffer(payload)
+    arena = BamArena(spill_dir=tmp_path)
+    idx = arena.append_raw(ctypes.addressof(buf), 7)
+    assert idx == 0
+    assert (tmp_path / "chunk_000000.bin").is_file()
+    assert arena.chunk_len(0) == 7
+    assert ctypes.string_at(arena.chunk_addr(0), 7) == b"spillok"
+    empty = arena.append_raw(0, 0)
+    assert empty == 1
+    assert arena.chunk_len(1) == 0
+    assert arena.n_chunks() == 2

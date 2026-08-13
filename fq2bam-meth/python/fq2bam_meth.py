@@ -430,6 +430,10 @@ def run_mojo_linear_map(
         env = os.environ.copy()
         py = str(root / "fq2bam-meth" / "python")
         env["PYTHONPATH"] = py + os.pathsep + env.get("PYTHONPATH", "")
+        if not env.get("METHYLGRAPHER_BAM_ARENA_DIR"):
+            arena = log.parent / "bam_arena"
+            arena.mkdir(parents=True, exist_ok=True)
+            env["METHYLGRAPHER_BAM_ARENA_DIR"] = str(arena)
         proc = subprocess.Popen(
             cmd,
             cwd=str(root),
