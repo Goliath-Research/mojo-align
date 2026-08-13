@@ -14,6 +14,7 @@ from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
 from linear_extend import hit_to_sam_line, pair_hits, LinearHit
 from linear_fm_index import FmIndex, fm_prefix_from_ref
+from linear_gpu_sort import gpu_sort_markdup
 from linear_gpu_locate import (
     FastqRec,
     _canonical_contig,
@@ -101,8 +102,74 @@ def _open_bam_writer(
     var pl = _env_str("METHYLGRAPHER_RG_PL", "ILLUMINA")
     var level = _env_int("METHYLGRAPHER_BAM_LEVEL", 1)
     return bam_mod.BamWriter(
-        path, sq_names, sq_lens, rg, sm, lb, pl, "0.1.0-mojo-fm", level
+        path,
+        sq_names,
+        sq_lens,
+        rg,
+        sm,
+        lb,
+        pl,
+        "0.1.0-mojo-fm",
+        level,
+        "coordinate",
     )
+
+
+def _open_bam_arena() raises -> PythonObject:
+    var bam_mod = Python.import_module("bam_emit")
+    return bam_mod.BamArena()
+
+
+def _unclipped5(flag: Int, pos0: Int, sl: Int, sr: Int, qlen: Int) -> Int:
+    if (flag & 4) != 0 or qlen <= 0:
+        return 0
+    var slv = sl
+    var srv = sr
+    if slv < 0:
+        slv = 0
+    if srv < 0:
+        srv = 0
+    if slv + srv >= qlen:
+        slv = 0
+        srv = 0
+    var mid = qlen - slv - srv
+    if (flag & 16) != 0:
+        return pos0 + mid + slv - 1
+    return pos0 - slv
+
+
+def _coord_key(tid: Int, pos0: Int, orig: Int) -> UInt64:
+    if tid < 0:
+        return (UInt64(4294967295) << 32) | (UInt64(orig) & 4294967295)
+    var p = pos0
+    if p < 0:
+        p = 0
+    return (UInt64(tid) << 32) | UInt64(p)
+
+
+def _pack_end(tid: Int, u5: Int, strand: Int) -> UInt64:
+    var t = 0
+    if tid >= 0:
+        t = tid + 1
+    var u = u5 + 1073741824
+    if u < 0:
+        u = 0
+    return (UInt64(t) << 48) | (UInt64(strand & 1) << 47) | (UInt64(u) & 140737488355327)
+
+
+def _or_dup_flag(p: UnsafePointer[UInt8, MutAnyOrigin], rec_off: Int):
+    var b0 = Int(p[rec_off + 16])
+    var b1 = Int(p[rec_off + 17])
+    var b2 = Int(p[rec_off + 18])
+    var b3 = Int(p[rec_off + 19])
+    var flag_nc = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    var flag = (flag_nc >> 16) | 1024
+    var nc = flag_nc & 65535
+    var v = (flag << 16) | nc
+    p[rec_off + 16] = UInt8(v & 255)
+    p[rec_off + 17] = UInt8((v >> 8) & 255)
+    p[rec_off + 18] = UInt8((v >> 16) & 255)
+    p[rec_off + 19] = UInt8((v >> 24) & 255)
 
 
 def _rid_to_tid_table(index: FmIndex) raises -> List[Int]:
@@ -159,15 +226,6 @@ def _nt16_comp(b: UInt8) -> UInt8:
     if b == 4:
         return 2
     return 15
-    if b == 65 or b == 97:
-        return 1
-    if b == 67 or b == 99:
-        return 2
-    if b == 71 or b == 103:
-        return 4
-    if b == 84 or b == 116:
-        return 8
-    return 15
 
 
 def _reg2bin(beg: Int, end: Int) -> Int:
@@ -192,25 +250,26 @@ def _pack_bam_aln(
     p: UnsafePointer[UInt8, MutAnyOrigin],
     off0: Int,
     cap: Int,
-    name: String,
+    name: UnsafePointer[UInt8, ...],
+    name_len: Int,
     flag: Int,
     tid: Int,
     pos0: Int,
     mapq: Int,
     sl: Int,
     sr: Int,
-    seq_in: String,
-    qual_in: String,
+    seq: UnsafePointer[UInt8, ...],
+    qlen: Int,
+    qual: UnsafePointer[UInt8, ...],
+    qual_len: Int,
     ntid: Int,
     npos: Int,
     tlen: Int,
     nm: Int,
-    rg: String,
+    rg: UnsafePointer[UInt8, ...],
+    rg_n: Int,
 ) raises -> Int:
-    var seq = seq_in
-    var qual = qual_in
     var rev = (flag & 16) != 0
-    var qlen = seq.byte_length()
     var slv = sl
     var srv = sr
     if slv < 0:
@@ -233,9 +292,8 @@ def _pack_bam_aln(
             n_cigar += 1
         if srv > 0:
             n_cigar += 1
-    var l_qname = name.byte_length() + 1
+    var l_qname = name_len + 1
     var seq_packed_n = (qlen + 1) // 2
-    var rg_n = rg.byte_length()
     var tags_n = 3 + rg_n + 1 + 4
     var block = 32 + l_qname + 4 * n_cigar + seq_packed_n + qlen + tags_n
     var need = off0 + 4 + block
@@ -276,8 +334,8 @@ def _pack_bam_aln(
     _put_i32(p, off0 + 32, tlen)
     var off = off0 + 36
     var ni = 0
-    while ni < name.byte_length():
-        p[off + ni] = UInt8(ord(name[byte = ni : ni + 1]))
+    while ni < name_len:
+        p[off + ni] = name[ni]
         ni += 1
     p[off + ni] = 0
     off += l_qname
@@ -298,8 +356,8 @@ def _pack_bam_aln(
         if rev:
             ia = qlen - 1 - si
             ib = qlen - 2 - si
-        var a = _nt16(UInt8(ord(seq[byte = ia : ia + 1])))
-        var b = _nt16(UInt8(ord(seq[byte = ib : ib + 1])))
+        var a = _nt16(seq[ia])
+        var b = _nt16(seq[ib])
         if rev:
             a = _nt16_comp(a)
             b = _nt16_comp(b)
@@ -310,18 +368,18 @@ def _pack_bam_aln(
         var ic = si
         if rev:
             ic = 0
-        var c = _nt16(UInt8(ord(seq[byte = ic : ic + 1])))
+        var c = _nt16(seq[ic])
         if rev:
             c = _nt16_comp(c)
         p[off] = c << 4
         off += 1
     var qi2 = 0
-    if qual.byte_length() == qlen and qual != "*":
+    if qual_len == qlen:
         while qi2 < qlen:
             var srcq = qi2
             if rev:
                 srcq = qlen - 1 - qi2
-            var qb2 = UInt8(ord(qual[byte = srcq : srcq + 1]))
+            var qb2 = qual[srcq]
             if qb2 >= 33:
                 p[off + qi2] = qb2 - 33
             else:
@@ -332,19 +390,19 @@ def _pack_bam_aln(
             p[off + qi2] = 255
             qi2 += 1
     off += qlen
-    p[off] = 82  # R
-    p[off + 1] = 71  # G
-    p[off + 2] = 90  # Z
+    p[off] = 82
+    p[off + 1] = 71
+    p[off + 2] = 90
     off += 3
     var ri = 0
     while ri < rg_n:
-        p[off + ri] = UInt8(ord(rg[byte = ri : ri + 1]))
+        p[off + ri] = rg[ri]
         ri += 1
     p[off + rg_n] = 0
     off += rg_n + 1
-    p[off] = 78  # N
-    p[off + 1] = 77  # M
-    p[off + 2] = 67  # C
+    p[off] = 78
+    p[off + 1] = 77
+    p[off + 2] = 67
     var nmv = nm
     if nmv < 0:
         nmv = 0
@@ -1469,10 +1527,41 @@ def map_fastq_fm_gpu(
 
         var fh = Python.none()
         var bam_w = Python.none()
+        var bam_arena = Python.none()
         var rid_to_tid = List[Int]()
+        var bam_cap = 1
+        var bam_blob = ctx.enqueue_create_host_buffer[DType.uint8](1)
+        var rg_s = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+        var meta_cap = 1
+        if emit_bam:
+            meta_cap = _env_int("METHYLGRAPHER_FM_SORT_CAP", 67108864)
+        var h_coord = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
+        var h_dhi = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
+        var h_dlo = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
+        var h_rec = ctx.enqueue_create_host_buffer[DType.uint64](meta_cap)
+        var h_len = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var h_score = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var h_pair = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var h_perm = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var h_dup = ctx.enqueue_create_host_buffer[DType.uint32](meta_cap)
+        var md_raw = _env_str("METHYLGRAPHER_LINEAR_MARKDUP", "1").lower()
+        var do_markdup = True
+        if md_raw == "0" or md_raw == "false" or md_raw == "no" or md_raw == "off":
+            do_markdup = False
         if emit_bam:
             bam_w = _open_bam_writer(index, out_sam)
+            bam_arena = _open_bam_arena()
             rid_to_tid = _rid_to_tid_table(index)
+            bam_cap = batch_size * 2 * 512
+            if bam_cap < 1 << 20:
+                bam_cap = 1 << 20
+            bam_blob = ctx.enqueue_create_host_buffer[DType.uint8](bam_cap)
+            print(
+                "MojoLinear GPU-fm native BAM coordinate-sort cap=",
+                meta_cap,
+                " markdup=",
+                do_markdup,
+            )
         else:
             fh = open_text_write(out_sam)
             _write_sam_header_fm(fh, index)
@@ -1634,16 +1723,11 @@ def map_fastq_fm_gpu(
             var t_e0 = time_mod.perf_counter()
             var n1 = len(batch1)
             if emit_bam:
-                var recs = n1
-                if paired:
-                    recs = n1 * 2
-                var cap = recs * (192 + 2 * 160)
-                if cap < 4096:
-                    cap = 4096
-                var blob = ctx.enqueue_create_host_buffer[DType.uint8](cap)
-                var bp = blob.unsafe_ptr()
+                var bp = bam_blob.unsafe_ptr()
                 var off = 0
-                var rg = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
+                var rg_bytes = rg_s.as_bytes()
+                var rg_p = rg_bytes.unsafe_ptr()
+                var rg_n = rg_s.byte_length()
                 var pj = 0
                 while pj < n1:
                     var rid1 = Int(host_rid[pj])
@@ -1661,26 +1745,63 @@ def map_fastq_fm_gpu(
                     var seq1 = batch1[pj].original_seq
                     if seq1.byte_length() == 0:
                         seq1 = batch1[pj].seq
+                    var q1 = batch1[pj].qual
+                    var q1n = q1.byte_length()
+                    if q1n == 1 and q1 == "*":
+                        q1n = 0
                     if not paired:
+                        if n_reads >= meta_cap:
+                            raise Error(
+                                "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
+                            )
+                        var rec_start = off
                         off = _pack_bam_aln(
                             bp,
                             off,
-                            cap,
-                            batch1[pj].name,
+                            bam_cap,
+                            batch1[pj].name.as_bytes().unsafe_ptr(),
+                            batch1[pj].name.byte_length(),
                             fl1,
                             tid1,
                             pos1,
                             mq1,
                             sl1,
                             sr1,
-                            seq1,
-                            batch1[pj].qual,
+                            seq1.as_bytes().unsafe_ptr(),
+                            seq1.byte_length(),
+                            q1.as_bytes().unsafe_ptr(),
+                            q1n,
                             -1,
                             -1,
                             0,
                             nm1,
-                            rg,
+                            rg_p,
+                            rg_n,
                         )
+                        h_coord[n_reads] = _coord_key(tid1, pos1, n_reads)
+                        if tid1 >= 0:
+                            h_dhi[n_reads] = _pack_end(
+                                tid1,
+                                _unclipped5(
+                                    fl1, pos1, sl1, sr1, seq1.byte_length()
+                                ),
+                                (fl1 >> 4) & 1,
+                            )
+                            h_dlo[n_reads] = 0
+                        else:
+                            h_dhi[n_reads] = ~UInt64(0)
+                            h_dlo[n_reads] = UInt64(n_reads)
+                        h_rec[n_reads] = (UInt64(n_batches) << 32) | UInt64(
+                            rec_start
+                        )
+                        h_len[n_reads] = UInt32(off - rec_start)
+                        var nm_c = nm1
+                        if nm_c < 0:
+                            nm_c = 0
+                        if nm_c > 255:
+                            nm_c = 255
+                        h_score[n_reads] = UInt32((mq1 << 8) | (255 - nm_c))
+                        h_pair[n_reads] = UInt32(n_reads)
                         if tid1 >= 0:
                             n_mapped += 1
                         n_reads += 1
@@ -1735,51 +1856,127 @@ def map_fastq_fm_gpu(
                         var seq2 = batch2[pj].original_seq
                         if seq2.byte_length() == 0:
                             seq2 = batch2[pj].seq
+                        var q2 = batch2[pj].qual
+                        var q2n = q2.byte_length()
+                        if q2n == 1 and q2 == "*":
+                            q2n = 0
+                        if n_reads + 1 >= meta_cap:
+                            raise Error(
+                                "FM sort cap exceeded; set METHYLGRAPHER_FM_SORT_CAP"
+                            )
+                        var rec_start1 = off
                         off = _pack_bam_aln(
                             bp,
                             off,
-                            cap,
-                            batch1[pj].name,
+                            bam_cap,
+                            batch1[pj].name.as_bytes().unsafe_ptr(),
+                            batch1[pj].name.byte_length(),
                             fl1,
                             tid1,
                             pos1,
                             mq1,
                             sl1,
                             sr1,
-                            seq1,
-                            batch1[pj].qual,
+                            seq1.as_bytes().unsafe_ptr(),
+                            seq1.byte_length(),
+                            q1.as_bytes().unsafe_ptr(),
+                            q1n,
                             ntid1,
                             npos1,
                             tlen1,
                             nm1,
-                            rg,
+                            rg_p,
+                            rg_n,
                         )
+                        var rec_len1 = off - rec_start1
+                        var rec_start2 = off
                         off = _pack_bam_aln(
                             bp,
                             off,
-                            cap,
-                            batch2[pj].name,
+                            bam_cap,
+                            batch2[pj].name.as_bytes().unsafe_ptr(),
+                            batch2[pj].name.byte_length(),
                             fl2,
                             tid2,
                             pos2,
                             mq2,
                             sl2,
                             sr2,
-                            seq2,
-                            batch2[pj].qual,
+                            seq2.as_bytes().unsafe_ptr(),
+                            seq2.byte_length(),
+                            q2.as_bytes().unsafe_ptr(),
+                            q2n,
                             ntid2,
                             npos2,
                             tlen2,
                             nm2,
-                            rg,
+                            rg_p,
+                            rg_n,
                         )
+                        var rec_len2 = off - rec_start2
+                        var i1 = n_reads
+                        var i2 = n_reads + 1
+                        var pid = UInt32(n_reads // 2)
+                        var nm_sum = nm1 + nm2
+                        if nm_sum < 0:
+                            nm_sum = 0
+                        if nm_sum > 255:
+                            nm_sum = 255
+                        var pscore = UInt32(((mq1 + mq2) << 8) | (255 - nm_sum))
+                        var dhi = ~UInt64(0)
+                        var dlo = UInt64(i1)
+                        if tid1 >= 0 or tid2 >= 0:
+                            var e1 = _pack_end(
+                                tid1,
+                                _unclipped5(
+                                    fl1, pos1, sl1, sr1, seq1.byte_length()
+                                ),
+                                (fl1 >> 4) & 1,
+                            )
+                            var e2 = _pack_end(
+                                tid2,
+                                _unclipped5(
+                                    fl2, pos2, sl2, sr2, seq2.byte_length()
+                                ),
+                                (fl2 >> 4) & 1,
+                            )
+                            if tid1 < 0:
+                                dhi = e2
+                                dlo = 0
+                            elif tid2 < 0:
+                                dhi = e1
+                                dlo = 0
+                            elif e1 <= e2:
+                                dhi = e1
+                                dlo = e2
+                            else:
+                                dhi = e2
+                                dlo = e1
+                        h_coord[i1] = _coord_key(tid1, pos1, i1)
+                        h_coord[i2] = _coord_key(tid2, pos2, i2)
+                        h_dhi[i1] = dhi
+                        h_dhi[i2] = dhi
+                        h_dlo[i1] = dlo
+                        h_dlo[i2] = dlo
+                        h_rec[i1] = (UInt64(n_batches) << 32) | UInt64(
+                            rec_start1
+                        )
+                        h_rec[i2] = (UInt64(n_batches) << 32) | UInt64(
+                            rec_start2
+                        )
+                        h_len[i1] = UInt32(rec_len1)
+                        h_len[i2] = UInt32(rec_len2)
+                        h_score[i1] = pscore
+                        h_score[i2] = pscore
+                        h_pair[i1] = pid
+                        h_pair[i2] = pid
                         if tid1 >= 0:
                             n_mapped += 1
                         if tid2 >= 0:
                             n_mapped += 1
                         n_reads += 2
                     pj += 1
-                bam_w.write_raw(Int(bp), off)
+                _ = bam_arena.append_raw(Int(bp), off)
             else:
                 var pj = 0
                 while pj < n1:
@@ -1844,8 +2041,69 @@ def map_fastq_fm_gpu(
         fh1.close()
         if paired:
             fh2.close()
+        var t_sort = time_mod.perf_counter() * 0
         if emit_bam:
+            var t_s0 = time_mod.perf_counter()
+            if n_reads > 0:
+                gpu_sort_markdup(
+                    api,
+                    n_reads,
+                    Int(h_coord.unsafe_ptr()),
+                    Int(h_dhi.unsafe_ptr()),
+                    Int(h_dlo.unsafe_ptr()),
+                    Int(h_score.unsafe_ptr()),
+                    Int(h_pair.unsafe_ptr()),
+                    Int(h_dup.unsafe_ptr()),
+                    Int(h_perm.unsafe_ptr()),
+                    do_markdup,
+                )
+            t_sort = time_mod.perf_counter() - t_s0
+            var t_g0s = time_mod.perf_counter()
+            var n_chunks = Int(py=bam_arena.n_chunks())
+            var chunk_addrs = List[Int]()
+            var cii = 0
+            while cii < n_chunks:
+                chunk_addrs.append(Int(py=bam_arena.chunk_addr(cii)))
+                cii += 1
+            var gout = 0
+            var gi = 0
+            var bp_out = bam_blob.unsafe_ptr()
+            while gi < n_reads:
+                var orig = Int(h_perm[gi])
+                var packed = h_rec[orig]
+                var cid = Int(packed >> 32)
+                var loc = Int(packed & 4294967295)
+                var rlen = Int(h_len[orig])
+                if gout + rlen > bam_cap:
+                    bam_w.write_raw(Int(bp_out), gout)
+                    gout = 0
+                if rlen > bam_cap:
+                    raise Error("BAM record larger than batch buffer")
+                var src = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=chunk_addrs[cid] + loc
+                )
+                var dst = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=Int(bp_out) + gout
+                )
+                memcpy(dest=dst, src=src, count=rlen)
+                if Int(h_dup[orig]) != 0:
+                    _or_dup_flag(bp_out, gout)
+                gout += rlen
+                gi += 1
+            if gout > 0:
+                bam_w.write_raw(Int(bp_out), gout)
             bam_w.close()
+            t_emit = t_emit + (time_mod.perf_counter() - t_g0s)
+            print(
+                "MojoLinear GPU-fm sort_markdup_s=",
+                t_sort,
+                " gather_bgzf_s=",
+                time_mod.perf_counter() - t_g0s,
+                " arena_bytes=",
+                Int(py=bam_arena.nbytes()),
+                " dups_marked=",
+                do_markdup,
+            )
         else:
             fh.close()
         var t_map1 = time_mod.perf_counter()
@@ -1865,6 +2123,8 @@ def map_fastq_fm_gpu(
             t_gpu,
             " emit_s=",
             t_emit,
+            " sort_s=",
+            t_sort,
             " reads=",
             n_reads,
         )

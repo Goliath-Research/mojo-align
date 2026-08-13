@@ -1,9 +1,10 @@
 """MojoFq2bamMeth — portable linear WGBS Align (Clara fq2bam_meth substitute).
 
 Directional C↔T / G↔A conversion + **Mojo linear GPU mapper** (NVIDIA / AMD)
-against a C2T-converted reference, then samtools sort + index. Emits a
-Parabricks-shaped metrics JSON subset and qc-metrics directory consumed by
-methyl_alignment_qc.
+against a C2T-converted reference. Parity/speed engines finish with samtools
+fixmate/sort/markdup; the FM engine writes a GPU coordinate-sorted,
+dup-marked BAM and only indexes. Emits a Parabricks-shaped metrics JSON
+subset and qc-metrics directory consumed by methyl_alignment_qc.
 
 Mapper selection (``METHYLGRAPHER_LINEAR_MAPPER``):
 
@@ -420,7 +421,9 @@ def run_mojo_linear_map(
         handle.write("COMMAND: " + " ".join(cmd) + "\n")
         handle.write("LINEAR_ENGINE: " + resolve_linear_engine() + "\n")
         if native_bam:
-            handle.write(f"NATIVE_BAM: {out_bam} (Mojo BGZF, no SAM)\n")
+            handle.write(
+                f"NATIVE_BAM: {out_bam} (Mojo BGZF, GPU sort+markdup, no SAM)\n"
+            )
         elif out_bam is not None:
             handle.write(f"STREAM_BAM: {out_bam} (no on-disk SAM)\n")
         handle.flush()
@@ -645,52 +648,65 @@ def run_mojo_fq2bam_meth(
         used_mapper = "bwa"
 
     out_bam.parent.mkdir(parents=True, exist_ok=True)
-    # GATK4 / Picard expect coordinate-sorted BAMs with consistent mates.
-    # fixmate -m fills MC/ms so markdup (and ValidateSamFile) can run.
-    bam_fixmate = work / "aligned.fixmate.bam"
-    bam_sorted = work / "aligned.sorted.bam"
-    st = max(1, threads)
-    _run(
-        [samtools, "fixmate", "-@", str(st), "-m", str(bam_unsorted), str(bam_fixmate)],
-        log,
+    fm_gpu_sorted = (
+        used_mapper == "mojo" and resolve_linear_engine() == "fm"
     )
-    _run(
-        [
-            samtools,
-            "sort",
-            "-@",
-            str(st),
-            "-m",
-            "2G",
-            "-l",
-            "1",
-            "-o",
-            str(bam_sorted),
-            str(bam_fixmate),
-        ],
-        log,
-    )
-    markdup_on = os.environ.get("METHYLGRAPHER_LINEAR_MARKDUP", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    if markdup_on:
+    if fm_gpu_sorted:
+        # Mojo wrote coordinate-sorted, dup-marked BGZF BAM.
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "POST: gpu-sort+markdup (skip samtools fixmate/sort/markdup)\n"
+            )
+        if bam_unsorted.resolve() != out_bam.resolve():
+            shutil.move(str(bam_unsorted), str(out_bam))
+        _run([samtools, "index", str(out_bam)], log)
+    else:
+        # GATK4 / Picard expect coordinate-sorted BAMs with consistent mates.
+        # fixmate -m fills MC/ms so markdup (and ValidateSamFile) can run.
+        bam_fixmate = work / "aligned.fixmate.bam"
+        bam_sorted = work / "aligned.sorted.bam"
+        st = max(1, threads)
+        _run(
+            [samtools, "fixmate", "-@", str(st), "-m", str(bam_unsorted), str(bam_fixmate)],
+            log,
+        )
         _run(
             [
                 samtools,
-                "markdup",
+                "sort",
                 "-@",
                 str(st),
+                "-m",
+                "2G",
+                "-l",
+                "1",
+                "-o",
                 str(bam_sorted),
-                str(out_bam),
+                str(bam_fixmate),
             ],
             log,
         )
-    else:
-        shutil.copy2(bam_sorted, out_bam)
-    _run([samtools, "index", str(out_bam)], log)
+        markdup_on = os.environ.get("METHYLGRAPHER_LINEAR_MARKDUP", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if markdup_on:
+            _run(
+                [
+                    samtools,
+                    "markdup",
+                    "-@",
+                    str(st),
+                    str(bam_sorted),
+                    str(out_bam),
+                ],
+                log,
+            )
+        else:
+            shutil.copy2(bam_sorted, out_bam)
+        _run([samtools, "index", str(out_bam)], log)
 
     fs = subprocess.run(
         [samtools, "flagstat", str(out_bam)], capture_output=True, text=True, check=False

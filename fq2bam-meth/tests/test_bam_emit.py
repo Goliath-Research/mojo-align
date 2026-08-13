@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from bam_emit import BamWriter, _pack_seq, _reg2bin
+from bam_emit import BamArena, BamWriter, _pack_seq, _reg2bin
 
 
 def test_pack_seq_and_bin():
@@ -19,7 +20,9 @@ def test_pack_seq_and_bin():
 @pytest.mark.skipif(shutil.which("samtools") is None, reason="samtools required")
 def test_bam_writer_roundtrip(tmp_path: Path):
     bam = tmp_path / "t.bam"
-    w = BamWriter(str(bam), ["chr1"], [1000], rg_id="mojo1", level=1)
+    w = BamWriter(
+        str(bam), ["chr1"], [1000], rg_id="mojo1", level=1, sort_order="coordinate"
+    )
     w.write_batch(
         qnames=["r1", "r1"],
         flags=[99, 147],
@@ -43,6 +46,7 @@ def test_bam_writer_roundtrip(tmp_path: Path):
         text=True,
     )
     text = view.stdout
+    assert "@HD\tVN:1.6\tSO:coordinate" in text
     assert "@SQ\tSN:chr1\tLN:1000" in text
     assert "@RG\tID:mojo1" in text
     lines = [ln for ln in text.splitlines() if not ln.startswith("@")]
@@ -63,3 +67,15 @@ def test_bam_writer_roundtrip(tmp_path: Path):
         text=True,
     )
     assert "2 + 0 mapped" in fs.stdout
+
+
+def test_bam_arena_chunks():
+    payload = bytearray(b"defgh")
+    buf = (ctypes.c_char * 5).from_buffer(payload)
+    arena = BamArena()
+    idx = arena.append_raw(ctypes.addressof(buf), 5)
+    assert idx == 0
+    assert arena.n_chunks() == 1
+    assert arena.chunk_len(0) == 5
+    assert arena.nbytes() == 5
+    assert ctypes.string_at(arena.chunk_addr(0), 5) == b"defgh"

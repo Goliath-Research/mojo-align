@@ -115,8 +115,45 @@ class _BgzfWriter:
         self._fh.close()
 
 
+class BamArena:
+    """Uncompressed BAM alignment blocks (no BGZF) for GPU sort/permute.
+
+    Each ``append_raw`` stores one mapper batch as a chunk. After mapping,
+    Mojo gathers records by ``(chunk_id, local_off)`` into coordinate order.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[bytearray] = []
+        self._n = 0
+
+    def append_raw(self, addr: int, n: int) -> int:
+        """Copy ``n`` bytes at ``addr``; return the new chunk index."""
+        if n <= 0:
+            self._chunks.append(bytearray())
+            return len(self._chunks) - 1
+        self._chunks.append(bytearray(ctypes.string_at(int(addr), int(n))))
+        self._n += int(n)
+        return len(self._chunks) - 1
+
+    def n_chunks(self) -> int:
+        return len(self._chunks)
+
+    def nbytes(self) -> int:
+        return self._n
+
+    def chunk_addr(self, i: int) -> int:
+        c = self._chunks[int(i)]
+        if not c:
+            return 0
+        buf = (ctypes.c_char * len(c)).from_buffer(c)
+        return ctypes.addressof(buf)
+
+    def chunk_len(self, i: int) -> int:
+        return len(self._chunks[int(i)])
+
+
 class BamWriter:
-    """Stream query-grouped BAM records to ``path`` (BGZF)."""
+    """Stream BAM records to ``path`` (BGZF)."""
 
     def __init__(
         self,
@@ -129,12 +166,19 @@ class BamWriter:
         pl: str = "ILLUMINA",
         pg_vn: str = "0.1.0-mojo-fm",
         level: int = 1,
+        sort_order: str = "unsorted",
     ) -> None:
         if len(sq_names) != len(sq_lens):
             raise ValueError("sq_names/sq_lens length mismatch")
+        so = sort_order if sort_order in {
+            "unsorted",
+            "coordinate",
+            "queryname",
+            "unknown",
+        } else "unsorted"
         self._rg = rg_id.encode("ascii")
         self._bgzf = _BgzfWriter(path, level=level)
-        hd = ["@HD\tVN:1.6\tSO:unsorted"]
+        hd = [f"@HD\tVN:1.6\tSO:{so}"]
         for name, ln in zip(sq_names, sq_lens):
             hd.append(f"@SQ\tSN:{name}\tLN:{ln}")
         hd.append(f"@RG\tID:{rg_id}\tSM:{sm}\tLB:{lb}\tPL:{pl}\tPU:{rg_id}")

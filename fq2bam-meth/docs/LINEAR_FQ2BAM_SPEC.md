@@ -8,14 +8,16 @@ from dual-graph `Align` / MojoGiraffe (GAF → MethylCall).
 
 ## Pipeline
 
-1. **Python orchestrator** ([`engine/fq2bam_meth.py`](../engine/fq2bam_meth.py)): directional convert (R1 C→T, R2 G→A; reference C→T), mapper select, `samtools` sort/index, Parabricks-shaped QC JSON.
+1. **Python orchestrator** ([`python/fq2bam_meth.py`](../python/fq2bam_meth.py)): directional convert (R1 C→T, R2 G→A; reference C→T), mapper select, postprocess, Parabricks-shaped QC JSON.
 2. **Native Mojo linear mapper** ([`src/linear_mapper.mojo`](../src/linear_mapper.mojo)):
    - Streaming FASTQ batches (`METHYLGRAPHER_LINEAR_READ_BATCH`, default **16384**) — never full production FASTQ as Mojo rows
    - Fleet dense-v1 mmap pack (`kmers.bin` / `offsets.bin` / `postings.bin`) via `linear_index`; in-memory Dict only for tiny fixtures
    - Optional fused BS convert (`-bs_r1 C2T` / `-bs_r2 G2A`) in the mapper
    - Portable GPU/host seeds (`linear_gpu_kernels`) **wired into** `extend_read_with_seeds` (not discarded warmup)
    - Gapless extend + PE SAM flags
-3. Stream SAM through a FIFO into `samtools view -u` (on-disk artifact is **BAM**, never `.sam`), then `fixmate` / `sort -l 1` / `markdup` / `index`.
+3. **Postprocess**
+   - **fm**: native BGZF BAM, GPU coordinate sort + pair markdup, `samtools index` only
+   - **parity/speed**: stream SAM through a FIFO into `samtools view -u`, then `fixmate` / `sort -l 1` / `markdup` / `index`
 
 Mapping is **native Mojo** (index + seed → extend), not a BWA wrap.
 

@@ -120,7 +120,8 @@ python3 fq2bam-meth/scripts/compare_gatk_picard_metrics.py \
 Requires `gatk` on PATH or `GATK_JAR` / `PICARD_JAR`. Gates include
 `ValidateSamFile`, alignment summary `% aligned`, insert-size metrics, and
 flagstat mapped/proper-pair deltas. Mojo BAMs emit `@RG`, restore
-pre-conversion SEQ, and run `samtools fixmate -m` → `sort` → `markdup`.
+pre-conversion SEQ. Parity/speed run `samtools fixmate -m` → `sort` → `markdup`;
+FM GPU-sorts and markdups in the mapper.
 
 ## Local smoke (no Clara sample / no GPU)
 
