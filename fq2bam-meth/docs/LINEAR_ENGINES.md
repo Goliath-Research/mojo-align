@@ -64,7 +64,7 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 | `METHYLGRAPHER_BAM_LEVEL` | 1 | BGZF level for native BAM emit |
 | `METHYLGRAPHER_BAM_THREADS` | 32 | Parallel BGZF deflate workers |
 | `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for GPU sort/markdup host tables (still a hard cap; 53M fits, ~800M 30× does not) |
-| `METHYLGRAPHER_FM_SORT_TILE` | 0 (one tile = n) | GPU radix working set in records. `0` / unset / `≥ n` = one shot. Smaller tiles (e.g. `65536` on 100k, `1048576` on the full sample) keep device buffers O(tile); host k-way merge rebuilds global order. Markdup is the same Picard-style scan on the merged dup-key order. |
+| `METHYLGRAPHER_FM_SORT_TILE` | 0 (one tile = n) | GPU radix working set in records. `0` / unset / `≥ n` = one shot. Smaller tiles (e.g. `65536` on 100k, `1048576` on the full sample) keep device buffers O(tile); host **min-heap** k-way merge rebuilds global order in O(n log n_tiles). Markdup is the same Picard-style scan on the merged dup-key order. |
 | `METHYLGRAPHER_BAM_ARENA_DIR` | `{work}/bam_arena` | SSD mmap for uncompressed BAM chunks (`ram` to keep in memory) |
 | `METHYLGRAPHER_LINEAR_MARKDUP` | 1 | GPU (fm) / samtools (parity) duplicate marking |
 
