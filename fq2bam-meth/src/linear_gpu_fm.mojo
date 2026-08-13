@@ -20,8 +20,6 @@ from linear_gpu_locate import (
     _canonical_contig,
     _env_int,
     _env_str,
-    _open_fastq,
-    _read_pe_batch,
     _require_hbm,
 )
 from utility import open_text_write, reverse_complement
@@ -113,6 +111,45 @@ def _open_bam_writer(
         level,
         "coordinate",
     )
+
+
+def _open_fq_reader(
+    fq1: String, fq2: String, bs_r1: String, bs_r2: String
+) raises -> PythonObject:
+    var mod = Python.import_module("fastq_batch")
+    return mod.FastqPairReader(fq1, fq2, bs_r1, bs_r2)
+
+
+def _py_batch_to_recs(
+    b: PythonObject,
+    paired: Bool,
+    mut batch1: List[FastqRec],
+    mut batch2: List[FastqRec],
+) raises -> Int:
+    batch1 = List[FastqRec]()
+    batch2 = List[FastqRec]()
+    var n1 = Int(py=b.n1)
+    var i = 0
+    while i < n1:
+        batch1.append(
+            FastqRec(
+                String(b.names1[i]),
+                String(b.seq1[i]),
+                String(b.qual1[i]),
+                String(b.orig1[i]),
+            )
+        )
+        if paired:
+            batch2.append(
+                FastqRec(
+                    String(b.names2[i]),
+                    String(b.seq2[i]),
+                    String(b.qual2[i]),
+                    String(b.orig2[i]),
+                )
+            )
+        i += 1
+    return n1
 
 
 def _open_bam_arena() raises -> PythonObject:
@@ -1565,10 +1602,7 @@ def map_fastq_fm_gpu(
         else:
             fh = open_text_write(out_sam)
             _write_sam_header_fm(fh, index)
-        var fh1 = _open_fastq(fq1)
-        var fh2 = fh1
-        if paired:
-            fh2 = _open_fastq(fq2)
+        var fq_reader = _open_fq_reader(fq1, fq2, bs_r1, bs_r2)
 
         var n_mapped = 0
         var n_reads = 0
@@ -1576,11 +1610,14 @@ def map_fastq_fm_gpu(
         var t_map0 = time_mod.perf_counter()
         var t_gpu = time_mod.perf_counter() * 0
         var t_emit = time_mod.perf_counter() * 0
+        var t_fastq = time_mod.perf_counter() * 0
         var batch1 = List[FastqRec]()
         var batch2 = List[FastqRec]()
-        _read_pe_batch(
-            fh1, fh2, paired, batch_size, bs_r1, bs_r2, batch1, batch2
+        var t_f0 = time_mod.perf_counter()
+        _ = _py_batch_to_recs(
+            fq_reader.read_batch(batch_size), paired, batch1, batch2
         )
+        t_fastq = t_fastq + (time_mod.perf_counter() - t_f0)
         comptime BLOCK = 256
 
         while len(batch1) > 0:
@@ -1610,13 +1647,14 @@ def map_fastq_fm_gpu(
                 var L = s.byte_length()
                 host_lens[si] = UInt32(L)
                 var base = si * max_len
-                var p = 0
-                while p < max_len:
-                    if p < L:
-                        host_bases[base + p] = UInt8(ord(s[byte = p : p + 1]))
-                    else:
-                        host_bases[base + p] = 78
-                    p += 1
+                var sp = s.as_bytes().unsafe_ptr()
+                var di = 0
+                while di < L:
+                    host_bases[base + di] = sp[di]
+                    di += 1
+                while di < max_len:
+                    host_bases[base + di] = 78
+                    di += 1
                 si += 1
 
             var dev_bases = ctx.enqueue_create_buffer[DType.uint8](n_bases)
@@ -1717,8 +1755,16 @@ def map_fastq_fm_gpu(
             ctx.enqueue_copy(src_buf=dev_sl, dst_buf=host_sl)
             ctx.enqueue_copy(src_buf=dev_sr, dst_buf=host_sr)
             ctx.enqueue_copy(src_buf=dev_nm, dst_buf=host_nm)
+            var next1 = List[FastqRec]()
+            var next2 = List[FastqRec]()
+            var t_ov0 = time_mod.perf_counter()
+            _ = _py_batch_to_recs(
+                fq_reader.read_batch(batch_size), paired, next1, next2
+            )
+            var t_overlap = time_mod.perf_counter() - t_ov0
+            t_fastq = t_fastq + t_overlap
             ctx.synchronize()
-            t_gpu = t_gpu + (time_mod.perf_counter() - t_g0)
+            t_gpu = t_gpu + (time_mod.perf_counter() - t_g0) - t_overlap
 
             var t_e0 = time_mod.perf_counter()
             var n1 = len(batch1)
@@ -2034,13 +2080,10 @@ def map_fastq_fm_gpu(
                     " gpu_reads≈",
                     n_reads,
                 )
-            _read_pe_batch(
-                fh1, fh2, paired, batch_size, bs_r1, bs_r2, batch1, batch2
-            )
+            batch1 = next1^
+            batch2 = next2^
 
-        fh1.close()
-        if paired:
-            fh2.close()
+        fq_reader.close()
         var t_sort = time_mod.perf_counter() * 0
         if emit_bam:
             var t_s0 = time_mod.perf_counter()
@@ -2125,6 +2168,8 @@ def map_fastq_fm_gpu(
             t_emit,
             " sort_s=",
             t_sort,
+            " fastq_s=",
+            t_fastq,
             " reads=",
             n_reads,
         )

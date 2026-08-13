@@ -7,8 +7,10 @@ flag 0x10 reverse-complements SEQ and QUAL.
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 import zlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Sequence
 
 _BAM_MAGIC = b"BAM\x01"
@@ -68,49 +70,80 @@ def _rc_seq(seq: str) -> str:
     return seq.encode("ascii", "replace").translate(_RC)[::-1].decode("ascii")
 
 
+def _bgzf_block(chunk: bytes, level: int) -> bytes:
+    """One BGZF member (raw deflate). zlib releases the GIL here."""
+    cobj = zlib.compressobj(level, zlib.DEFLATED, -15)
+    payload = cobj.compress(chunk) + cobj.flush()
+    crc = zlib.crc32(chunk) & 0xFFFFFFFF
+    bsize = 25 + len(payload)
+    header = struct.pack(
+        "<BBBBLBBHBBHH",
+        31,
+        139,
+        8,
+        4,
+        0,
+        0,
+        255,
+        6,
+        66,
+        67,
+        2,
+        bsize,
+    )
+    return header + payload + struct.pack("<II", crc, len(chunk) & 0xFFFFFFFF)
+
+
 class _BgzfWriter:
-    def __init__(self, path: str, level: int = 1) -> None:
+    def __init__(self, path: str, level: int = 1, threads: int = 1) -> None:
         self._fh = open(path, "wb", buffering=8 * 1024 * 1024)
         self._level = max(0, min(level, 9))
         self._buf = bytearray()
+        self._off = 0
+        self._threads = max(1, int(threads))
+        self._pool: ThreadPoolExecutor | None = None
+        self._pending: list[Future[bytes]] = []
+        if self._threads > 1:
+            self._pool = ThreadPoolExecutor(max_workers=self._threads)
 
     def write(self, data: bytes | bytearray) -> None:
         self._buf.extend(data)
-        while len(self._buf) >= _MAX_UNCOMPRESSED:
-            self._flush(self._buf[:_MAX_UNCOMPRESSED])
-            del self._buf[:_MAX_UNCOMPRESSED]
+        while len(self._buf) - self._off >= _MAX_UNCOMPRESSED:
+            start = self._off
+            end = start + _MAX_UNCOMPRESSED
+            chunk = bytes(self._buf[start:end])
+            self._off = end
+            self._submit(chunk)
+        if self._off >= 1 << 20:
+            del self._buf[: self._off]
+            self._off = 0
 
-    def _flush(self, chunk: bytes | bytearray) -> None:
+    def _submit(self, chunk: bytes) -> None:
         if not chunk:
             return
-        cobj = zlib.compressobj(self._level, zlib.DEFLATED, -15)
-        payload = cobj.compress(bytes(chunk)) + cobj.flush()
-        crc = zlib.crc32(chunk) & 0xFFFFFFFF
-        # total block = 18-byte header + payload + 8 (crc/isize); BSIZE = total-1
-        bsize = 25 + len(payload)
-        header = struct.pack(
-            "<BBBBLBBHBBHH",
-            31,
-            139,
-            8,
-            4,
-            0,
-            0,
-            255,
-            6,
-            66,  # B
-            67,  # C
-            2,
-            bsize,
-        )
-        self._fh.write(header)
-        self._fh.write(payload)
-        self._fh.write(struct.pack("<II", crc, len(chunk) & 0xFFFFFFFF))
+        if self._pool is None:
+            self._fh.write(_bgzf_block(chunk, self._level))
+            return
+        self._pending.append(self._pool.submit(_bgzf_block, chunk, self._level))
+        # Back-pressure: keep ~2 in-flight blocks per worker.
+        while len(self._pending) >= self._threads * 2:
+            self._fh.write(self._pending.pop(0).result())
+
+    def _flush_tail(self) -> None:
+        if self._off:
+            del self._buf[: self._off]
+            self._off = 0
+        if self._buf:
+            self._submit(bytes(self._buf))
+            self._buf.clear()
+        while self._pending:
+            self._fh.write(self._pending.pop(0).result())
 
     def close(self) -> None:
-        if self._buf:
-            self._flush(self._buf)
-            self._buf.clear()
+        self._flush_tail()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
         self._fh.write(_BGZF_EOF)
         self._fh.close()
 
@@ -177,7 +210,13 @@ class BamWriter:
             "unknown",
         } else "unsorted"
         self._rg = rg_id.encode("ascii")
-        self._bgzf = _BgzfWriter(path, level=level)
+        try:
+            threads = int(os.environ.get("METHYLGRAPHER_BAM_THREADS", "16"))
+        except ValueError:
+            threads = 16
+        if threads < 1:
+            threads = 1
+        self._bgzf = _BgzfWriter(path, level=level, threads=threads)
         hd = [f"@HD\tVN:1.6\tSO:{so}"]
         for name, ln in zip(sq_names, sq_lens):
             hd.append(f"@SQ\tSN:{name}\tLN:{ln}")

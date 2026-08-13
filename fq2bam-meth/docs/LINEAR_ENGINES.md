@@ -62,6 +62,7 @@ METHYLGRAPHER_LINEAR_ENGINE=fm \
 | `METHYLGRAPHER_FM_MAX_SOFT` | 20 | End soft-clip cap |
 | `METHYLGRAPHER_FM_RESCUE_WIN` | 512 | Mate-rescue window (bp) when exactly one end mapped |
 | `METHYLGRAPHER_BAM_LEVEL` | 1 | BGZF level for native BAM emit |
+| `METHYLGRAPHER_BAM_THREADS` | 16 | Parallel BGZF deflate workers |
 | `METHYLGRAPHER_FM_SORT_CAP` | 67108864 | Max records for GPU sort/markdup host tables |
 | `METHYLGRAPHER_LINEAR_MARKDUP` | 1 | GPU (fm) / samtools (parity) duplicate marking |
 
@@ -99,16 +100,14 @@ the frozen engine.
 | fm (BAM FIFO) | 98.11% | 0.016 | 1.00 | 83.4 / 232 / 583 s | 826 s | **pass** |
 | fm (native BAM + mate-rescue) | **98.34%** | **0.013** | **1.00** | **88.0 / 201 / 560 s** | **779 s** | **pass** |
 | fm (GPU sort + markdup) | **98.34%** | **0.013** | **1.00** | **88.0 / emit 168 / sort 2.1 / map 528 s** | **~705 s** (incl. compare; BAM+index ~9 min) | **pass** |
+| fm (pigz FASTQ + parallel BGZF) | **98.34%** | **0.013** | **1.00** | kernel hidden under FASTQ 143 / emit 84 (BGZF 26) / sort 2.1 / **map 237 s** | **~380 s** script (BAM+index ~4 min) | **pass** |
 
-GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k). Native BAM
-emit beat the old SAM path on 100k (0.75 s vs 0.81 s) and dropped full-sample
-emit 232 s → 201 s. **FM GPU-sorts and markdups** in **2.1 s** on the full
-sample (Clara sort ~10 s + markdup/BQSR ~21 s) and skips samtools
-`fixmate`/`sort`/`markdup`; only `samtools index` remains. Duplicate count
-tracks Clara (11.04M vs 11.25M). Full-sample script wall is **~705 s**
-(map 528 s + index + concordance); previous FM E2E was **779 s** with CPU
-samtools. Remaining gap vs Clara **~122 s** is FASTQ pack + host BGZF, not
-sort/markdup. Default stays **parity** until E2E is in Clara's ballpark.
+GPU kernel is ~605k reads/s (rescue included; Clara mem ~636k) and is now
+**hidden under FASTQ ingest**. pigz + bulk Python FASTQ (no per-line Mojo FFI)
+and 16-thread BGZF dropped full-sample **map 528 s → 237 s** and script E2E
+**705 s → 380 s** (BAM+index ~4 min vs Clara ~122 s). Remaining wall is FASTQ
+parse/String copies (~143 s) and BAM pack (~58 s) + BGZF (~26 s). Default stays
+**parity** until E2E is in Clara's ballpark.
 
 Mate-rescue recovered the good one-end-mapped mates. Remaining Δ vs Clara is mostly 2–4 bp indels and low-quality extras we are not chasing.
 
