@@ -484,6 +484,15 @@ def ensure_pack_for_gbz(gbz: str) -> SegmentPack:
     ready = resolve_pack(gbz)
     if ready is not None:
         return SegmentPack(ready)
+    # Production Align: packs are a fleet prebuild. Fail closed unless the
+    # operator explicitly allows on-the-fly vg convert (toys / first boot).
+    require = os.environ.get("METHYLGRAPHER_MOJO_PACK_REQUIRE", "1").strip().lower()
+    if require not in {"0", "false", "no", "off"}:
+        raise RuntimeError(
+            f"no segment pack for {gbz}; prebuild with "
+            f"build_mojo_segment_pack.py --from-gbz --gbz {gbz} "
+            f"(set METHYLGRAPHER_MOJO_PACK_REQUIRE=0 to allow mid-Align build)"
+        )
     # Try companion / local GFA for dense build
     # Production: build from GBZ via vg convert (node-id aligned). Companion
     # wl.gfa may have a different node set than C2T/G2A Giraffe GBZs.

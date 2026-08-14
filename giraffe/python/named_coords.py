@@ -338,6 +338,14 @@ def ensure_translated_inplace(
         return False
     idx_dir = Path(index_dir) if index_dir else default_index_dir()
     stamp = Path(str(gaf_path) + ".named_coords.json")
+    # Emit-time translation already wrote GFA segment ids (giraffe_gaf_emit).
+    if stamp.is_file():
+        try:
+            meta = json.loads(stamp.read_text(encoding="utf-8"))
+            if meta.get("emit_time") or meta.get("already_named"):
+                return False
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     max_gfa = 0
     if index_ready(idx_dir):
         try:

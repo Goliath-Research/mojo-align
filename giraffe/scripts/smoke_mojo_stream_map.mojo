@@ -8,7 +8,7 @@ from giraffe_gbz import map_gbz_native
 
 
 def main() raises:
-    var root = "/home/ubuntu/methylGrapher-mojo/tests/data/giraffe_fixture"
+    var root = "/home/ubuntu/mojo-align/giraffe/tests/data/giraffe_fixture"
     var gbz_toy = root + "/gbz_toy"
     var os_mod = Python.import_module("os")
     var tmp = Python.import_module("tempfile")

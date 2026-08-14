@@ -28,7 +28,8 @@ cp -a "$REPO_ROOT"/methylgrapher/engine/. "$DEST/engine/"
 cp -a "$REPO_ROOT"/gpu-common/python/gpu_mem.py "$DEST/engine/gpu_mem.py"
 cp -a "$REPO_ROOT"/fq2bam-meth/python/fq2bam_meth.py "$DEST/engine/fq2bam_meth.py"
 cp -a "$REPO_ROOT"/giraffe/python/. "$DEST/engine/"
-# Restore package helpers that must not be overwritten incorrectly
+# Keep FASTQ open helper importable as top-level ``fastq_open`` and under engine/
+cp -a "$REPO_ROOT"/giraffe/python/fastq_open.py "$DEST/engine/fastq_open.py" 2>/dev/null || true
 cp -a "$REPO_ROOT"/methylgrapher/engine/__init__.py "$DEST/engine/"
 cp -a "$REPO_ROOT"/methylgrapher/engine/cli.py "$DEST/engine/"
 cp -a "$REPO_ROOT"/methylgrapher/engine/alignments.py "$DEST/engine/"

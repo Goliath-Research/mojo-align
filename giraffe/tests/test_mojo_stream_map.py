@@ -19,7 +19,7 @@ GBZ_TOY = PKG / "tests/data/giraffe_fixture/gbz_toy"
 GOLDEN = PKG / "tests/data/giraffe_fixture/golden.gaf"
 R1 = PKG / "tests/data/giraffe_fixture/R1.fastq"
 R2 = PKG / "tests/data/giraffe_fixture/R2.fastq"
-SMOKE = ROOT / "scripts/smoke_mojo_stream_map.mojo"
+SMOKE = PKG / "scripts/smoke_mojo_stream_map.mojo"
 
 
 def test_oracle_quartet_map_still_golden(tmp_path, monkeypatch):
@@ -54,7 +54,20 @@ def test_mojo_stream_map_smoke():
     env = os.environ.copy()
     env["PATH"] = str(Path.home() / ".pixi/bin") + os.pathsep + env.get("PATH", "")
     # Prefer pixi mojo when available.
-    cmd = ["pixi", "run", "mojo", "-I", "src", str(SMOKE)]
+    cmd = [
+        "pixi",
+        "run",
+        "mojo",
+        "-I",
+        "gpu-common/src",
+        "-I",
+        "fq2bam-meth/src",
+        "-I",
+        "giraffe/src",
+        "-I",
+        "methylgrapher/src",
+        str(SMOKE),
+    ]
     try:
         proc = subprocess.run(
             cmd,

@@ -7,7 +7,8 @@ from std.collections import List
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
-from giraffe_gaf_emit import append_gaf_hits
+from giraffe_fastq import giraffe_fq_read_header_seq
+from giraffe_gaf_emit import append_gaf_hits, flush_emit
 from giraffe_gpu_index import (
     gpu_index_meta_from,
     log_gpu_index_resident,
@@ -16,6 +17,7 @@ from giraffe_gpu_index import (
 from giraffe_hit import AlignmentHit
 from giraffe_min_index import MojoMinIndex
 from giraffe_pack import DensePack
+from linear_fastq import FastqPairStream, FastqPipe
 
 
 def _fixture_extend_tiny(
@@ -123,26 +125,18 @@ def _parse_mg_fastq_fields(n: String, s: String) -> StreamReadGPU:
     return StreamReadGPU(bare, s, original, conversion)
 
 
-def _read_one_gpu(fh: PythonObject) raises -> StreamReadGPU:
-    var n = String(fh.readline())
-    if n.byte_length() == 0:
+def _read_one_gpu_pipe(mut pipe: FastqPipe) raises -> StreamReadGPU:
+    var n = String("")
+    var s = String("")
+    if not giraffe_fq_read_header_seq(pipe, n, s):
         return StreamReadGPU("", "", "", "")
-    var s = String(fh.readline())
-    _ = String(fh.readline())
-    _ = String(fh.readline())
-    _strip_nl(n)
-    _strip_nl(s)
-    if n.startswith("@"):
-        n = String(n[byte = 1 : n.byte_length()])
     return _parse_mg_fastq_fields(n, s)
 
 
 def gpu_native_stream_loop(
     mut pack: DensePack,
     mut min_idx: MojoMinIndex,
-    fh1: PythonObject,
-    fh2: PythonObject,
-    paired: Bool,
+    mut fq: FastqPairStream,
     out_fh: PythonObject,
     dist: String,
     batch_size: Int,
@@ -712,14 +706,15 @@ def gpu_native_stream_loop(
             var t0 = time.perf_counter()
             var batch1 = List[StreamReadGPU]()
             var batch2 = List[StreamReadGPU]()
+            var paired = fq.paired
             var i = 0
             while i < batch_size:
-                var r1 = _read_one_gpu(fh1)
+                var r1 = _read_one_gpu_pipe(fq.r1)
                 if r1.name.byte_length() == 0:
                     break
                 batch1.append(r1^)
                 if paired:
-                    var r2 = _read_one_gpu(fh2)
+                    var r2 = _read_one_gpu_pipe(fq.r2)
                     if r2.name.byte_length() == 0:
                         raise Error("paired FASTQ length mismatch (R2 ended early)")
                     batch2.append(r2^)
@@ -988,7 +983,7 @@ def gpu_native_stream_loop(
                     j += 1
 
                 n_written += append_gaf_hits(out_fh, batch_hits)
-                out_fh.flush()
+                flush_emit(out_fh)
                 var t_emit = time.perf_counter()
                 if profile:
                     print(
@@ -1057,7 +1052,7 @@ def gpu_native_stream_loop(
                         n_records += 2
                     j2 += 1
                 n_written += append_gaf_hits(out_fh, batch_hits2)
-                out_fh.flush()
+                flush_emit(out_fh)
                 if profile:
                     print(
                         "mojo_stream stages_s fastq=",

@@ -85,12 +85,19 @@ def resolve_mojo_giraffe_bin() -> Optional[str]:
     env = os.environ.get("METHYLGRAPHER_MOJO_GIRAFFE_BIN", "").strip()
     if env and Path(env).exists():
         return env
+    # Host checkouts: mojo-align/bin or staged flat image /opt/.../bin
+    here = Path(__file__).resolve()
     for cand in (
-        "/usr/local/bin/methylGrapher",
-        shutil.which("methylGrapher"),
+        here.parents[2] / "bin" / "methylGrapher",  # mojo-align/bin
+        here.parents[1] / "bin" / "methylGrapher",  # flat _flat_image/bin
+        Path("/opt/methylgrapher-mojo/bin/methylGrapher"),
+        Path("/usr/local/bin/methylGrapher"),
     ):
-        if cand and Path(cand).exists():
+        if cand.is_file():
             return str(cand)
+    which = shutil.which("methylGrapher")
+    if which and Path(which).exists():
+        return which
     return None
 
 
@@ -177,15 +184,16 @@ def build_mojo_giraffe_gfa_cmd(
     # Prefer a real GAF path: Align's fd3/pipe + underscore-shard router drops
     # Illumina qnames from MojoGiraffe. File + stderr logs is the production path.
     out = (out_gaf or "").strip()
+    env_prefix = 'METHYLGRAPHER_ENGINE=mojo '
     if out:
         return (
             "set -euo pipefail; "
-            f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
+            f'{env_prefix}"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
             f'-out_gaf "{out}" -device "{dev}"{k_arg} 1>&2'
         )
     return (
         "set -euo pipefail; "
-        f'"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
+        f'{env_prefix}"{mojo_bin}" MojoGiraffe -gfa "{gfa_path}" -fq1 "{fq1}"{fq2_arg} '
         f'-out_gaf /dev/fd/3 -device "{dev}"{k_arg} 3>&1 1>&2'
     )
 
@@ -218,16 +226,19 @@ def build_mojo_giraffe_gbz_cmd(
     fq2_arg = f" -fq2 {fq2}" if fq2 else ""
     zip_arg = f' -zipcodes "{zipcodes}"' if zipcodes else ""
     out = (out_gaf or "").strip()
+    # MojoGiraffe lives in the Mojo CLI (methylgrapher/src/main.mojo), not
+    # the Python engine. Force METHYLGRAPHER_ENGINE=mojo for host + image bins.
+    env_prefix = 'METHYLGRAPHER_ENGINE=mojo '
     if out:
         return (
             "set -euo pipefail; "
-            f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
+            f'{env_prefix}"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
             f"{zip_arg} -fq1 \"{fq1}\"{fq2_arg} "
             f'-out_gaf "{out}" -device "{dev}"{k_arg} 1>&2'
         )
     return (
         "set -euo pipefail; "
-        f'"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
+        f'{env_prefix}"{mojo_bin}" MojoGiraffe -gbz "{gbz}" -dist "{dist}" -min "{min_path}"'
         f"{zip_arg} -fq1 \"{fq1}\"{fq2_arg} "
         f'-out_gaf /dev/fd/3 -device "{dev}"{k_arg} 3>&1 1>&2'
     )

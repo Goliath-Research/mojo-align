@@ -53,9 +53,9 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 |-----------|------|--------|
 | Toy GBZ PE vs golden | path / cs / ri / os / rc | **PASS** (`giraffe_stream_map`) |
 | DS-scale (500 PE) on toy GBZ | GAF lines land | **PASS** (protocol smoke) |
-| Buffy-subset seed+extend | oracle `quartet_map` 13/13; production = stream_map | **PASS** oracle; re-run stream_map on subset |
-| DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PENDING** operator |
-| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **PENDING** (stream GAF wired; C2T/G2A **serialized** by default on GPU) |
+| Buffy-subset seed+extend | oracle `quartet_map` 13/13; production = stream_map | **PASS** stream_map 13/13 (pack-walk fixture; emit-time named-coords) |
+| DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PASS** 20k-line subset: python vs mojo MethylCall identical (`graph.methyl` 18996, `graph.cpg.tsv` 18837) |
+| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **NOT MET (2026-08-14)** Mojo C2T started (~10k pairs/s stage estimate ⇒ ≫2 h dual); crashed `R2 ended early` at ~87 s — GAF emit still dominant; keep `cpu_vg` default |
 | Production `gpu_giraffe` → Mojo GBZ | READY default-on + dense pack + quartet | **WIRED** (opt out with `READY=0`) |
 
 Build production dense segment packs (preferred — from companion GFA):

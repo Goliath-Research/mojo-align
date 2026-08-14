@@ -13,6 +13,7 @@ from std.sys import has_accelerator
 
 from giraffe_device import require_device_or_raise
 from giraffe_dist import cluster_seed_hits
+from giraffe_fastq import giraffe_fq_close, giraffe_fq_open, giraffe_fq_read_header_seq
 from giraffe_gaf_emit import append_gaf_hits, close_emit, emit_footer_log, open_gaf_write
 from giraffe_sam_emit import close_qc_offsets
 from giraffe_gapless import gapless_extend_with_pack
@@ -25,6 +26,7 @@ from giraffe_hit import AlignmentHit
 from giraffe_min_index import MojoMinIndex
 from giraffe_minzip import locate_batch_hits_with_index
 from giraffe_pack import DensePack
+from linear_fastq import FastqPairStream, FastqPipe
 
 
 struct StreamRead(Copyable, Movable):
@@ -107,26 +109,12 @@ def _parse_mg_fastq_fields(n: String, s: String) -> StreamRead:
     return StreamRead(bare, s, original, conversion)
 
 
-def _open_fastq(path: String) raises -> PythonObject:
-    var builtins = Python.import_module("builtins")
-    var gzip = Python.import_module("gzip")
-    var low = path.lower()
-    if low.endswith(".gz") or low.endswith(".gzip"):
-        return gzip.open(path, "rt")
-    return builtins.open(path, "r")
-
-
-def _read_one(fh: PythonObject) raises -> StreamRead:
-    var n = String(fh.readline())
-    if n.byte_length() == 0:
+def _read_one_pipe(mut pipe: FastqPipe) raises -> StreamRead:
+    """One record via linear_fastq FastqPipe (pigz fd + libc read)."""
+    var n = String("")
+    var s = String("")
+    if not giraffe_fq_read_header_seq(pipe, n, s):
         return StreamRead("", "", "", "")
-    var s = String(fh.readline())
-    _ = String(fh.readline())
-    _ = String(fh.readline())
-    _strip_nl(n)
-    _strip_nl(s)
-    if n.startswith("@"):
-        n = String(n[byte = 1 : n.byte_length()])
     return _parse_mg_fastq_fields(n, s)
 
 
@@ -242,9 +230,7 @@ def _is_gpu_device(device: String) -> Bool:
 def _map_stream_gpu_session(
     mut pack: DensePack,
     mut min_idx: MojoMinIndex,
-    fh1: PythonObject,
-    fh2: PythonObject,
-    paired: Bool,
+    mut fq: FastqPairStream,
     out_fh: PythonObject,
     dist: String,
     zipcodes: String,
@@ -278,9 +264,7 @@ def _map_stream_gpu_session(
         return gpu_native_stream_loop(
             pack,
             min_idx,
-            fh1,
-            fh2,
-            paired,
+            fq,
             out_fh,
             dist,
             batch_size,
@@ -359,11 +343,9 @@ def map_fastq_stream_to_gaf(
         flush=True,
     )
     var out_fh = open_gaf_write(out_gaf)
-    var fh1 = _open_fastq(fq1)
-    var paired = fq2.byte_length() > 0
-    var fh2 = fh1
-    if paired:
-        fh2 = _open_fastq(fq2)
+    var fq = giraffe_fq_open(fq1, fq2)
+    var paired = fq.paired
+    print("mojo_stream_map fastq=linear_fastq_pipe", flush=True)
 
     var gpu_session = (
         _is_gpu_device(dev)
@@ -389,9 +371,7 @@ def map_fastq_stream_to_gaf(
         var n_wrt = _map_stream_gpu_session(
             pack,
             min_idx,
-            fh1,
-            fh2,
-            paired,
+            fq,
             out_fh,
             dist,
             zipcodes,
@@ -401,9 +381,7 @@ def map_fastq_stream_to_gaf(
             backend,
             dev,
         )
-        fh1.close()
-        if paired:
-            fh2.close()
+        giraffe_fq_close(fq)
         close_emit(out_fh)
         min_idx.close()
         emit_footer_log()
@@ -427,12 +405,12 @@ def map_fastq_stream_to_gaf(
         var batch2 = List[StreamRead]()
         var i = 0
         while i < batch_size:
-            var r1 = _read_one(fh1)
+            var r1 = _read_one_pipe(fq.r1)
             if r1.name.byte_length() == 0:
                 break
             batch1.append(r1^)
             if paired:
-                var r2 = _read_one(fh2)
+                var r2 = _read_one_pipe(fq.r2)
                 if r2.name.byte_length() == 0:
                     raise Error("paired FASTQ length mismatch (R2 ended early)")
                 batch2.append(r2^)
@@ -489,7 +467,6 @@ def map_fastq_stream_to_gaf(
         var t_extend = time.perf_counter()
 
         n_written += append_gaf_hits(out_fh, batch_hits)
-        out_fh.flush()
         var t_emit = time.perf_counter()
 
         if profile:
@@ -508,9 +485,7 @@ def map_fastq_stream_to_gaf(
                 len(batch1),
             )
 
-    fh1.close()
-    if paired:
-        fh2.close()
+    giraffe_fq_close(fq)
     close_emit(out_fh)
     min_idx.close()
     emit_footer_log()

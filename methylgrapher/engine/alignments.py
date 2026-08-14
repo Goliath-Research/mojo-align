@@ -425,10 +425,54 @@ def alignment(
         gpu_mem.wait_for_hbm_free(min_free, device=device, timeout_s=timeout)
 
     if workers == 1:
+        # Host-only: start graph-2 pack resolve while graph-1 maps on the GPU.
+        # Never start a second DeviceContext / MojoGiraffe here.
+        next_pack_fut = None
+        if len(jobs) > 1:
+            try:
+                from engine.quartet_map import ensure_pack_for_gbz as _ensure_pack
+            except ImportError:
+                try:
+                    from quartet_map import ensure_pack_for_gbz as _ensure_pack  # type: ignore
+                except ImportError:
+                    _ensure_pack = None  # type: ignore
+            if _ensure_pack is not None:
+                def _gbz_for_job(job) -> str:
+                    ref_type = job[0]
+                    prefix = index_prefix_ga if ref_type == "G2A" else index_prefix_ct
+                    return f"{prefix}.giraffe.gbz"
+
+                # Ensure graph-1 pack is ready, then prefetch graph-2 in background.
+                try:
+                    _ = _ensure_pack(_gbz_for_job(jobs[0]))
+                except Exception as exc:
+                    print(f"WARNING: pack ensure job0: {exc}", flush=True)
+                pref_pool = ThreadPoolExecutor(max_workers=1)
+                next_pack_fut = pref_pool.submit(_ensure_pack, _gbz_for_job(jobs[1]))
+                print(
+                    "Align dual-graph: prefetching pack for job1 while job0 maps",
+                    flush=True,
+                )
+            else:
+                pref_pool = None
+        else:
+            pref_pool = None
         for i, job in enumerate(jobs):
             if i > 0:
+                if next_pack_fut is not None:
+                    try:
+                        _ = next_pack_fut.result()
+                        print("Align dual-graph: job1 pack prefetch ready", flush=True)
+                    except Exception as exc:
+                        print(f"WARNING: pack prefetch job1: {exc}", flush=True)
+                    next_pack_fut = None
+                    if pref_pool is not None:
+                        pref_pool.shutdown(wait=False)
+                        pref_pool = None
                 _reclaim_hbm_between_graphs()
             _run_one_map(*job)
+        if pref_pool is not None:
+            pref_pool.shutdown(wait=False)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = [pool.submit(_run_one_map, *job) for job in jobs]
