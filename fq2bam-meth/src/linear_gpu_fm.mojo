@@ -705,6 +705,7 @@ def _emit_bam_from_batch(
     mut n_mapped: Int,
     n_batches: Int,
     meta_cap: Int,
+    n_total: Int,
 ) raises -> Int:
     fq_export_ptrs(
         arena,
@@ -815,7 +816,8 @@ def _emit_bam_from_batch(
             if nm_c > 255:
                 nm_c = 255
             h_score[n_reads] = UInt32((mq1 << 8) | (255 - nm_c))
-            h_pair[n_reads] = UInt32(n_reads)
+            # Globally unique across tiles: n_reads resets on flush but n_total does not.
+            h_pair[n_reads] = UInt32(n_total + n_reads)
             if tid1 >= 0:
                 n_mapped += 1
             n_reads += 1
@@ -926,7 +928,8 @@ def _emit_bam_from_batch(
             var rec_len2 = off - rec_start2
             var i1 = n_reads
             var i2 = n_reads + 1
-            var pid = UInt32(n_reads // 2)
+            # Globally unique across tiles: n_reads resets on flush but n_total does not.
+            var pid = UInt32((n_total + n_reads) // 2)
             var nm_sum = nm1 + nm2
             if nm_sum < 0:
                 nm_sum = 0
@@ -2697,6 +2700,7 @@ def map_fastq_fm_gpu(
                                 n_mapped,
                                 tile_chunks,
                                 meta_cap,
+                                n_total,
                             )
                         else:
                             fq_read_batch(fq_stream, arena_spare, batch_size)
@@ -3106,6 +3110,7 @@ def map_fastq_fm_gpu(
                     n_mapped,
                     tile_chunks,
                     meta_cap,
+                    n_total,
                 )
                 _ = bam_arena.append_raw(
                     Int(bam_blob.unsafe_ptr()), packed_last

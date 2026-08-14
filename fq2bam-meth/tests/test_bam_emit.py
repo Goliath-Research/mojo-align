@@ -228,3 +228,46 @@ def test_bam_run_store_merge_and_markdup(tmp_path: Path):
     _or_dup_flag_bytes(dup)
     out = b"".join(sink.chunks)
     assert out == recs0[0] + bytes(dup) + recs0[1] + recs1[1]
+
+
+def test_markdup_runs_requires_globally_unique_pair_ids():
+    """Tile-local pair IDs (same pid in two runs) must not keep both duplicates.
+
+    ``_markdup_runs`` keeps every record whose ``pair`` equals ``best_pair``.
+    If unrelated pairs from different tiles reuse the same tile-local pid and
+    share a dup key, the lower-score pair would escape marking. Global pids
+    (as emitted via ``n_total + n_reads``) avoid that.
+    """
+    import array
+    from types import SimpleNamespace
+
+    from bam_emit import _markdup_runs
+
+    def keys(score: int, pair: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            n=1,
+            dhi=array.array("Q", [1]),
+            dlo=array.array("Q", [1]),
+            score=array.array("I", [score]),
+            pair=array.array("I", [pair]),
+            dupperm=array.array("I", [0]),
+        )
+
+    # Unique global pids: weaker score is marked.
+    flags = [array.array("B", [0]), array.array("B", [0])]
+    marked = _markdup_runs(
+        [(keys(100, 0), Path(".")), (keys(50, 500), Path("."))],
+        flags,
+    )
+    assert marked == 1
+    assert flags[0][0] == 0
+    assert flags[1][0] == 1
+
+    # Colliding tile-local pid=0 incorrectly keeps both.
+    flags_bad = [array.array("B", [0]), array.array("B", [0])]
+    marked_bad = _markdup_runs(
+        [(keys(100, 0), Path(".")), (keys(50, 0), Path("."))],
+        flags_bad,
+    )
+    assert marked_bad == 0
+    assert flags_bad[0][0] == 0 and flags_bad[1][0] == 0
