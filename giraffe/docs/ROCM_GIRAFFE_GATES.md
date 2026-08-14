@@ -40,13 +40,17 @@ Site pin:
 
 ## Measurement gates
 
-| Gate | How |
-|------|-----|
-| Device probe | `docker run --rm … methylGrapher MojoGiraffe … -device amd` logs `kernel_target=amdgpu` (or `amdgpu:gfx942`) |
-| Toy GBZ PE | Same golden as NVIDIA (`docs/BENCHMARK_GIRAFFE.md`) |
-| Known-mapped Buffy C2T | 13/13 style fixture |
-| Full Buffy wall | ≤ target vs GH200 baseline (~2 h goal) |
-| Parity | DS20M / subset `graph.methyl` vs NVIDIA Mojo (and optional `cpu_vg`) |
+| Gate | How | Status |
+|------|-----|--------|
+| Device probe | `docker run --rm … methylGrapher MojoGiraffe … -device amd` logs `kernel_target=amdgpu` (or `amdgpu:gfx942`) | image smoke |
+| Toy GBZ PE | Same golden as NVIDIA (`docs/BENCHMARK_GIRAFFE.md`) | operator |
+| Known-mapped Buffy C2T | 13/13 style fixture | operator |
+| Full Buffy wall | ≤ target vs GH200 baseline (~2 h goal) | **PENDING** MI300X bakeoff |
+| Parity | DS20M / subset `graph.methyl` vs NVIDIA Mojo (and optional `cpu_vg`) | **PENDING** |
+
+Same Mojo DeviceContext sources as NVIDIA (`gpu-common` + `giraffe_gpu_map_kernels`). No HIP rewrite. Clara remains NVIDIA-only (explicit linear/stock path).
+
+**Build note (2026-08-14):** `:1.70-mojo-rocm` image builds from `mojo-align` on GH200 hosts; `smoke_64k.sh` CUDA/cupy probe is skipped/irrelevant on ROCm — use `-device amd` on MI300X for the DeviceContext gate. Instinct Buffy wall remains **PENDING** bakeoff.
 
 ## Rollback
 

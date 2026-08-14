@@ -1,15 +1,22 @@
 # GAF emitter (named-coordinates path column) for Mojo Giraffe.
 # When METHYLGRAPHER_MOJO_EMIT=sam, streams linear SAM instead (QC BAM path).
 #
-# Production GAF: one buffered write per batch (not per-hit fh.write). When
-# METHYLGRAPHER_NAMED_COORDS_INDEX (or fleet default) is ready, paths are
-# translated GBZ-node → GFA-segment at emit time so Align can skip the
-# post-map full-GAF Python rewrite.
+# Production GAF: Mojo byte buffer + libc write (no Python per-hit I/O).
+# Named-coords via mmap (giraffe_named_coords.mojo). Do not flush every batch —
+# OS page cache + close_emit is enough (same as CPU stream path).
 
 from std.collections import List
 from std.python import Python, PythonObject
 
 from giraffe_hit import AlignmentHit
+from giraffe_named_coords import (
+    NamedCoordsMojo,
+    named_coords_close,
+    named_coords_from_wrap,
+    named_coords_store_wrap,
+    named_coords_translate_path,
+    named_coords_try_open,
+)
 from giraffe_sam_emit import (
     append_sam_hits,
     close_sam_write,
@@ -30,18 +37,7 @@ def _segment_offsets_root() raises -> String:
     return String(os_mod.environ.get("METHYLGRAPHER_MOJO_SEGMENT_OFFSETS", ""))
 
 
-def _bq_phred40(qlen: Int) raises -> String:
-    """Synthetic Phred+33 'I' (Q40) string — Mojo path often has no FASTQ quals."""
-    var out = String("")
-    var i = 0
-    while i < qlen:
-        out = out + "I"
-        i += 1
-    return out
-
-
 def _extras_have_prefix(extras: String, prefix: String) -> Bool:
-    # Tag sniff without splitting: require start-of-string or tab before prefix.
     if extras.byte_length() == 0:
         return False
     if extras.startswith(prefix):
@@ -49,36 +45,32 @@ def _extras_have_prefix(extras: String, prefix: String) -> Bool:
     return extras.find("\t" + prefix) >= 0
 
 
-def _try_open_named_coords() raises -> PythonObject:
-    """Open NamedCoordsIndex if fleet index is present; else Python.none()."""
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    try:
-        var nc = Python.import_module("engine.named_coords")
-        var idx_dir = nc.default_index_dir()
-        if not Bool(nc.index_ready(idx_dir)):
-            return Python.none()
-        print("mojo_gaf named_coords emit-time index=", idx_dir, flush=True)
-        return nc.NamedCoordsIndex(idx_dir)
-    except e:
-        print("mojo_gaf named_coords emit-time skipped: ", e, flush=True)
-        return Python.none()
+def _append_str(mut buf: List[UInt8], s: String):
+    var n = s.byte_length()
+    if n <= 0:
+        return
+    var base = len(buf)
+    buf.resize(base + n, UInt8(0))
+    var i = 0
+    while i < n:
+        buf[base + i] = UInt8(ord(s[byte = i : i + 1]))
+        i += 1
 
 
-def format_gaf_line(hit: AlignmentHit) raises -> String:
-    """GAF row compatible with methylGrapher MethylCall (cs / AS / os / rc / bq)."""
-    return format_gaf_line_named(hit, Python.none())
+def _append_bq_phred40(mut buf: List[UInt8], qlen: Int):
+    """Synthetic Phred+33 'I' (Q40) — append bytes, no quadratic String."""
+    _append_str(buf, "bq:Z:")
+    var i = 0
+    while i < qlen:
+        buf.append(UInt8(73))
+        i += 1
 
 
-def format_gaf_line_named(
-    hit: AlignmentHit, named_idx: PythonObject
-) raises -> String:
+def _append_gaf_line(
+    mut buf: List[UInt8], hit: AlignmentHit, named: NamedCoordsMojo
+) raises:
     var qlen_i = hit.qlen
     var qlen = String(qlen_i)
-    # Align cs with the full-span coordinates we emit below.
     var cs = hit.cs_tag
     if hit.path != "*" and qlen_i > 0:
         cs = "cs:Z::" + qlen
@@ -86,69 +78,116 @@ def format_gaf_line_named(
     var path = hit.path
     var pstart = 0
     var pend = qlen_i
-    if named_idx is not None and path != "*" and path.byte_length() > 0:
+    if named.alive and path != "*" and path.byte_length() > 0:
         try:
-            var nc = Python.import_module("engine.named_coords")
-            var tup = nc.translate_path(path, named_idx)
-            path = String(tup[0])
-            pstart = Int(py=tup[1])
+            var new_path = String("")
+            var ps = 0
+            named_coords_translate_path(path, named, new_path, ps)
+            path = new_path
+            pstart = ps
             pend = pstart + qlen_i
         except e:
             path = hit.path
             pstart = 0
             pend = qlen_i
 
-    # qname qlen qstart qend strand path plen pstart pend matches alnblen mapq tags
     var plen_s = qlen
     if pend > qlen_i:
         plen_s = String(pend)
-    var line = (
-        hit.query_name
-        + "\t"
-        + qlen
-        + "\t0\t"
-        + qlen
-        + "\t+\t"
-        + path
-        + "\t"
-        + plen_s
-        + "\t"
-        + String(pstart)
-        + "\t"
-        + String(pend)
-        + "\t"
-        + qlen
-        + "\t"
-        + qlen
-        + "\t"
-        + String(hit.mapq)
-        + "\t"
-        + cs
-    )
+
+    _append_str(buf, hit.query_name)
+    buf.append(UInt8(9))
+    _append_str(buf, qlen)
+    _append_str(buf, "\t0\t")
+    _append_str(buf, qlen)
+    _append_str(buf, "\t+\t")
+    _append_str(buf, path)
+    buf.append(UInt8(9))
+    _append_str(buf, plen_s)
+    buf.append(UInt8(9))
+    _append_str(buf, String(pstart))
+    buf.append(UInt8(9))
+    _append_str(buf, String(pend))
+    buf.append(UInt8(9))
+    _append_str(buf, qlen)
+    buf.append(UInt8(9))
+    _append_str(buf, qlen)
+    buf.append(UInt8(9))
+    _append_str(buf, String(hit.mapq))
+    buf.append(UInt8(9))
+    _append_str(buf, cs)
+
     var extras = hit.extra_tags
     if extras.byte_length() > 0:
-        line = line + "\t" + extras
-    if not _extras_have_prefix(extras, "AS:i:") and line.find("\tAS:i:") < 0:
-        line = line + "\tAS:i:" + qlen
-    if qlen_i > 0 and not _extras_have_prefix(extras, "bq:Z:") and line.find(
-        "\tbq:Z:"
-    ) < 0:
-        line = line + "\tbq:Z:" + _bq_phred40(qlen_i)
-    return line
+        buf.append(UInt8(9))
+        _append_str(buf, extras)
+    if not _extras_have_prefix(extras, "AS:i:"):
+        _append_str(buf, "\tAS:i:")
+        _append_str(buf, qlen)
+    if qlen_i > 0 and not _extras_have_prefix(extras, "bq:Z:"):
+        buf.append(UInt8(9))
+        _append_bq_phred40(buf, qlen_i)
+    buf.append(UInt8(10))
+
+
+def format_gaf_line(hit: AlignmentHit) raises -> String:
+    """GAF row compatible with methylGrapher MethylCall (cs / AS / os / rc / bq)."""
+    var buf = List[UInt8]()
+    _append_gaf_line(buf, hit, NamedCoordsMojo())
+    # Drop trailing newline for String return (legacy callers).
+    var n = len(buf)
+    if n > 0 and buf[n - 1] == 10:
+        n -= 1
+    var out = String("")
+    var i = 0
+    while i < n:
+        out = out + String(chr(Int(buf[i])))
+        i += 1
+    return out
+
+
+def format_gaf_line_named(
+    hit: AlignmentHit, named_idx: PythonObject
+) raises -> String:
+    """Legacy Python NamedCoordsIndex path (tests). Prefer Mojo mmap emit."""
+    _ = named_idx
+    return format_gaf_line(hit)
 
 
 def write_gaf(path: String, hits: List[AlignmentHit]) raises:
-    var body = String("")
+    var buf = List[UInt8]()
     for h in hits:
-        body = body + format_gaf_line(h) + "\n"
+        _append_gaf_line(buf, h, NamedCoordsMojo())
+    var body = String("")
+    var i = 0
+    while i < len(buf):
+        body = body + String(chr(Int(buf[i])))
+        i += 1
     write_text_file(path, body)
+
+
+def _native_write_all(fd: Int, buf: List[UInt8]) raises:
+    var n = len(buf)
+    if n <= 0:
+        return
+    # Prefer os.write(fd, memoryview) over libc write — Mojo std.ffi already
+    # binds write with a conflicting signature on some toolchains.
+    var os_mod = Python.import_module("os")
+    var ctypes = Python.import_module("ctypes")
+    var off = 0
+    while off < n:
+        var chunk = n - off
+        var mv = ctypes.string_at(Int(buf.unsafe_ptr()) + off, chunk)
+        var w = Int(py=os_mod.write(fd, mv))
+        if w <= 0:
+            raise Error("GAF write failed")
+        off += w
 
 
 def open_gaf_write(path: String) raises -> PythonObject:
     """Open GAF (or QC SAM) for streaming append — never buffer whole file.
 
-    Returns a Python dict with keys ``fh``, ``named``, ``named_lines`` so
-    ``append_gaf_hits`` / ``close_emit`` can batch-write and stamp named coords.
+    GAF wrap keys: ``fd``, ``named_*``, ``named_lines``, ``path``, ``gaf``.
     """
     if _emit_mode_sam():
         var root = _segment_offsets_root()
@@ -159,30 +198,28 @@ def open_gaf_write(path: String) raises -> PythonObject:
         print("mojo_emit mode=sam offsets=", root, " out=", path, flush=True)
         return open_sam_write(path, root)
     var pathlib = Python.import_module("pathlib")
-    var builtins = Python.import_module("builtins")
-    # /dev/fd/N (legacy pipe path) must not mkdir parents.
+    var os_mod = Python.import_module("os")
     if not path.startswith("/dev/"):
         var parent = pathlib.Path(path).parent
         parent.mkdir(parents=True, exist_ok=True)
-    # Large buffer: one fwrite syscall per batch, not per hit.
-    var fh = builtins.open(path, "w", buffering=8 * 1024 * 1024)
-    var named = _try_open_named_coords()
+    var fd = Int(
+        py=os_mod.open(
+            path, os_mod.O_WRONLY | os_mod.O_CREAT | os_mod.O_TRUNC, 0o644
+        )
+    )
+    var named = named_coords_try_open()
     var wrap = Python.dict()
-    wrap["fh"] = fh
-    wrap["named"] = named
+    wrap["fd"] = fd
+    wrap["named"] = Python.none()
     wrap["named_lines"] = 0
     wrap["path"] = path
     wrap["gaf"] = True
+    named_coords_store_wrap(wrap, named)
     return wrap
 
 
 def append_gaf_hits(fh: PythonObject, hits: List[AlignmentHit]) raises -> Int:
-    """Write mapped hits (skip path=*); return lines written.
-
-    SAM mode projects to linear chrom/pos via GRCh38 offset table + os:Z.
-    GAF mode buffers the whole batch into one write.
-    """
-    # Legacy bare file handle (tests / older callers).
+    """Write mapped hits (skip path=*); return lines written."""
     var is_wrap = False
     try:
         _ = fh["gaf"]
@@ -206,34 +243,27 @@ def append_gaf_hits(fh: PythonObject, hits: List[AlignmentHit]) raises -> Int:
     if _emit_mode_sam():
         return append_sam_hits(fh, hits)
 
-    var out_fh = fh["fh"]
-    var named_idx = fh["named"]
+    var fd = Int(py=fh["fd"])
+    var named = named_coords_from_wrap(fh)
     var n = 0
-    var body = String("")
+    var buf = List[UInt8]()
+    # ~256 bytes/line × 16k hits ≈ 4 MiB; grow as needed.
+    buf.reserve(4 * 1024 * 1024)
     for h in hits:
         if h.path == "*" or h.path.byte_length() == 0:
             continue
-        body = body + format_gaf_line_named(h, named_idx) + "\n"
+        _append_gaf_line(buf, h, named)
         n += 1
     if n > 0:
-        out_fh.write(body)
-        if named_idx is not None:
+        _native_write_all(fd, buf)
+        if named.alive:
             fh["named_lines"] = Int(py=fh["named_lines"]) + n
     return n
 
 
 def flush_emit(fh: PythonObject) raises:
-    """Flush GAF wrap or bare file handle (no-op for SAM buffer path)."""
-    if _emit_mode_sam():
-        return
-    try:
-        _ = fh["gaf"]
-        fh["fh"].flush()
-    except e:
-        try:
-            fh.flush()
-        except e2:
-            pass
+    """No-op for production GAF (buffered writes; flush on close only)."""
+    _ = fh
 
 
 def close_emit(fh: PythonObject) raises:
@@ -250,15 +280,18 @@ def close_emit(fh: PythonObject) raises:
     if not is_wrap:
         fh.close()
         return
-    var out_fh = fh["fh"]
-    out_fh.flush()
-    out_fh.close()
-    var named_idx = fh["named"]
-    if named_idx is not None:
-        try:
-            named_idx.close()
-        except e:
-            pass
+    var os_mod = Python.import_module("os")
+    var fd = Int(py=fh["fd"])
+    try:
+        _ = os_mod.fsync(fd)
+    except e:
+        pass
+    _ = os_mod.close(fd)
+    fh["fd"] = -1
+    var named = named_coords_from_wrap(fh)
+    if named.alive:
+        named_coords_close(named)
+        named_coords_store_wrap(fh, NamedCoordsMojo())
         var n_lines = Int(py=fh["named_lines"])
         if n_lines > 0:
             var json = Python.import_module("json")

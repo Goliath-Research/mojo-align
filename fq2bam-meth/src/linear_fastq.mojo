@@ -151,7 +151,7 @@ def _open_pipe(path: String, convert: Int) raises -> FastqPipe:
         cmd.append(gz)
         cmd.append("-dc")
         cmd.append(path)
-    var proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL)
+    var proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
     p.fd = Int32(Int(py=os_mod.dup(proc.stdout.fileno())))
     p.has_proc = True
     p.proc = proc
@@ -214,6 +214,17 @@ def _pipe_refill(mut p: FastqPipe) raises:
     if n < 0:
         raise Error("FASTQ read failed")
     if n == 0:
+        # Distinguish clean EOF from pigz/gzip death (CRC/OOM/kill).
+        if p.has_proc:
+            var rc_obj = p.proc.poll()
+            if rc_obj is not None:
+                var rc = Int(py=rc_obj)
+                if rc != 0:
+                    raise Error(
+                        "FASTQ decompress failed rc="
+                        + String(rc)
+                        + " (pigz/gzip exited before EOF)"
+                    )
         p.eof = True
         return
     p.end = p.end + n

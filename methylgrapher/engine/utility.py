@@ -559,9 +559,55 @@ def fastq_converter_worker_function(input_fastq_fp, output_fastq_fp, conversion_
     newl = f"{original_qn1}_{conversion_str}_{reminder}_{seq}\n{converted_seq}\n+\n{phred}\n"
     output_fastq_fh.write(newl)
 
-    read_counts.append(int(i / 4) + 1)
+    n_reads = int(i / 4) + 1
+    read_counts.append(n_reads)
+    try:
+        with open(output_fastq_fp + ".n_reads", "w", encoding="utf-8") as nfh:
+            nfh.write(f"{n_reads}\n")
+    except OSError:
+        pass
 
     return 0
+
+
+def _converted_fastq_n_reads(path: str) -> int | None:
+    """Return cached pair/read count for a converted FASTQ, or None."""
+    side = path + ".n_reads"
+    try:
+        with open(side, encoding="utf-8") as fh:
+            return int(fh.read().strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _count_fastq_records(path: str) -> int:
+    """Stream-count FASTQ records (4 lines each). Used when sidecar is missing."""
+    utils = Utility()
+    n = 0
+    if utils.isGzip(path):
+        with gzip.open(path, "rt") as fh:
+            for i, _ in enumerate(fh):
+                if i % 4 == 0:
+                    n += 1
+    else:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, _ in enumerate(fh):
+                if i % 4 == 0:
+                    n += 1
+    return n
+
+
+def _ensure_converted_n_reads(path: str) -> int:
+    cached = _converted_fastq_n_reads(path)
+    if cached is not None and cached > 0:
+        return cached
+    n = _count_fastq_records(path)
+    try:
+        with open(path + ".n_reads", "w", encoding="utf-8") as nfh:
+            nfh.write(f"{n}\n")
+    except OSError:
+        pass
+    return n
 
 
 def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True, split_num=1000):
@@ -570,6 +616,7 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
     pool = []
     manager = multiprocessing.Manager()
     read_counts = manager.list()
+    reused_paths: list[str] = []
 
     read_count = 0
     for fq in (fq1, fq2):
@@ -593,11 +640,25 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
                 output_fastq += '.gz'
 
             # Resume: keep prior converted FASTQs (Buffy-scale reconvert is multi-hour).
+            # Require a usable .n_reads sidecar (or recount once) so truncated
+            # resumes cannot silently desync C2T.R1 vs G2A.R2.
             if os.path.isfile(output_fastq) and os.path.getsize(output_fastq) > 0:
-                report_file_handle.write(
-                    f"Reusing existing converted FASTQ: {output_fastq}\n"
-                )
-                continue
+                n = _ensure_converted_n_reads(output_fastq)
+                if n <= 0:
+                    report_file_handle.write(
+                        f"Refusing empty converted FASTQ reuse: {output_fastq}\n"
+                    )
+                    os.remove(output_fastq)
+                    try:
+                        os.remove(output_fastq + ".n_reads")
+                    except OSError:
+                        pass
+                else:
+                    report_file_handle.write(
+                        f"Reusing existing converted FASTQ: {output_fastq} n_reads={n}\n"
+                    )
+                    reused_paths.append(output_fastq)
+                    continue
 
             p = multiprocessing.Process(
                 target=fastq_converter_worker_function,
@@ -610,7 +671,6 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
     for p in pool:
         p.join()
 
-    # print(read_counts)
     if pool:
         assert len(set(read_counts)) == 1
         report_file_handle.write(f"Total reads for R1: {read_counts[0]}\n")
@@ -618,6 +678,23 @@ def fastq_converter(fq1, fq2, workdir, compress=True, thread=1, directional=True
             report_file_handle.write(f"Total reads for R2: {read_counts[0]}\n\n")
     else:
         report_file_handle.write("Total reads: reused existing converted FASTQs\n\n")
+
+    # PE directional: C2T.R1 and G2A.R2 must have matching pair counts.
+    if fq2 is not None and directional:
+        r1 = f"{workdir}/C2T.R1.fastq"
+        r2 = f"{workdir}/G2A.R2.fastq"
+        if compress:
+            r1 += ".gz"
+            r2 += ".gz"
+        if os.path.isfile(r1) and os.path.isfile(r2):
+            n1 = _ensure_converted_n_reads(r1)
+            n2 = _ensure_converted_n_reads(r2)
+            if n1 != n2:
+                raise RuntimeError(
+                    f"Converted PE FASTQ pair-count mismatch: {r1} n={n1} vs {r2} n={n2} "
+                    "(refuse Align; delete truncated converted FASTQs and reconvert)"
+                )
+            report_file_handle.write(f"PE convert pair-count OK: {n1}\n\n")
 
     report_file_handle.close()
 

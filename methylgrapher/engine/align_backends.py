@@ -228,7 +228,26 @@ def build_mojo_giraffe_gbz_cmd(
     out = (out_gaf or "").strip()
     # MojoGiraffe lives in the Mojo CLI (methylgrapher/src/main.mojo), not
     # the Python engine. Force METHYLGRAPHER_ENGINE=mojo for host + image bins.
+    # Emit-time named-coords only when an index is ready (explicit or fleet default).
     env_prefix = 'METHYLGRAPHER_ENGINE=mojo '
+    named_idx = (os.environ.get("METHYLGRAPHER_NAMED_COORDS_INDEX") or "").strip()
+    if not named_idx:
+        try:
+            from . import named_coords as _nc
+        except ImportError:
+            try:
+                from engine import named_coords as _nc  # type: ignore
+            except ImportError:
+                _nc = None
+        if _nc is not None:
+            try:
+                d = _nc.default_index_dir()
+                if _nc.index_ready(d):
+                    named_idx = str(d)
+            except Exception:
+                named_idx = ""
+    if named_idx:
+        env_prefix += f'METHYLGRAPHER_NAMED_COORDS_INDEX="{named_idx}" '
     if out:
         return (
             "set -euo pipefail; "

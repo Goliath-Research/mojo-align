@@ -171,6 +171,15 @@ def alignment(
             fq1 += ".gz"
             fq2 += ".gz"
 
+        # Cheap PE length preflight (sidecar .n_reads from convert) before GPU map.
+        if os.path.exists(fq1) and os.path.exists(fq2):
+            n1 = utility._converted_fastq_n_reads(fq1)
+            n2 = utility._converted_fastq_n_reads(fq2)
+            if n1 is not None and n2 is not None and n1 != n2:
+                raise RuntimeError(
+                    f"PE FASTQ pair-count mismatch before map: {fq1} n={n1} vs {fq2} n={n2}"
+                )
+
         job_index_prefix = index_prefix_ga if ref_type == "G2A" else index_prefix_ct
 
         giraffe_input = f"-f {fq1}"

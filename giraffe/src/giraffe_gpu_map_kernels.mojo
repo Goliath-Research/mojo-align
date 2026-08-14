@@ -3,12 +3,13 @@
 # One DeviceContext owns index residency + all batch kernels for the FASTQ stream.
 # Unique-cell HT only (skip IS_POINTER) — same contract as MojoMinIndex.
 
+from std.algorithm import parallelize
 from std.collections import List
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
 from giraffe_fastq import giraffe_fq_read_header_seq
-from giraffe_gaf_emit import append_gaf_hits, flush_emit
+from giraffe_gaf_emit import append_gaf_hits
 from giraffe_gpu_index import (
     gpu_index_meta_from,
     log_gpu_index_resident,
@@ -702,23 +703,70 @@ def gpu_native_stream_loop(
             do_prune = 1
         comptime BLOCK = 256
 
+        # Deferred GAF emit overlapped with the next FASTQ batch read.
+        var pending_hits = List[AlignmentHit]()
+        var has_pending = False
+
         while True:
             var t0 = time.perf_counter()
             var batch1 = List[StreamReadGPU]()
             var batch2 = List[StreamReadGPU]()
             var paired = fq.paired
-            var i = 0
-            while i < batch_size:
-                var r1 = _read_one_gpu_pipe(fq.r1)
-                if r1.name.byte_length() == 0:
-                    break
-                batch1.append(r1^)
-                if paired:
-                    var r2 = _read_one_gpu_pipe(fq.r2)
-                    if r2.name.byte_length() == 0:
-                        raise Error("paired FASTQ length mismatch (R2 ended early)")
-                    batch2.append(r2^)
-                i += 1
+            var t_write = 0.0
+            var emit_n = 0
+            var ov_fail0 = 0
+            var ov_fail1 = 0
+
+            if has_pending:
+                @parameter
+                def ov_work(wi: Int):
+                    try:
+                        if wi == 0:
+                            emit_n = append_gaf_hits(out_fh, pending_hits)
+                        else:
+                            var i = 0
+                            while i < batch_size:
+                                var r1 = _read_one_gpu_pipe(fq.r1)
+                                if r1.name.byte_length() == 0:
+                                    break
+                                batch1.append(r1^)
+                                if paired:
+                                    var r2 = _read_one_gpu_pipe(fq.r2)
+                                    if r2.name.byte_length() == 0:
+                                        raise Error(
+                                            "paired FASTQ length mismatch (R2 ended early)"
+                                        )
+                                    batch2.append(r2^)
+                                i += 1
+                    except e:
+                        if wi == 0:
+                            ov_fail0 = 1
+                        else:
+                            ov_fail1 = 1
+                        print("mojo_stream emit||fastq overlap worker", wi, e)
+
+                parallelize[ov_work](2, 2)
+                if ov_fail0 != 0 or ov_fail1 != 0:
+                    raise Error("Giraffe emit||FASTQ overlap worker failed")
+                n_written += emit_n
+                pending_hits = List[AlignmentHit]()
+                has_pending = False
+                t_write = Float64(py=time.perf_counter()) - Float64(py=t0)
+            else:
+                var i = 0
+                while i < batch_size:
+                    var r1 = _read_one_gpu_pipe(fq.r1)
+                    if r1.name.byte_length() == 0:
+                        break
+                    batch1.append(r1^)
+                    if paired:
+                        var r2 = _read_one_gpu_pipe(fq.r2)
+                        if r2.name.byte_length() == 0:
+                            raise Error(
+                                "paired FASTQ length mismatch (R2 ended early)"
+                            )
+                        batch2.append(r2^)
+                    i += 1
             if len(batch1) == 0:
                 break
             var t_fastq = time.perf_counter()
@@ -912,6 +960,7 @@ def gpu_native_stream_loop(
                 ctx.synchronize()
                 var t_extend = time.perf_counter()
 
+                var t_host0 = time.perf_counter()
                 ri = 0
                 while ri < n_reads:
                     var qname = String("")
@@ -981,20 +1030,25 @@ def gpu_native_stream_loop(
                             batch_hits.append(h2s[1].copy())
                         n_records += 2
                     j += 1
-
-                n_written += append_gaf_hits(out_fh, batch_hits)
-                flush_emit(out_fh)
+                var t_host = time.perf_counter() - t_host0
+                # Defer write: overlapped with next FASTQ read.
+                pending_hits = batch_hits^
+                has_pending = True
                 var t_emit = time.perf_counter()
                 if profile:
                     print(
                         "mojo_stream stages_s fastq=",
-                        t_fastq - t0,
+                        t_fastq - t0 - t_write,
                         " gpu_seed=",
                         t_seed1 - t_seed0,
                         " locate=",
                         t_locate - t_seed1,
                         " cluster_extend=",
                         t_extend - t_locate,
+                        " host_hits=",
+                        t_host,
+                        " gaf_write_ov=",
+                        t_write,
                         " gaf_emit=",
                         t_emit - t_extend,
                         " n_batch=",
@@ -1052,7 +1106,8 @@ def gpu_native_stream_loop(
                         n_records += 2
                     j2 += 1
                 n_written += append_gaf_hits(out_fh, batch_hits2)
-                flush_emit(out_fh)
+                pending_hits = List[AlignmentHit]()
+                has_pending = False
                 if profile:
                     print(
                         "mojo_stream stages_s fastq=",
@@ -1063,6 +1118,11 @@ def gpu_native_stream_loop(
                         flush=True,
                     )
             _ = t_seed0
+
+        if has_pending:
+            n_written += append_gaf_hits(out_fh, pending_hits)
+            pending_hits = List[AlignmentHit]()
+            has_pending = False
 
         print(
             "mojo_stream_gpu_session records=",
