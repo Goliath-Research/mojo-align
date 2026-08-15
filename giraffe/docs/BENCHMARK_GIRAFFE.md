@@ -77,6 +77,16 @@ python scripts/build_mojo_segment_pack.py \
 | NVIDIA GH200 | `nvidia:sm_90` DeviceContext | PASS | CuPy / host-nvidia fallback **refused** on stream map |
 | AMD Instinct | `amdgpu:gfx942` (MI300X) / HIP | bakeoff **PENDING** | See `docs/ROCM_GIRAFFE_GATES.md`; set `METHYLGRAPHER_AMDGPU_ARCH` if needed. Same Mojo DeviceContext sources as NVIDIA — no second kernel dialect. Buffy wall twin of GH200 when MI300X available. |
 
+## Comparison arms (vg retained)
+
+`align_engine=cpu_vg` (`vg giraffe`) remains a first-class **before** arm (`align.pangenome_wgbs.vg`). MojoGiraffe is preferred science for production WGBS procedures; do **not** retire `cpu_vg` or flip fleet defaults solely from this bakeoff. MethylPipeline matrix: `docs/architecture/sample-prep-tooling.md` / plan `comparison-arms-bakeoff`.
+
+| Gate (2026-08-15) | Criterion | Status |
+|-------------------|-----------|--------|
+| vg vs Mojo dual-map wall | Report hours on agreed subset; ≤2h aspirational | **PENDING** / aspirational (no kernel work this pass) |
+| Named-coordinate GAF science | MethylCall path for both arms | Available via engine overlay |
+| Production site default flip away from Mojo WGBS | — | **Not done** (by design) |
+
 ## Rollback
 
 ```bash

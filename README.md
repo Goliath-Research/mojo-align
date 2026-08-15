@@ -17,29 +17,42 @@ Do not attach LICENSE files to the other packages.
 
 ## Align paths + sample layout
 
-Canonical align IDs (folder names under each sample):
+Canonical align IDs (folder names under each sample). **Before/after bakeoffs keep
+Clara and `vg` as first-class arms** — Mojo is preferred science, not a deletion
+of originals.
 
-| ID | Runtime |
-|----|---------|
-| `align.linear.parabricks` | NVIDIA Parabricks `fq2bam_meth` |
-| `align.pangenome.parabricks` | Parabricks `giraffe` (BAM) |
-| `align.linear.mojo` | MojoFq2bamMeth (`fq2bam-meth`) |
-| `align.pangenome.vg` | `vg giraffe` via methylGrapher (`cpu_vg`) |
-| `align.pangenome_wgbs.mojo` | MojoGiraffe dual-graph |
+| ID | Runtime | Role |
+|----|---------|------|
+| `align.linear.parabricks` | NVIDIA Parabricks `fq2bam_meth` | **Before** linear baseline |
+| `align.linear.mojo` | MojoFq2bamMeth (`fq2bam-meth`) | **After** portable linear |
+| `align.pangenome.parabricks` | Parabricks `giraffe` (BAM) | Stock non-BS pangenome (not WGBS GAF) |
+| `align.pangenome.vg` / `align.pangenome_wgbs.vg` | `vg giraffe` (`cpu_vg`) | **Before** named-coordinate GAF oracle |
+| `align.pangenome_wgbs.mojo` | MojoGiraffe dual-graph | **After** preferred WGBS science |
+
+Optional extract staging (MethylPipeline compare harness; not written by this CLI):
+
+| ID | Tool | Role |
+|----|------|------|
+| `extract.methylextractor/` | MethylExtractor | Production linear extract |
+| `extract.methyldackel/` | Upstream MethylDackel | Optional A/B only |
 
 ```
 /work/samples/<sampleId>/
   *.fastq.gz
-  align.linear.parabricks/   # BAM, BAI, metrics, {chr}-{ctx}.h5
+  align.linear.parabricks/   # BAM, BAI, metrics
   align.linear.mojo/         # same shape — parity vs Parabricks
   align.pangenome.parabricks/
-  align.pangenome.vg/
+  align.pangenome.vg/          # or align.pangenome_wgbs.vg
   align.pangenome_wgbs.mojo/
+  extract.methylextractor/     # optional staging
+  extract.methyldackel/        # optional A/B
 ```
 
 Multiple align dirs may coexist for side-by-side parity and linear→pangenome
 comparisons. MethylPipeline owns creating these folders; tools write to the
-`-work_dir` they are given.
+`-work_dir` they are given. Comparison reports land under
+`/work/samples/_comparisons/<stamp>/` (see MethylPipeline
+`docs/architecture/sample-prep-tooling.md`).
 
 ## Quick start
 

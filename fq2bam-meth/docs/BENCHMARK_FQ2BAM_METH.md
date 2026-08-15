@@ -56,17 +56,29 @@ Harness: [`scripts/benchmark_clara_fq2bam_meth.sh`](../scripts/benchmark_clara_f
 | AMD MI300X twin | Mojo AMD wall ≈ NVIDIA Mojo twin; ≫ BWA CPU | **PENDING** ROCm bakeoff |
 | Complete status | both wall-clock gates green | **PENDING** (default mapper is already `mojo`) |
 
-Default `METHYLGRAPHER_LINEAR_MAPPER` is already `mojo`; operator gates decide when to mark the component **Complete** in the README, not when to flip the default.
+**Site defaults:** do **not** flip production `actionConfig.parabricks.engine` based on this table alone. Clara remains a first-class before-arm (`align.linear.parabricks`) for before/after bakeoffs — see MethylPipeline `docs/architecture/sample-prep-tooling.md` and `docs/plans/comparison-arms-bakeoff.plan.md`.
 
 Record operator runs:
 
 ```bash
 scripts/benchmark_clara_fq2bam_meth.sh /path/to/R1.fastq.gz /path/to/R2.fastq.gz /path/to/ref.fa nvidia
 scripts/benchmark_fq2bam_meth.sh /path/to/R1.fastq.gz /path/to/R2.fastq.gz /path/to/ref.fa
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh --device nvidia
+```
+
+MethylPipeline report staging (after arms exist):
+
+```bash
+.venv/bin/python scripts/comparison_arms_report.py \
+  --sample-id <id> --ensure-arms \
+  --arm-metric 'align.linear.parabricks:status=operator,wall_s=<clara>' \
+  --arm-metric 'align.linear.mojo:status=operator,wall_s=<mojo>' \
+  --note 'Clara retained for comparison; no site-default flip'
 ```
 
 ## Rollback
 
 ```bash
 export METHYLGRAPHER_LINEAR_MAPPER=bwa
+# Or MethylPipeline: actionConfig.parabricks.engine=parabricks
 ```
