@@ -37,8 +37,9 @@ Toy / development: native Mojo `giraffe_mapper` + `giraffe_index` / `extend_exac
 
 1. **Index / pack** — ensure `{gbz}.mojo_segments/` dense pack.
 2. **Device gate + GPU warmup** — `giraffe_device` + `giraffe_gpu_kernels` (`nvidia:sm_90` / `amdgpu:gfx942`). Driver &lt;580 needs `MODULAR_NVPTX_COMPILER_PATH=ptxas`. Empty/`1` `METHYLGRAPHER_GPU_REQUIRE` fails closed if DeviceContext cannot be created for nvidia/amd; set `0` to allow host kernels.
-3. **GPU-native stream** — HBM preflight via `nvidia-smi` / `rocm-smi` ([`engine/gpu_mem.py`](../engine/gpu_mem.py); fail closed with free/need GiB before DeviceContext alloc), Mojo-native index upload (`upload_mmap_to_device`), then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `METHYLGRAPHER_MOJO_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `cluster_extend` / `gaf_emit`. DeviceContext backend token `cuda`/`hip` is Mojo framework naming for NVIDIA/AMD — production app code does not call libcudart.
+3. **GPU-native stream** — HBM preflight via `nvidia-smi` / `rocm-smi` ([`engine/gpu_mem.py`](../engine/gpu_mem.py); fail closed with free/need GiB before DeviceContext alloc), Mojo-native index upload (`upload_mmap_to_device`), then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `METHYLGRAPHER_MOJO_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `sync_prefetch` / `host_hits` / `gaf_emit`. DeviceContext backend token `cuda`/`hip` is Mojo framework naming for NVIDIA/AMD — production app code does not call libcudart.
 4. **Pair tags** — PE `ri`/`os`/`rc` on the primary pair (before any secondary).
+5. **Dual-graph** — default **serialize** C2T then G2A on one GPU (HBM handoff). Set `METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` or `auto` only when ≥2 discrete GPUs are visible; each MojoGiraffe subprocess gets `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` pinned (never two DeviceContexts on one GPU).
 
 ## MethylCall-consumed GAF fields
 

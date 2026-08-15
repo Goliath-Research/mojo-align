@@ -17,6 +17,8 @@ python3 scripts/profile_giraffe_stages.py --device cpu \
 
 **Production Mojo stream map** — set `METHYLGRAPHER_PROFILE_STAGES=1` and run
 `MojoGiraffe -gbz …`; stage lines print as `mojo_stream stages_s …`.
+Requires `MODULAR_NVPTX_COMPILER_PATH=/usr/bin/ptxas` on driver &lt;580 and
+`METHYLGRAPHER_GPU_HBM_FRACTION` (e.g. `0.90`) for the capacity preflight.
 
 Toy GBZ oracle profile (2026-08-08, GH200; cold pack build excluded):
 
@@ -26,6 +28,21 @@ Toy GBZ oracle profile (2026-08-08, GH200; cold pack build excluded):
 | `cluster_extend` | ~75% | zip/dist cluster + gapless |
 | `gaf_emit` | ~16% | streamed GAF lines |
 | `fastq_batch` | ~5% | streaming PE batches |
+
+### Production Buffy-scale subset (2026-08-15, GH200, 65 536 PE)
+
+HPRC d9-bs C2T GBZ + dense pack; `METHYLGRAPHER_MOJO_READ_BATCH=8192`; banner
+`devicecontext-cuda+gpu_ht+gpu_gapless+mojo_stream`.
+
+| Stage (steady batch) | Wall / 8192 pairs | Notes |
+|----------------------|-------------------|-------|
+| `gpu_seed` + `locate` | ~1–2 ms | Device kernels; buffer reuse |
+| GPU gapless (in `sync_prefetch`) | ~1–2 ms true GPU | Prefetch overlaps FASTQ with sync |
+| `sync_prefetch` | ~**90–100 ms** | Dominated by MG FASTQ header parse (`os:Z` originals) |
+| `host_hits` | ~5 ms | PE tag assembly (shrunk vs prior List copies) |
+| `gaf_write_ov` / emit | ~2–5 ms | Already fixed 2026-08-14 |
+
+**Attribution:** remaining wall is **FASTQ / MG-header parse**, not DeviceContext map kernels. Kernel work this pass (reuse, always-on `DIST_CAP` prune, gapless early-exit, sync∥prefetch, chunked `_ascii_span`, scan-based MG header parse) keeps GPU ≪ I/O.
 
 `vg giraffe` full-Buffy dual-map baseline remains **~6.2 h** (operator). Mojo gate: dual-map ≤ **~2 h** + DS20M MethylCall parity.
 
@@ -55,7 +72,7 @@ python3 scripts/giraffe_gaf_parity.py --mojo /tmp/mojo_gbz.gaf \
 | DS-scale (500 PE) on toy GBZ | GAF lines land | **PASS** (protocol smoke) |
 | Buffy-subset seed+extend | oracle `quartet_map` 13/13; production = stream_map | **PASS** stream_map 13/13 (pack-walk fixture; emit-time named-coords) |
 | DS20M `graph.methyl` vs `cpu_vg` | `parity_compare.py` | **PASS** 20k-line subset: python vs mojo MethylCall identical (`graph.methyl` 18996, `graph.cpg.tsv` 18837) |
-| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **NOT MET (2026-08-14 retime)** Mojo native GAF emit: `gaf_emit` median **~0.006 s** / 8192-pair batch (was ~0.6–0.9 s); steady ~**78k pairs/s** on GH200 ⇒ ~2.7 h / graph, ~5.4 h dual (still >2 h). R2 EOF guards + equal convert sidecars in place. Keep `cpu_vg` default |
+| Full Buffy dual-map ≤ ~2 h | wall vs ~6.2 h `vg` baseline | **NOT MET (2026-08-15 kernel pass)** Prior emit fix ~78k pairs/s (~5.4 h dual). This pass: GPU seed/locate/gapless ~2 ms/8192; steady wall still ~**75–90k pairs/s** (MG FASTQ header parse ~0.1 s/batch). Need ~210k pairs/s for serial ≤2 h. Multi-GPU `DUAL_GRAPH_PARALLEL=1` only when `nvidia-smi -L` ≥2 (one process/GPU). Keep `cpu_vg` library default. |
 | Production `gpu_giraffe` → Mojo GBZ | READY default-on + dense pack + quartet | **WIRED** (opt out with `READY=0`) |
 
 Build production dense segment packs (preferred — from companion GFA):
@@ -83,9 +100,10 @@ python scripts/build_mojo_segment_pack.py \
 
 | Gate (2026-08-15) | Criterion | Status |
 |-------------------|-----------|--------|
-| vg vs Mojo dual-map wall | Report hours on agreed subset; ≤2h aspirational | **PENDING** / aspirational (no kernel work this pass) |
+| vg vs Mojo dual-map wall | Report hours on agreed subset; ≤2h aspirational | **NOT MET** — ~75–90k pairs/s after kernel pass; see stage table above |
 | Named-coordinate GAF science | MethylCall path for both arms | Available via engine overlay |
-| Production site default flip away from Mojo WGBS | — | **Not done** (by design) |
+| Multi-GPU dual-parallel | `METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` or `auto` with ≥2 GPUs; one process per GPU | Documented; this host has 1× GH200 → serial |
+| Production site / library default flip | — | **Not done** (by design; keep `cpu_vg`) |
 
 ## Rollback
 

@@ -230,7 +230,7 @@ class SystemExecute(object):
     def __init__(self):
         self._pool = []
 
-    def execute(self, cmd, stdout=None, stderr=None):
+    def execute(self, cmd, stdout=None, stderr=None, env=None):
         if stdout is None:
             stdout = subprocess.PIPE
         else:
@@ -245,7 +245,13 @@ class SystemExecute(object):
                 os.makedirs(os.path.dirname(stderr))
             stderr = open(stderr, "a")
 
-        sp = subprocess.Popen(cmd, shell=True, stdout=stdout, stderr=stderr)
+        run_env = None
+        if env is not None:
+            run_env = os.environ.copy()
+            run_env.update(env)
+        sp = subprocess.Popen(
+            cmd, shell=True, stdout=stdout, stderr=stderr, env=run_env
+        )
         self._pool.append(sp)
 
         stdout, stderr = sp.stdout, sp.stderr

@@ -18,12 +18,21 @@ from linear_fastq import (
 def _ascii_span(buf_addr: Int, off: Int, n: Int) raises -> String:
     if n <= 0:
         return String("")
+    # Chunked ``+= chr`` (64-byte pieces) — full-string ``+=`` was O(n^2) on long
+    # MG headers (embedded original_seq). No Python here: this runs under
+    # ``parallelize`` (sync||prefetch) where ``Python.import_module`` segfaults.
     var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=buf_addr + off)
     var out = String("")
+    var chunk = String("")
     var i = 0
     while i < n:
-        out += chr(Int(p[i]))
+        chunk += chr(Int(p[i]))
+        if chunk.byte_length() >= 64:
+            out += chunk
+            chunk = String("")
         i += 1
+    if chunk.byte_length() > 0:
+        out += chunk
     return out^
 
 

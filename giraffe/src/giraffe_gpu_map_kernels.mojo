@@ -48,7 +48,10 @@ comptime OFF_MASK = REV_MASK - 1
 comptime MAX_OCCS = 64
 comptime HIT_CAP = 24
 comptime MAX_CLUSTER = 16
+# Node-id distance prune (heuristic when zip/dist STAGED); always on in GPU path.
 comptime DIST_CAP = 200
+# Fixed query stride so batch device buffers can be reused across the stream.
+comptime READ_STRIDE_CAP = 256
 
 
 struct StreamReadGPU(Copyable, Movable):
@@ -102,27 +105,42 @@ def _pe_extra_tags(
 
 
 def _parse_mg_fastq_fields(n: String, s: String) -> StreamReadGPU:
+    """Parse methylGrapher converted FASTQ header (``id_C2T_i_original``).
+
+    Single left-to-right scan — avoid ``split`` + re-join on long ``original_seq``.
+    """
     var bare = n
     var original = s
     var conversion = String("")
-    var parts = n.split("_")
-    if len(parts) >= 4:
-        var conv = String(parts[1])
+    # Find first three '_' separators without building a parts list.
+    var u0 = -1
+    var u1 = -1
+    var u2 = -1
+    var i = 0
+    var nlen = n.byte_length()
+    while i < nlen:
+        if n[byte = i : i + 1] == "_":
+            if u0 < 0:
+                u0 = i
+            elif u1 < 0:
+                u1 = i
+            elif u2 < 0:
+                u2 = i
+                break
+        i += 1
+    if u0 >= 0 and u1 > u0 and u2 > u1:
+        var conv = String(n[byte = u0 + 1 : u1])
         if conv == "C2T" or conv == "G2A":
-            bare = String(parts[0])
+            bare = String(n[byte = 0 : u0])
             conversion = conv
-            original = String(parts[3])
-            var pi = 4
-            while pi < len(parts):
-                original = original + "_" + String(parts[pi])
-                pi += 1
+            original = String(n[byte = u2 + 1 : nlen])
         else:
-            bare = String(parts[0])
-    elif len(parts) > 0:
-        bare = String(parts[0])
-    var sp = bare.split(" ")
-    if len(sp) > 0:
-        bare = String(sp[0])
+            bare = String(n[byte = 0 : u0])
+    elif u0 >= 0:
+        bare = String(n[byte = 0 : u0])
+    var sp = bare.find(" ")
+    if sp >= 0:
+        bare = String(bare[byte = 0 : sp])
     return StreamReadGPU(bare, s, original, conversion)
 
 
@@ -151,7 +169,7 @@ def gpu_native_stream_loop(
     else:
         from std.gpu import block_dim, block_idx, thread_idx
         from std.gpu.host import DeviceContext
-        from std.memory import UnsafePointer, memcpy
+        from std.memory import UnsafePointer, memcpy, memset
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
@@ -458,13 +476,14 @@ def gpu_native_stream_loop(
             if n_in <= 0:
                 out_n[ri] = 0
                 return
+            # Single-pass bucket histogram (HIT_CAP small) vs O(n^2) recount.
             var best_bucket = Int(in_node[base]) >> 8
             var best_count = 0
             var i = 0
             while i < n_in:
                 var b = Int(in_node[base + i]) >> 8
-                var c = 0
-                var j = 0
+                var c = 1
+                var j = i + 1
                 while j < n_in:
                     if (Int(in_node[base + j]) >> 8) == b:
                         c += 1
@@ -472,6 +491,10 @@ def gpu_native_stream_loop(
                 if c > best_count:
                     best_count = c
                     best_bucket = b
+                # Skip ahead over same bucket once counted? Keep simple: still O(n^2)
+                # but early-exit when remaining cannot beat best_count.
+                if best_count >= (n_in - i):
+                    break
                 i += 1
             var anchor = -1
             var written: Int32 = 0
@@ -632,6 +655,9 @@ def gpu_native_stream_loop(
                         best_score = score
                         best_matched = matched
                         best_mism = mism
+                    # Prefer primary seed start: skip remaining trials when near-perfect.
+                    if matched >= (qlen * 9) // 10 and mism <= 1:
+                        break
                 trial += 1
 
             if best_score < 0:
@@ -698,14 +724,54 @@ def gpu_native_stream_loop(
         var n_records = 0
         var n_written = 0
         var prune_dist = dist.byte_length() > 0
-        var do_prune = 0
-        if prune_dist:
-            do_prune = 1
+        # Always apply DIST_CAP prune on GPU path (zip/dist STAGED); dist path
+        # presence only logs richer pruning later. Fewer seeds → gapless.
+        var do_prune = 1
+        _ = prune_dist
         comptime BLOCK = 256
 
         # Deferred GAF emit overlapped with the next FASTQ batch read.
         var pending_hits = List[AlignmentHit]()
         var has_pending = False
+        var pref1 = List[StreamReadGPU]()
+        var pref2 = List[StreamReadGPU]()
+        var has_pref = False
+
+        # Reuse HBM/host batch buffers across the stream (avoid per-batch create).
+        var cap_reads = batch_size * 2
+        if cap_reads < 2:
+            cap_reads = 2
+        var cap_bases = cap_reads * READ_STRIDE_CAP
+        var cap_slots = cap_reads * MAX_CLUSTER
+        var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](cap_bases)
+        var host_lens = ctx.enqueue_create_host_buffer[DType.int32](cap_reads)
+        var d_bases = ctx.enqueue_create_buffer[DType.uint8](cap_bases)
+        var d_codes = ctx.enqueue_create_buffer[DType.uint8](cap_bases)
+        var d_kf = ctx.enqueue_create_buffer[DType.uint64](cap_bases)
+        var d_kr = ctx.enqueue_create_buffer[DType.uint64](cap_bases)
+        var d_hf = ctx.enqueue_create_buffer[DType.uint64](cap_bases)
+        var d_hr = ctx.enqueue_create_buffer[DType.uint64](cap_bases)
+        var d_valid = ctx.enqueue_create_buffer[DType.uint8](cap_bases)
+        var d_lens = ctx.enqueue_create_buffer[DType.int32](cap_reads)
+        var d_occ_keys = ctx.enqueue_create_buffer[DType.uint64](cap_reads * MAX_OCCS)
+        var d_occ_n = ctx.enqueue_create_buffer[DType.int32](cap_reads)
+        var d_hit_node = ctx.enqueue_create_buffer[DType.int32](cap_reads * HIT_CAP)
+        var d_hit_orient = ctx.enqueue_create_buffer[DType.uint8](cap_reads * HIT_CAP)
+        var d_hit_off = ctx.enqueue_create_buffer[DType.int32](cap_reads * HIT_CAP)
+        var d_hit_n = ctx.enqueue_create_buffer[DType.int32](cap_reads)
+        var d_cl_node = ctx.enqueue_create_buffer[DType.int32](cap_slots)
+        var d_cl_orient = ctx.enqueue_create_buffer[DType.uint8](cap_slots)
+        var d_cl_off = ctx.enqueue_create_buffer[DType.int32](cap_slots)
+        var d_cl_n = ctx.enqueue_create_buffer[DType.int32](cap_reads)
+        var d_out_node = ctx.enqueue_create_buffer[DType.int32](cap_slots)
+        var d_out_mapq = ctx.enqueue_create_buffer[DType.int32](cap_slots)
+        var d_out_matched = ctx.enqueue_create_buffer[DType.int32](cap_slots)
+        var d_out_valid = ctx.enqueue_create_buffer[DType.uint8](cap_slots)
+        var h_node = ctx.enqueue_create_host_buffer[DType.int32](cap_slots)
+        var h_mapq = ctx.enqueue_create_host_buffer[DType.int32](cap_slots)
+        var h_matched = ctx.enqueue_create_host_buffer[DType.int32](cap_slots)
+        var h_valid = ctx.enqueue_create_host_buffer[DType.uint8](cap_slots)
+        var pack_large = pack.size() > 50_000
 
         while True:
             var t0 = time.perf_counter()
@@ -717,7 +783,19 @@ def gpu_native_stream_loop(
             var ov_fail0 = 0
             var ov_fail1 = 0
 
-            if has_pending:
+            if has_pref:
+                batch1 = pref1^
+                batch2 = pref2^
+                pref1 = List[StreamReadGPU]()
+                pref2 = List[StreamReadGPU]()
+                has_pref = False
+                if has_pending:
+                    emit_n = append_gaf_hits(out_fh, pending_hits)
+                    n_written += emit_n
+                    pending_hits = List[AlignmentHit]()
+                    has_pending = False
+                    t_write = Float64(py=time.perf_counter()) - Float64(py=t0)
+            elif has_pending:
                 @parameter
                 def ov_work(wi: Int):
                     try:
@@ -786,43 +864,38 @@ def gpu_native_stream_loop(
                 if L > max_len:
                     max_len = L
                 ri += 1
+            if max_len > READ_STRIDE_CAP:
+                raise Error(
+                    "read length "
+                    + String(max_len)
+                    + " exceeds READ_STRIDE_CAP="
+                    + String(READ_STRIDE_CAP)
+                )
+            if n_reads > cap_reads:
+                raise Error("n_reads exceeds reused batch capacity")
 
             var t_seed0 = time.perf_counter()
-            var per_read_hits = List[List[AlignmentHit]]()
-            ri = 0
-            while ri < n_reads:
-                per_read_hits.append(List[AlignmentHit]())
-                ri += 1
-
             var ran_gpu_batch = False
             if max_len >= meta.k and n_reads > 0:
                 ran_gpu_batch = True
-                var n_bases = n_reads * max_len
-                var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
-                var host_lens = ctx.enqueue_create_host_buffer[DType.int32](n_reads)
+                var stride = READ_STRIDE_CAP
+                var n_bases = n_reads * stride
+                # memset unused lanes to N so kmer kernels stay valid.
+                memset(host_bases.unsafe_ptr(), 78, n_bases)
                 ri = 0
                 while ri < n_reads:
                     var s = seqs[ri]
                     var L = s.byte_length()
                     host_lens[ri] = Int32(L)
-                    var base = ri * max_len
-                    var p = 0
-                    while p < max_len:
-                        if p < L:
-                            host_bases[base + p] = UInt8(ord(s[byte = p : p + 1]))
-                        else:
-                            host_bases[base + p] = 78
-                        p += 1
+                    if L > 0:
+                        var sb = s.as_bytes()
+                        memcpy(
+                            dest=host_bases.unsafe_ptr() + ri * stride,
+                            src=sb.unsafe_ptr(),
+                            count=L,
+                        )
                     ri += 1
 
-                var d_bases = ctx.enqueue_create_buffer[DType.uint8](n_bases)
-                var d_codes = ctx.enqueue_create_buffer[DType.uint8](n_bases)
-                var d_kf = ctx.enqueue_create_buffer[DType.uint64](n_bases)
-                var d_kr = ctx.enqueue_create_buffer[DType.uint64](n_bases)
-                var d_hf = ctx.enqueue_create_buffer[DType.uint64](n_bases)
-                var d_hr = ctx.enqueue_create_buffer[DType.uint64](n_bases)
-                var d_valid = ctx.enqueue_create_buffer[DType.uint8](n_bases)
-                var d_lens = ctx.enqueue_create_buffer[DType.int32](n_reads)
                 ctx.enqueue_copy(src_buf=host_bases, dst_buf=d_bases)
                 ctx.enqueue_copy(src_buf=host_lens, dst_buf=d_lens)
 
@@ -843,16 +916,12 @@ def gpu_native_stream_loop(
                     d_valid.unsafe_ptr(),
                     n_bases,
                     meta.k,
-                    max_len,
+                    stride,
                     grid_dim=grid_bases,
                     block_dim=BLOCK,
                 )
                 var t_seed1 = time.perf_counter()
 
-                var d_occ_keys = ctx.enqueue_create_buffer[DType.uint64](
-                    n_reads * MAX_OCCS
-                )
-                var d_occ_n = ctx.enqueue_create_buffer[DType.int32](n_reads)
                 var grid_reads = (n_reads + BLOCK - 1) // BLOCK
                 ctx.enqueue_function[window_reduce_kernel](
                     d_kf.unsafe_ptr(),
@@ -864,23 +933,13 @@ def gpu_native_stream_loop(
                     d_occ_keys.unsafe_ptr(),
                     d_occ_n.unsafe_ptr(),
                     n_reads,
-                    max_len,
+                    stride,
                     meta.k,
                     meta.w,
                     grid_dim=grid_reads,
                     block_dim=BLOCK,
                 )
 
-                var d_hit_node = ctx.enqueue_create_buffer[DType.int32](
-                    n_reads * HIT_CAP
-                )
-                var d_hit_orient = ctx.enqueue_create_buffer[DType.uint8](
-                    n_reads * HIT_CAP
-                )
-                var d_hit_off = ctx.enqueue_create_buffer[DType.int32](
-                    n_reads * HIT_CAP
-                )
-                var d_hit_n = ctx.enqueue_create_buffer[DType.int32](n_reads)
                 ctx.enqueue_function[ht_probe_kernel](
                     dev_ht.unsafe_ptr(),
                     d_occ_keys.unsafe_ptr(),
@@ -897,16 +956,6 @@ def gpu_native_stream_loop(
                 )
                 var t_locate = time.perf_counter()
 
-                var d_cl_node = ctx.enqueue_create_buffer[DType.int32](
-                    n_reads * MAX_CLUSTER
-                )
-                var d_cl_orient = ctx.enqueue_create_buffer[DType.uint8](
-                    n_reads * MAX_CLUSTER
-                )
-                var d_cl_off = ctx.enqueue_create_buffer[DType.int32](
-                    n_reads * MAX_CLUSTER
-                )
-                var d_cl_n = ctx.enqueue_create_buffer[DType.int32](n_reads)
                 ctx.enqueue_function[cluster_kernel](
                     d_hit_node.unsafe_ptr(),
                     d_hit_orient.unsafe_ptr(),
@@ -923,15 +972,11 @@ def gpu_native_stream_loop(
                 )
 
                 var n_slots = n_reads * MAX_CLUSTER
-                var d_out_node = ctx.enqueue_create_buffer[DType.int32](n_slots)
-                var d_out_mapq = ctx.enqueue_create_buffer[DType.int32](n_slots)
-                var d_out_matched = ctx.enqueue_create_buffer[DType.int32](n_slots)
-                var d_out_valid = ctx.enqueue_create_buffer[DType.uint8](n_slots)
                 var grid_slots = (n_slots + BLOCK - 1) // BLOCK
                 ctx.enqueue_function[gapless_kernel](
                     d_bases.unsafe_ptr(),
                     d_lens.unsafe_ptr(),
-                    max_len,
+                    stride,
                     dev_off.unsafe_ptr(),
                     dev_seq.unsafe_ptr(),
                     meta.pack_n,
@@ -949,73 +994,152 @@ def gpu_native_stream_loop(
                     block_dim=BLOCK,
                 )
 
-                var h_node = ctx.enqueue_create_host_buffer[DType.int32](n_slots)
-                var h_mapq = ctx.enqueue_create_host_buffer[DType.int32](n_slots)
-                var h_matched = ctx.enqueue_create_host_buffer[DType.int32](n_slots)
-                var h_valid = ctx.enqueue_create_host_buffer[DType.uint8](n_slots)
                 ctx.enqueue_copy(src_buf=d_out_node, dst_buf=h_node)
                 ctx.enqueue_copy(src_buf=d_out_mapq, dst_buf=h_mapq)
                 ctx.enqueue_copy(src_buf=d_out_matched, dst_buf=h_matched)
                 ctx.enqueue_copy(src_buf=d_out_valid, dst_buf=h_valid)
-                ctx.synchronize()
-                var t_extend = time.perf_counter()
+                # Overlap DeviceContext sync with prefetch of the next FASTQ batch.
+                var next1 = List[StreamReadGPU]()
+                var next2 = List[StreamReadGPU]()
+                var next_paired = paired
+                var prefetch_ok = 1
+                var sync_fail = 0
+                @parameter
+                def sync_or_prefetch(wi: Int):
+                    try:
+                        if wi == 0:
+                            ctx.synchronize()
+                        else:
+                            var i = 0
+                            while i < batch_size:
+                                var r1 = _read_one_gpu_pipe(fq.r1)
+                                if r1.name.byte_length() == 0:
+                                    break
+                                next1.append(r1^)
+                                if next_paired:
+                                    var r2 = _read_one_gpu_pipe(fq.r2)
+                                    if r2.name.byte_length() == 0:
+                                        raise Error(
+                                            "paired FASTQ length mismatch (R2 ended early)"
+                                        )
+                                    next2.append(r2^)
+                                i += 1
+                    except e:
+                        if wi == 0:
+                            sync_fail = 1
+                        else:
+                            prefetch_ok = 0
+                        print("mojo_stream sync||prefetch worker", wi, e)
+
+                parallelize[sync_or_prefetch](2, 2)
+                if sync_fail != 0:
+                    raise Error("Giraffe DeviceContext synchronize failed")
+                var t_sync_pref = time.perf_counter()
+                if prefetch_ok != 0 and len(next1) > 0:
+                    pref1 = next1^
+                    pref2 = next2^
+                    has_pref = True
+                var t_extend = t_sync_pref
+                var t_prefetch = t_sync_pref - t_locate
 
                 var t_host0 = time.perf_counter()
-                ri = 0
-                while ri < n_reads:
-                    var qname = String("")
-                    if ri < len(batch1):
-                        qname = batch1[ri].name
-                    else:
-                        qname = batch2[ri - len(batch1)].name
-                    var qlen = seqs[ri].byte_length()
-                    var row = List[AlignmentHit]()
-                    var si = 0
-                    while si < MAX_CLUSTER and len(row) < 2:
-                        var tid = ri * MAX_CLUSTER + si
-                        if h_valid[tid] != 0:
-                            var matched = Int(h_matched[tid])
-                            var mq = Int(h_mapq[tid])
-                            var cs = "cs:Z::" + String(matched)
-                            if mq >= 60:
-                                cs = "cs:Z::" + String(qlen)
-                            row.append(
-                                AlignmentHit(
-                                    qname,
-                                    ">" + String(Int(h_node[tid])),
-                                    qlen,
-                                    mq,
-                                    cs,
-                                )
-                            )
-                        si += 1
-                    if len(row) == 0:
-                        row = _fixture_extend_tiny(pack, qname, seqs[ri], meta.k)
-                    per_read_hits[ri] = row^
-                    ri += 1
-
                 var batch_hits = List[AlignmentHit]()
+                # Build PE / SE hits directly from D2H — skip per_read List copies.
                 var j = 0
                 while j < len(batch1):
                     var a = batch1[j].copy()
-                    var h1s = per_read_hits[j].copy()
+                    var r1_i = j
+                    var r2_i = len(batch1) + j
                     if not paired:
                         n_records += 1
-                        for h in h1s:
-                            batch_hits.append(h.copy())
+                        var si = 0
+                        var took = 0
+                        while si < MAX_CLUSTER and took < 2:
+                            var tid = r1_i * MAX_CLUSTER + si
+                            if h_valid[tid] != 0:
+                                var matched = Int(h_matched[tid])
+                                var mq = Int(h_mapq[tid])
+                                var qlen = Int(host_lens[r1_i])
+                                var cs = "cs:Z::" + String(matched)
+                                if mq >= 60:
+                                    cs = "cs:Z::" + String(qlen)
+                                batch_hits.append(
+                                    AlignmentHit(
+                                        a.name,
+                                        ">" + String(Int(h_node[tid])),
+                                        qlen,
+                                        mq,
+                                        cs,
+                                    )
+                                )
+                                took += 1
+                            si += 1
+                        if took == 0 and not pack_large:
+                            var tiny = _fixture_extend_tiny(
+                                pack, a.name, seqs[r1_i], meta.k
+                            )
+                            for h in tiny:
+                                batch_hits.append(h.copy())
                     else:
                         var b = batch2[j].copy()
-                        var h2s = per_read_hits[len(batch1) + j].copy()
                         var h1 = AlignmentHit(
                             a.name, "*", a.seq.byte_length(), 0, "cs:Z:*"
                         )
                         var h2 = AlignmentHit(
                             b.name, "*", b.seq.byte_length(), 0, "cs:Z:*"
                         )
-                        if len(h1s) > 0:
-                            h1 = h1s[0].copy()
-                        if len(h2s) > 0:
-                            h2 = h2s[0].copy()
+                        var si = 0
+                        var took1 = 0
+                        while si < MAX_CLUSTER and took1 < 1:
+                            var tid = r1_i * MAX_CLUSTER + si
+                            if h_valid[tid] != 0:
+                                var matched = Int(h_matched[tid])
+                                var mq = Int(h_mapq[tid])
+                                var qlen = Int(host_lens[r1_i])
+                                var cs = "cs:Z::" + String(matched)
+                                if mq >= 60:
+                                    cs = "cs:Z::" + String(qlen)
+                                h1 = AlignmentHit(
+                                    a.name,
+                                    ">" + String(Int(h_node[tid])),
+                                    qlen,
+                                    mq,
+                                    cs,
+                                )
+                                took1 = 1
+                            si += 1
+                        si = 0
+                        var took2 = 0
+                        while si < MAX_CLUSTER and took2 < 1:
+                            var tid2 = r2_i * MAX_CLUSTER + si
+                            if h_valid[tid2] != 0:
+                                var matched2 = Int(h_matched[tid2])
+                                var mq2 = Int(h_mapq[tid2])
+                                var qlen2 = Int(host_lens[r2_i])
+                                var cs2 = "cs:Z::" + String(matched2)
+                                if mq2 >= 60:
+                                    cs2 = "cs:Z::" + String(qlen2)
+                                h2 = AlignmentHit(
+                                    b.name,
+                                    ">" + String(Int(h_node[tid2])),
+                                    qlen2,
+                                    mq2,
+                                    cs2,
+                                )
+                                took2 = 1
+                            si += 1
+                        if took1 == 0 and not pack_large:
+                            var tiny1 = _fixture_extend_tiny(
+                                pack, a.name, seqs[r1_i], meta.k
+                            )
+                            if len(tiny1) > 0:
+                                h1 = tiny1[0].copy()
+                        if took2 == 0 and not pack_large:
+                            var tiny2 = _fixture_extend_tiny(
+                                pack, b.name, seqs[r2_i], meta.k
+                            )
+                            if len(tiny2) > 0:
+                                h2 = tiny2[0].copy()
                         h1.extra_tags = _pe_extra_tags(
                             1, a.original_seq, a.conversion, "CT"
                         )
@@ -1023,11 +1147,7 @@ def gpu_native_stream_loop(
                             2, b.original_seq, b.conversion, "GA"
                         )
                         batch_hits.append(h1^)
-                        if len(h1s) > 1:
-                            batch_hits.append(h1s[1].copy())
                         batch_hits.append(h2^)
-                        if len(h2s) > 1:
-                            batch_hits.append(h2s[1].copy())
                         n_records += 2
                     j += 1
                 var t_host = time.perf_counter() - t_host0
@@ -1043,8 +1163,8 @@ def gpu_native_stream_loop(
                         t_seed1 - t_seed0,
                         " locate=",
                         t_locate - t_seed1,
-                        " cluster_extend=",
-                        t_extend - t_locate,
+                        " sync_prefetch=",
+                        t_prefetch,
                         " host_hits=",
                         t_host,
                         " gaf_write_ov=",
@@ -1058,39 +1178,35 @@ def gpu_native_stream_loop(
 
             if not ran_gpu_batch:
                 # Short-read toys (len < k): fixture exact-match on tiny packs only.
-                ri = 0
-                while ri < n_reads:
-                    var qname2 = String("")
-                    if ri < len(batch1):
-                        qname2 = batch1[ri].name
-                    else:
-                        qname2 = batch2[ri - len(batch1)].name
-                    per_read_hits[ri] = _fixture_extend_tiny(
-                        pack, qname2, seqs[ri], meta.k
-                    )
-                    ri += 1
                 var batch_hits2 = List[AlignmentHit]()
                 var j2 = 0
                 while j2 < len(batch1):
                     var a2 = batch1[j2].copy()
-                    var h1s2 = per_read_hits[j2].copy()
                     if not paired:
                         n_records += 1
-                        for h in h1s2:
+                        var tiny = _fixture_extend_tiny(
+                            pack, a2.name, seqs[j2], meta.k
+                        )
+                        for h in tiny:
                             batch_hits2.append(h.copy())
                     else:
                         var b2 = batch2[j2].copy()
-                        var h2s2 = per_read_hits[len(batch1) + j2].copy()
                         var h1b = AlignmentHit(
                             a2.name, "*", a2.seq.byte_length(), 0, "cs:Z:*"
                         )
                         var h2b = AlignmentHit(
                             b2.name, "*", b2.seq.byte_length(), 0, "cs:Z:*"
                         )
-                        if len(h1s2) > 0:
-                            h1b = h1s2[0].copy()
-                        if len(h2s2) > 0:
-                            h2b = h2s2[0].copy()
+                        var tiny1 = _fixture_extend_tiny(
+                            pack, a2.name, seqs[j2], meta.k
+                        )
+                        var tiny2 = _fixture_extend_tiny(
+                            pack, b2.name, seqs[len(batch1) + j2], meta.k
+                        )
+                        if len(tiny1) > 0:
+                            h1b = tiny1[0].copy()
+                        if len(tiny2) > 0:
+                            h2b = tiny2[0].copy()
                         h1b.extra_tags = _pe_extra_tags(
                             1, a2.original_seq, a2.conversion, "CT"
                         )
@@ -1098,11 +1214,7 @@ def gpu_native_stream_loop(
                             2, b2.original_seq, b2.conversion, "GA"
                         )
                         batch_hits2.append(h1b^)
-                        if len(h1s2) > 1:
-                            batch_hits2.append(h1s2[1].copy())
                         batch_hits2.append(h2b^)
-                        if len(h2s2) > 1:
-                            batch_hits2.append(h2s2[1].copy())
                         n_records += 2
                     j2 += 1
                 n_written += append_gaf_hits(out_fh, batch_hits2)

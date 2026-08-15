@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import resource
 import multiprocessing
+import subprocess
 import time
 
 from . import mcall
@@ -17,6 +18,31 @@ from . import utility
 
 
 tmp_alignment_file_count = 1000
+
+
+def _count_discrete_gpus() -> int:
+    """Return discrete NVIDIA (or AMD) GPU count for dual-graph isolation.
+
+    Never treats two CUDA contexts on one GPU as safe. Used only when
+    ``METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1`` (or ``auto``) is set.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-L"], text=True, stderr=subprocess.DEVNULL, timeout=30
+        )
+        n = sum(1 for line in out.splitlines() if line.strip().startswith("GPU "))
+        if n > 0:
+            return n
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "-i"], text=True, stderr=subprocess.DEVNULL, timeout=30
+        )
+        # Best-effort: count GPU index lines.
+        return sum(1 for line in out.splitlines() if "GPU[" in line or "GPU ID" in line)
+    except (OSError, subprocess.SubprocessError):
+        return 0
 
 
 # The OS may have limit of how many file can you open at the same time.
@@ -161,8 +187,18 @@ def alignment(
     if mojo_direct and os.path.exists(final_gaf):
         os.remove(final_gaf)
 
-    def _run_one_map(ref_type, read_type1, read_type2):
+    def _run_one_map(ref_type, read_type1, read_type2, gpu_idx=None):
         print(f"Aligning R1({read_type1}) & R2({read_type2}) on reference({ref_type})")
+        pin_env = None
+        if gpu_idx is not None:
+            pin_env = {
+                "CUDA_VISIBLE_DEVICES": str(gpu_idx),
+                "HIP_VISIBLE_DEVICES": str(gpu_idx),
+            }
+            print(
+                f"Align dual-graph: pinning job ref={ref_type} to GPU {gpu_idx}",
+                flush=True,
+            )
 
         fq1 = f"{work_dir}/{read_type1}.R1.fastq"
         fq2 = f"{work_dir}/{read_type2}.R2.fastq"
@@ -285,7 +321,9 @@ def alignment(
             clear_shard_marker(mojo_out_gaf)
 
             # File-backed GAF; Mojo logs on stderr. Do not use underscore shard router.
-            fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
+            fout, flog = se.execute(
+                cmd_run, stdout=None, stderr=alignment_log, env=pin_env
+            )
             # Drain stdout (usually empty when out_gaf is a file).
             if fout is not None:
                 for _ in fout:
@@ -314,7 +352,9 @@ def alignment(
             )
             return ref_type, engine_used
 
-        fout, flog = se.execute(cmd_run, stdout=None, stderr=alignment_log)
+        fout, flog = se.execute(
+            cmd_run, stdout=None, stderr=alignment_log, env=pin_env
+        )
         for line in fout:
             line = line.decode("utf-8")
             stripped = line.strip()
@@ -363,8 +403,11 @@ def alignment(
 
     # Default serialize C2T/G2A when GPU/Mojo DeviceContext is in use — two
     # concurrent CUDA contexts on one GH200 cause CUDA_ERROR_ILLEGAL_ADDRESS.
-    # Opt in with METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1 only after GPU isolation.
+    # Opt in with METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1 only after GPU isolation
+    # (≥2 discrete GPUs; one MojoGiraffe process per GPU). ``auto`` enables
+    # parallel only when ≥2 GPUs are visible.
     parallel_raw = os.environ.get("METHYLGRAPHER_DUAL_GRAPH_PARALLEL", "").strip().lower()
+    gpu_n = _count_discrete_gpus()
     if parallel_raw == "":
         device = os.environ.get("METHYLGRAPHER_GIRAFFE_DEVICE", "").strip().lower()
         # mojo_direct covers the engine passed as an argument as well as
@@ -372,10 +415,31 @@ def alignment(
         # CLI-selected GPU engine run both graphs at once.
         gpuish = device in {"nvidia", "amd", "cuda", "hip", "rocm"} or mojo_direct
         parallel = not gpuish
+    elif parallel_raw in {"auto"}:
+        parallel = gpu_n >= 2
+        if not parallel:
+            print(
+                "Align dual-graph: DUAL_GRAPH_PARALLEL=auto but "
+                f"gpu_count={gpu_n} < 2; serializing (never dual DeviceContext "
+                "on one GPU)",
+                flush=True,
+            )
     else:
         parallel = parallel_raw not in {"0", "false", "no", "off"}
+        if parallel and gpu_n < 2:
+            print(
+                "WARNING: METHYLGRAPHER_DUAL_GRAPH_PARALLEL requested but "
+                f"gpu_count={gpu_n} < 2; forcing serialize to avoid dual "
+                "DeviceContext on one GPU",
+                flush=True,
+            )
+            parallel = False
     workers = 2 if parallel and len(jobs) > 1 else 1
-    print(f"Align dual-graph jobs={len(jobs)} parallel_workers={workers}")
+    print(
+        f"Align dual-graph jobs={len(jobs)} parallel_workers={workers} "
+        f"gpu_count={gpu_n}",
+        flush=True,
+    )
 
     def _reclaim_hbm_between_graphs() -> None:
         """Wait for CUDA to free HBM after one MojoGiraffe process exits.
@@ -483,8 +547,14 @@ def alignment(
         if pref_pool is not None:
             pref_pool.shutdown(wait=False)
     else:
+        # One MojoGiraffe subprocess per discrete GPU (CUDA/HIP_VISIBLE_DEVICES).
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_run_one_map, *job) for job in jobs]
+            futs = []
+            for ji, job in enumerate(jobs):
+                gpu_idx = ji % gpu_n if gpu_n > 0 else None
+                futs.append(
+                    pool.submit(_run_one_map, job[0], job[1], job[2], gpu_idx)
+                )
             for fut in as_completed(futs):
                 _ = fut.result()
 
