@@ -23,6 +23,8 @@ import tempfile
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+from engine.mojo_align_env import getenv
+
 _U32U32 = struct.Struct("<II")
 _U64 = struct.Struct("<Q")
 _PATH_NODE_RE = re.compile(r"([><])([^><\s]+)")
@@ -294,7 +296,7 @@ def default_index_dir(segments_cache: str | Path | None = None) -> Path:
         return Path(env_idx)
     root = Path(
         segments_cache
-        or os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
+        or getenv("SEGMENTS_CACHE")
         or "/work/cache/mojo_segments"
     )
     return root / "hprc-d9-bs.wl.gbz_to_gfa.named_coords"

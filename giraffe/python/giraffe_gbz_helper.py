@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from engine.mojo_align_env import getenv
 from engine.quartet_map import map_fastq_to_gaf as quartet_map_fastq_to_gaf
 from engine.quartet_map import mojo_giraffe_ready
 from engine.segment_pack import (
@@ -84,7 +85,7 @@ def stream_gbz_to_segments(gbz_path: str, vg_path: Optional[str] = None) -> Dict
 
 def _default_cache_roots() -> List[Path]:
     roots: List[Path] = []
-    env = os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
+    env = getenv("SEGMENTS_CACHE")
     if env:
         roots.append(Path(env))
     for cand in (
@@ -173,7 +174,7 @@ def load_segments(gbz_path: str, *, vg_path: Optional[str] = None) -> Dict[str, 
     """Load segments from dense/jsonl pack or direct convert for tiny GBZ."""
     gbz = Path(gbz_path)
     max_direct = int(
-        os.environ.get("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
+        getenv("GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
     )
     if gbz.is_file() and gbz.stat().st_size <= max_direct:
         try:

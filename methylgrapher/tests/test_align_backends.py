@@ -52,8 +52,8 @@ def test_gpu_giraffe_prefers_gbz_quartet(tmp_path, monkeypatch):
     bin_sh.write_text("#!/bin/sh\n")
     bin_sh.chmod(0o755)
     monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "mojo")
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_BIN", str(bin_sh))
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_MAX_GFA_BYTES", "100")
+    monkeypatch.setenv("MOJO_ALIGN_GIRAFFE_BIN", str(bin_sh))
+    monkeypatch.setenv("MOJO_ALIGN_GIRAFFE_MAX_GFA_BYTES", "100")
     eng, cmd = resolve_map_command(
         align_engine="gpu_giraffe",
         vg_path="/usr/bin/vg",
@@ -94,8 +94,8 @@ def test_gpu_giraffe_large_gbz_without_cache_falls_to_vg(tmp_path, monkeypatch):
     bin_sh.write_text("#!/bin/sh\n")
     bin_sh.chmod(0o755)
     monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "mojo")
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_BIN", str(bin_sh))
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
+    monkeypatch.setenv("MOJO_ALIGN_GIRAFFE_BIN", str(bin_sh))
+    monkeypatch.setenv("MOJO_ALIGN_GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
     eng, cmd = resolve_map_command(
         align_engine="gpu_giraffe",
         vg_path="/usr/bin/vg",

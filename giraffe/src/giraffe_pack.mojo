@@ -8,16 +8,11 @@ from std.collections import List
 from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 
+from mojo_align_env import ensure_python_path
+
 
 def _bootstrap_sys_path() raises:
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
 
 
 def _ascii_from_addr(addr: Int, length: Int) raises -> String:

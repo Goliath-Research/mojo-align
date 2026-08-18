@@ -65,7 +65,7 @@ Run:
 
 \`\`\`bash
 export PARABRICKS_SAMPLE=$SAMPLE_DIR
-/home/ubuntu/mojo-align/fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \\
+fq2bam-meth/scripts/parity_linear_parabricks_vs_mojo.sh \\
   --parabricks-sample $SAMPLE_DIR \\
   --sample-dir $SAMPLE_DIR \\
   --sample-id parabricks_sample \\

@@ -8,6 +8,7 @@ from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 
 from giraffe_minimizer import MinimizerOcc, wang_hash_64
+from mojo_align_env import ensure_python_path
 
 
 comptime TAG_Q1Q1 = 0x31513151
@@ -32,14 +33,7 @@ struct MojoMinIndex(Movable):
     var payload_size: Int
 
     def __init__(out self, path: String) raises:
-        var os_mod = Python.import_module("os")
-        var sys_mod = Python.import_module("sys")
-        sys_mod.path.insert(0, String(os_mod.getcwd()))
-        sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-        sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-        sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+        ensure_python_path()
         var bridge = Python.import_module("engine.min_mmap_bridge")
         var opened = bridge.open_min_mmap(path)
         self.addr = Int(py=opened[0])
@@ -80,13 +74,7 @@ struct MojoMinIndex(Movable):
     def close(mut self) raises:
         if self.addr == 0:
             return
-        var os_mod = Python.import_module("os")
-        var sys_mod = Python.import_module("sys")
-        sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-        sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-        sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+        ensure_python_path()
         var bridge = Python.import_module("engine.min_mmap_bridge")
         bridge.close_min_mmap(self._keep[0], self._keep[1])
         self.addr = 0

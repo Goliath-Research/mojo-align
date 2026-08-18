@@ -14,13 +14,14 @@ GBZ_TOY = ROOT / "giraffe/tests/data/giraffe_fixture/gbz_toy"
 
 def test_gpu_giraffe_default_selects_mojo(monkeypatch, tmp_path):
     """Mojo GBZ is default-on; opt out with READY=0."""
+    monkeypatch.delenv("MOJO_ALIGN_GIRAFFE_READY", raising=False)
     monkeypatch.delenv("METHYLGRAPHER_MOJO_GIRAFFE_READY", raising=False)
     monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "mojo")
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES", str(10**12))
+    monkeypatch.setenv("MOJO_ALIGN_GBZ_DIRECT_MAX_BYTES", str(10**12))
     fake = tmp_path / "methylGrapher"
     fake.write_text("#!/bin/sh\n", encoding="utf-8")
     fake.chmod(0o755)
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_BIN", str(fake))
+    monkeypatch.setenv("MOJO_ALIGN_GIRAFFE_BIN", str(fake))
     prefix = str(GBZ_TOY / "toy.wl.C2T")
     eng, cmd = resolve_map_command(
         align_engine="gpu_giraffe",
@@ -36,7 +37,7 @@ def test_gpu_giraffe_default_selects_mojo(monkeypatch, tmp_path):
 
 
 def test_gpu_giraffe_ready_off_autoscale_vg(monkeypatch, tmp_path):
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_GIRAFFE_READY", "0")
+    monkeypatch.setenv("MOJO_ALIGN_GIRAFFE_READY", "0")
     monkeypatch.setenv("METHYLGRAPHER_GPU_GIRAFFE_FALLBACK", "mojo")
     prefix = str(GBZ_TOY / "toy.wl.C2T")
     eng, cmd = resolve_map_command(

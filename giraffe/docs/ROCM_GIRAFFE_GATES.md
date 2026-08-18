@@ -6,13 +6,13 @@ Companion to MethylPipeline [`docs/plans/mojo-multi-gpu-dual-align.plan.md`](../
 
 ```bash
 # From MethylPipeline (stages this repo into workers/docker/methylgrapher)
-METHYLGRAPHER_MOJO_GPU_VARIANT=rocm \
-METHYLGRAPHER_MOJO_IMAGE_TAG=1.70-mojo-rocm \
+MOJO_ALIGN_GPU_VARIANT=rocm \
+MOJO_ALIGN_IMAGE_TAG=1.70-mojo-rocm \
   bash scripts/build_methylgrapher_mojo_image.sh
 
 # CUDA twin (Lambda / NGC hosts)
-METHYLGRAPHER_MOJO_GPU_VARIANT=cuda \
-METHYLGRAPHER_MOJO_IMAGE_TAG=1.70-mojo-cuda \
+MOJO_ALIGN_GPU_VARIANT=cuda \
+MOJO_ALIGN_IMAGE_TAG=1.70-mojo-cuda \
   bash scripts/build_methylgrapher_mojo_image.sh
 ```
 

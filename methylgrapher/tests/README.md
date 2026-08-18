@@ -8,7 +8,7 @@ Unit and integration tests for methylGrapher-mojo.
 tests/
   test_mcall_core.mojo          # Native parsers, GFA Dict, methylation, gzip
   test_align_backends.py        # cpu_vg / gpu_giraffe / mojo_giraffe selection
-  test_align_backends_ready.py  # METHYLGRAPHER_MOJO_GIRAFFE_READY gating
+  test_align_backends_ready.py  # MOJO_ALIGN_GIRAFFE_READY gating
   test_giraffe_gbz_helper.py    # GBZ quartet resolve / segment cache
   test_giraffe_gaf_parity.py    # Mojo GAF vs golden fixture
   test_fq2bam_meth.py           # Linear WGBS convert / QC / end-to-end map

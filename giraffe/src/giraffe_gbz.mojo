@@ -6,17 +6,11 @@ from std.python import Python
 from giraffe_device import require_device_or_raise
 from giraffe_gpu_kernels import kernel_target_label
 from giraffe_stream_map import map_fastq_stream_to_gaf
+from mojo_align_env import ensure_python_path
 
 
 def ensure_pack_dir(gbz: String) raises -> String:
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
     # Pack ensure stays in Python (one-time build / resolve); map loop is Mojo.
     var qm = Python.import_module("engine.quartet_map")
     var pack = qm.ensure_pack_for_gbz(gbz)
@@ -90,14 +84,7 @@ def map_gbz_via_helper(
 
 def load_segments_from_gbz(gbz_path: String) raises -> Dict[String, String]:
     """Decode GBZ / pack -> segment id→sequence for Mojo seed warm-up."""
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
     var helper = Python.import_module("engine.giraffe_gbz_helper")
     var py_segs = helper.load_segments(gbz_path)
     var out = Dict[String, String]()

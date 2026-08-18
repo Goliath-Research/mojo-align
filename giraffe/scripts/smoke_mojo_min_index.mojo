@@ -4,10 +4,11 @@ from std.python import Python
 
 from giraffe_min_index import MojoMinIndex
 from giraffe_minimizer import MinimizerOcc, minimizers_of_seq
+from mojo_align_env import ensure_python_path, giraffe_fixture_root
 
 
 def main() raises:
-    var toy = "/home/ubuntu/methylGrapher-mojo/tests/data/giraffe_fixture/gbz_toy/toy.wl.C2T.shortread.withzip.min"
+    var toy = giraffe_fixture_root() + "/gbz_toy/toy.wl.C2T.shortread.withzip.min"
     var idx = MojoMinIndex(toy)
     print("toy k=", idx.k, " w=", idx.w, " cells=", idx.cell_count)
     idx.close()
@@ -21,8 +22,7 @@ def main() raises:
     var pidx = MojoMinIndex(prod)
     print("prod k=", pidx.k, " cells=", pidx.cell_count)
     # Parity: pick first unique cell key from HT via Python oracle, Mojo find_offset.
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
     var minmod = Python.import_module("engine.minimizer_index")
     var py = minmod.MinimizerIndex(prod)
     # Scan a few cells for a real key

@@ -9,17 +9,11 @@ from std.collections import List
 from std.python import Python, PythonObject
 
 from giraffe_hit import AlignmentHit
+from mojo_align_env import ensure_python_path
 
 
 def _off_mod() raises -> PythonObject:
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
     return Python.import_module("engine.grch38_offsets")
 
 

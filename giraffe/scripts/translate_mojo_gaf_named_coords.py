@@ -35,7 +35,7 @@ def main() -> int:
         "--index",
         type=Path,
         default=None,
-        help="named_coords index dir (default: $METHYLGRAPHER_MOJO_SEGMENTS_CACHE/...)",
+        help="named_coords index dir (default: $MOJO_ALIGN_SEGMENTS_CACHE/...)",
     )
     args = ap.parse_args()
     index_dir = args.index or default_index_dir()

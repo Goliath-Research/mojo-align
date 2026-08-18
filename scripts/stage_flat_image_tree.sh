@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble a flat /opt/methylgrapher-mojo-compatible tree from mojo-align packages.
+# Assemble a flat /opt/mojo-align-compatible tree from mojo-align packages.
 #
 # Usage:
 #   scripts/stage_flat_image_tree.sh [DEST]

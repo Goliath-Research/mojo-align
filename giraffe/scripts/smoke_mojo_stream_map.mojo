@@ -5,18 +5,19 @@ from std.sys import exit
 from std.python import Python
 
 from giraffe_gbz import map_gbz_native
+from mojo_align_env import giraffe_fixture_root
 
 
 def main() raises:
-    var root = "/home/ubuntu/mojo-align/giraffe/tests/data/giraffe_fixture"
+    var root = giraffe_fixture_root()
     var gbz_toy = root + "/gbz_toy"
     var os_mod = Python.import_module("os")
     var tmp = Python.import_module("tempfile")
     var td = String(tmp.mkdtemp(prefix="mojo_stream_"))
-    os_mod.environ["METHYLGRAPHER_MOJO_SEGMENTS_CACHE"] = td
+    os_mod.environ["MOJO_ALIGN_SEGMENTS_CACHE"] = td
     os_mod.environ["METHYLGRAPHER_GPU_REQUIRE"] = "0"
     os_mod.environ["METHYLGRAPHER_PROFILE_STAGES"] = "1"
-    os_mod.environ["METHYLGRAPHER_MOJO_READ_BATCH"] = "8"
+    os_mod.environ["MOJO_ALIGN_READ_BATCH"] = "8"
 
     var out_gaf = td + "/out.gaf"
     var n = map_gbz_native(

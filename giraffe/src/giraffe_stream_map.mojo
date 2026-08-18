@@ -11,6 +11,7 @@ from std.collections import List
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 
+from mojo_align_env import getenv_align
 from giraffe_device import require_device_or_raise
 from giraffe_dist import cluster_seed_hits
 from giraffe_fastq import giraffe_fq_close, giraffe_fq_open, giraffe_fq_read_header_seq
@@ -119,8 +120,7 @@ def _read_one_pipe(mut pipe: FastqPipe) raises -> StreamRead:
 
 
 def _batch_size() raises -> Int:
-    var os_mod = Python.import_module("os")
-    var raw = String(os_mod.environ.get("METHYLGRAPHER_MOJO_READ_BATCH", "8192"))
+    var raw = getenv_align("READ_BATCH", "8192")
     try:
         var n = Int(raw)
         if n < 1:

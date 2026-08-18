@@ -48,7 +48,7 @@ def main() -> int:
     sys.path.insert(0, str(root))
     os.environ["METHYLGRAPHER_PROFILE_STAGES"] = "1"
     os.environ["METHYLGRAPHER_PROFILE_JSON"] = args.out
-    os.environ.setdefault("METHYLGRAPHER_MOJO_READ_BATCH", "256")
+    os.environ.setdefault("MOJO_ALIGN_READ_BATCH", "256")
 
     from engine.quartet_map import map_fastq_to_gaf
 

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
+from engine.mojo_align_env import getenv, install_prefix
 from engine.minimizer_index import MinimizerIndex, MinHit
 from engine.segment_pack import (
     SegmentPack,
@@ -26,7 +27,7 @@ from engine.stage_timer import StageTimer
 from engine.zipcodes_index import DistIndex, ZipcodesIndex
 
 # Bound peak RAM on Buffy-scale FASTQs (hundreds of GB uncompressed).
-# Operator override: METHYLGRAPHER_MOJO_READ_BATCH (pairs / SE reads per chunk).
+# Operator override: MOJO_ALIGN_READ_BATCH (pairs / SE reads per chunk).
 _DEFAULT_READ_BATCH = 8192
 
 
@@ -40,7 +41,7 @@ class FastqRec(NamedTuple):
 
 
 def _read_batch_size() -> int:
-    raw = os.environ.get("METHYLGRAPHER_MOJO_READ_BATCH", "").strip()
+    raw = getenv("READ_BATCH")
     if not raw:
         return _DEFAULT_READ_BATCH
     try:
@@ -379,9 +380,10 @@ def _seed_batch_hits(
             from engine.minimizer_index import MinimizerOcc
 
             # giraffe/python/quartet_map.py → giraffe/scripts/gpu_seed_worker.py
+            prefix = install_prefix()
             worker = Path(__file__).resolve().parents[1] / "scripts" / "gpu_seed_worker.py"
             if not worker.is_file():
-                worker = Path("/opt/methylgrapher-mojo/scripts/gpu_seed_worker.py")
+                worker = Path(prefix) / "scripts" / "gpu_seed_worker.py"
             payload = {
                 "seqs": seqs,
                 "k": int(min_index.k),
@@ -394,8 +396,7 @@ def _seed_batch_hits(
                 if k not in {"PYTHONHOME", "PYTHONPATH", "LD_PRELOAD"}
             }
             env["PYTHONPATH"] = (
-                "/opt/methylgrapher-mojo/scripts:/opt/methylgrapher-mojo:"
-                "/opt/methylgrapher-mojo/methylgrapher"
+                f"{prefix}/scripts:{prefix}:{prefix}/methylgrapher"
             )
             proc = subprocess.run(
                 ["/usr/bin/python3", str(worker)],
@@ -486,17 +487,17 @@ def ensure_pack_for_gbz(gbz: str) -> SegmentPack:
         return SegmentPack(ready)
     # Production Align: packs are a fleet prebuild. Fail closed unless the
     # operator explicitly allows on-the-fly vg convert (toys / first boot).
-    require = os.environ.get("METHYLGRAPHER_MOJO_PACK_REQUIRE", "1").strip().lower()
+    require = getenv("PACK_REQUIRE", "1").strip().lower()
     if require not in {"0", "false", "no", "off"}:
         raise RuntimeError(
             f"no segment pack for {gbz}; prebuild with "
             f"build_mojo_segment_pack.py --from-gbz --gbz {gbz} "
-            f"(set METHYLGRAPHER_MOJO_PACK_REQUIRE=0 to allow mid-Align build)"
+            f"(set MOJO_ALIGN_PACK_REQUIRE=0 to allow mid-Align build)"
         )
     # Try companion / local GFA for dense build
     # Production: build from GBZ via vg convert (node-id aligned). Companion
     # wl.gfa may have a different node set than C2T/G2A Giraffe GBZs.
-    out_root = os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
+    out_root = getenv("SEGMENTS_CACHE")
     if not out_root:
         out_root = "/work/cache/mojo_segments"
     out_dir = Path(out_root) / (Path(gbz).name + ".mojo_segments")
@@ -534,7 +535,7 @@ def map_fastq_to_gaf(
 ) -> int:
     """Map FASTQ using quartet indexes + dense pack; write GAF.
 
-    Streams reads in batches (``METHYLGRAPHER_MOJO_READ_BATCH``, default 8192)
+    Streams reads in batches (``MOJO_ALIGN_READ_BATCH``, default 8192)
     and writes GAF incrementally so Buffy-scale FASTQs do not OOM.
 
     ``device`` selects the seed backend: ``nvidia``/``amd`` use CuPy GPU
@@ -563,7 +564,7 @@ def map_fastq_to_gaf(
     batch_size = _read_batch_size()
     seed_backend = "unset"
     timer = StageTimer.from_env()
-    workers_raw = os.environ.get("METHYLGRAPHER_MOJO_EXTEND_WORKERS", "4").strip()
+    workers_raw = getenv("EXTEND_WORKERS", "4")
     try:
         extend_workers = max(1, int(workers_raw))
     except ValueError:
@@ -672,10 +673,10 @@ def mojo_giraffe_ready() -> bool:
     """Whether Mojo GBZ may be selected for ``gpu_giraffe`` / ``mojo_giraffe``.
 
     Default **on** (production Mojo path). Opt out with
-    ``METHYLGRAPHER_MOJO_GIRAFFE_READY=0`` / ``false`` / ``off`` to force
+    ``MOJO_ALIGN_GIRAFFE_READY=0`` / ``false`` / ``off`` to force
     ``vg_autoscale`` while keeping ``align_engine=gpu_giraffe``.
     """
-    raw = os.environ.get("METHYLGRAPHER_MOJO_GIRAFFE_READY", "1").strip().lower()
+    raw = getenv("GIRAFFE_READY", "1").strip().lower()
     if raw in {"0", "false", "no", "off", "vg"}:
         return False
     return True

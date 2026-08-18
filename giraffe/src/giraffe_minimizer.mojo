@@ -230,7 +230,7 @@ def minimizers_batch_devicecontext(
     var backend = probe_device_context(resolved)
     var target = kernel_target_label(resolved)
     var os_mod = Python.import_module("os")
-    var banner_key = "METHYLGRAPHER_MOJO_MIN_BANNER"
+    var banner_key = "MOJO_ALIGN_MIN_BANNER"
     if String(os_mod.environ.get(banner_key, "")) != backend:
         os_mod.environ[banner_key] = backend
         print(

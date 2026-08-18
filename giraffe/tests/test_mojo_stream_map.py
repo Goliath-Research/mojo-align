@@ -26,7 +26,7 @@ def test_oracle_quartet_map_still_golden(tmp_path, monkeypatch):
     """Python quartet_map remains the parity oracle."""
     cache_root = tmp_path / "cache"
     cache_root.mkdir()
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", str(cache_root))
+    monkeypatch.setenv("MOJO_ALIGN_SEGMENTS_CACHE", str(cache_root))
     gbz = GBZ_TOY / "toy.wl.C2T.giraffe.gbz"
     if not gbz.is_file():
         pytest.skip("gbz toy missing")

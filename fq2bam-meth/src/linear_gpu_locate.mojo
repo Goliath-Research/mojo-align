@@ -18,6 +18,7 @@ from std.sys import has_accelerator
 from gpu_device import select_device
 from gpu_kernels import _device_api, kernel_target_label, probe_device_context
 from linear_extend import hit_to_sam_line, pair_hits, LinearHit
+from mojo_align_env import ensure_python_path
 from linear_index import LinearIndex
 from utility import open_text_write, reverse_complement
 
@@ -205,8 +206,7 @@ def _write_sam_header(fh: PythonObject, index: LinearIndex) raises:
 
 
 def _require_hbm(science_bytes: Int, device: String) raises:
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/gpu-common/python")
+    ensure_python_path()
     var mem = Python.import_module("gpu_mem")
     _ = mem.require_index_capacity(science_bytes, device=device, overhead=1.15)
 

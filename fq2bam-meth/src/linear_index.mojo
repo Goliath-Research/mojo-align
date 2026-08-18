@@ -11,6 +11,7 @@ from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 
 from utility import open_text_read, open_text_write
+from mojo_align_env import ensure_python_path
 
 
 struct LinearContig(Copyable, Movable):
@@ -208,13 +209,7 @@ struct LinearIndex(Copyable, Movable):
                 i += 1
 
     def _bootstrap_sys_path(self) raises:
-        var os_mod = Python.import_module("os")
-        var sys_mod = Python.import_module("sys")
-        sys_mod.path.insert(0, String(os_mod.getcwd()))
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/fq2bam-meth/python")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/giraffe/python")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-        sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+        ensure_python_path()
 
     def _load_dense_pack(mut self, cache_dir: String) raises -> Bool:
         var os_mod = Python.import_module("os")

@@ -8,7 +8,7 @@ from engine.quartet_map import _iter_fastq_batches, _read_batch_size
 
 
 def test_iter_fastq_batches_pairs(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_READ_BATCH", "2")
+    monkeypatch.setenv("MOJO_ALIGN_READ_BATCH", "2")
     assert _read_batch_size() == 2
     r1 = tmp_path / "r1.fq"
     r2 = tmp_path / "r2.fq"

@@ -21,7 +21,7 @@ R2 = PKG / "tests/data/giraffe_fixture/R2.fastq"
 def test_toy_quartet_map_parity(tmp_path, monkeypatch):
     cache_root = tmp_path / "cache"
     cache_root.mkdir()
-    monkeypatch.setenv("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", str(cache_root))
+    monkeypatch.setenv("MOJO_ALIGN_SEGMENTS_CACHE", str(cache_root))
     gbz = GBZ_TOY / "toy.wl.C2T.giraffe.gbz"
     if not gbz.is_file():
         pytest.skip("gbz toy missing")

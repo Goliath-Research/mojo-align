@@ -7,6 +7,7 @@ from giraffe_gapless import gapless_extend_native
 from giraffe_hit import AlignmentHit
 from giraffe_index import GraphIndex
 from giraffe_seed import seed_hits
+from mojo_align_env import ensure_python_path
 
 # Re-export for existing `from giraffe_extend import AlignmentHit` call sites.
 
@@ -86,14 +87,7 @@ def gapless_extend_seeds(
     except e:
         print("native gapless unavailable; Python fallback: ", e)
 
-    var os_mod = Python.import_module("os")
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, String(os_mod.getcwd()))
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
+    ensure_python_path()
     var sp = Python.import_module("engine.segment_pack")
     var qm = Python.import_module("engine.quartet_map")
     var pack = sp.SegmentPack(pack_dir)

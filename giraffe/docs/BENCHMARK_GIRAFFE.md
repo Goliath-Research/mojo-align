@@ -31,7 +31,7 @@ Toy GBZ oracle profile (2026-08-08, GH200; cold pack build excluded):
 
 ### Production Buffy-scale subset (2026-08-15, GH200, 65 536 PE)
 
-HPRC d9-bs C2T GBZ + dense pack; `METHYLGRAPHER_MOJO_READ_BATCH=8192`; banner
+HPRC d9-bs C2T GBZ + dense pack; `MOJO_ALIGN_READ_BATCH=8192`; banner
 `devicecontext-cuda+gpu_ht+gpu_gapless+mojo_stream`.
 
 | Stage (steady batch) | Wall / 8192 pairs | Notes |
@@ -84,7 +84,7 @@ python scripts/build_mojo_segment_pack.py \
   --out /work/cache/mojo_segments/hprc-d9-bs.wl.C2T.giraffe.gbz.mojo_segments \
   --also-link-g2a
 # READY defaults on; opt out until gates pass if desired:
-# export METHYLGRAPHER_MOJO_GIRAFFE_READY=0
+# export MOJO_ALIGN_GIRAFFE_READY=0
 ```
 
 ## NVIDIA vs AMD bakeoff
@@ -112,5 +112,5 @@ export METHYLGRAPHER_ALIGN_ENGINE=cpu_vg
 # or
 export METHYLGRAPHER_GPU_GIRAFFE_FALLBACK=vg
 # or temporarily:
-export METHYLGRAPHER_MOJO_GIRAFFE_READY=0
+export MOJO_ALIGN_GIRAFFE_READY=0
 ```

@@ -24,7 +24,7 @@ Science contract for `pangenome_wgbs`: emit **GAF** with **named-coordinates** s
 - **CPU / toys** (`device=cpu` or `GPU_REQUIRE=0`): host Mojo HT over mmap + `gapless_extend_with_pack` (fixture exact-match for tiny packs).
 - Python [`engine/quartet_map.py`](../engine/quartet_map.py) is the **oracle** only (`map_fastq_to_gaf` for parity tests; `ensure_pack_for_gbz` / `mojo_giraffe_ready`). It is **not** the Align hot loop.
 - Dual-graph Align **serializes** C2T then G2A by default on GPU/Mojo (avoids dual DeviceContext faults on GH200). Opt in with `METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` only after GPU isolation.
-- Selection: `METHYLGRAPHER_MOJO_GIRAFFE_READY` defaults to **on** (`1`); set `0` / `false` / `off` to force vg.
+- Selection: `MOJO_ALIGN_GIRAFFE_READY` defaults to **on** (`1`); set `0` / `false` / `off` to force vg.
 - PE tags: primary pair gets `ri` / `os` / `rc` for MethylCall; up to two scored hits per mate (`-M 2` style) when gapless returns them.
 - PE emit order (MethylCall): **primary R1 → optional secondary R1 → primary R2 → optional secondary R2**. The first GAF row for a query must carry `ri`/`os`/`rc`.
 - Named coordinates: path column uses segment ids from the dense pack (same ids MethylCall resolves via PrepareGenome node maps).
@@ -37,7 +37,7 @@ Toy / development: native Mojo `giraffe_mapper` + `giraffe_index` / `extend_exac
 
 1. **Index / pack** — ensure `{gbz}.mojo_segments/` dense pack.
 2. **Device gate + GPU warmup** — `giraffe_device` + `giraffe_gpu_kernels` (`nvidia:sm_90` / `amdgpu:gfx942`). Driver &lt;580 needs `MODULAR_NVPTX_COMPILER_PATH=ptxas`. Empty/`1` `METHYLGRAPHER_GPU_REQUIRE` fails closed if DeviceContext cannot be created for nvidia/amd; set `0` to allow host kernels.
-3. **GPU-native stream** — HBM preflight via `nvidia-smi` / `rocm-smi` ([`engine/gpu_mem.py`](../engine/gpu_mem.py); fail closed with free/need GiB before DeviceContext alloc), Mojo-native index upload (`upload_mmap_to_device`), then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `METHYLGRAPHER_MOJO_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `sync_prefetch` / `host_hits` / `gaf_emit`. DeviceContext backend token `cuda`/`hip` is Mojo framework naming for NVIDIA/AMD — production app code does not call libcudart.
+3. **GPU-native stream** — HBM preflight via `nvidia-smi` / `rocm-smi` ([`engine/gpu_mem.py`](../engine/gpu_mem.py); fail closed with free/need GiB before DeviceContext alloc), Mojo-native index upload (`upload_mmap_to_device`), then `giraffe_gpu_map_kernels` (`METHYLGRAPHER_PROFILE_STAGES` / `MOJO_ALIGN_READ_BATCH`, default 8192). Stage line: `gpu_seed` / `locate` / `sync_prefetch` / `host_hits` / `gaf_emit`. DeviceContext backend token `cuda`/`hip` is Mojo framework naming for NVIDIA/AMD — production app code does not call libcudart.
 4. **Pair tags** — PE `ri`/`os`/`rc` on the primary pair (before any secondary).
 5. **Dual-graph** — default **serialize** C2T then G2A on one GPU (HBM handoff). Set `METHYLGRAPHER_DUAL_GRAPH_PARALLEL=1` or `auto` only when ≥2 discrete GPUs are visible; each MojoGiraffe subprocess gets `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` pinned (never two DeviceContexts on one GPU).
 

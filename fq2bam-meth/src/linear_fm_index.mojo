@@ -6,6 +6,8 @@ from std.collections import List
 from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 
+from mojo_align_env import ensure_python_path
+
 
 struct FmContig(Copyable, Movable):
     var name: String
@@ -81,11 +83,7 @@ struct FmIndex(Copyable, Movable):
         self._keep_pac = Python.none()
 
     def _bootstrap_sys_path(self) raises:
-        var os_mod = Python.import_module("os")
-        var sys_mod = Python.import_module("sys")
-        sys_mod.path.insert(0, String(os_mod.getcwd()))
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/fq2bam-meth/python")
-        sys_mod.path.insert(0, "/home/ubuntu/mojo-align/giraffe/python")
+        ensure_python_path()
 
     def load(mut self, prefix: String) raises:
         """Load prefix.bwt/.sa/.pac/.ann (Clara / bwa 0.7 layout)."""

@@ -197,7 +197,7 @@ def map_gbz_fastq_to_gaf(
 def run_mojo_giraffe_cli(args: List[String]) raises -> Int:
     """CLI: MojoGiraffe (-gfa|-gbz) -fq1 … (-out_gaf|-out_sam) …
 
-    ``-out_sam`` enables QC linear SAM emit (sets METHYLGRAPHER_MOJO_EMIT=sam)
+    ``-out_sam`` enables QC linear SAM emit (sets MOJO_ALIGN_EMIT=sam)
     and requires ``-segment_offsets <dir>`` (grch38-dense-v1 from
     scripts/build_grch38_offsets.py).
     """
@@ -220,8 +220,8 @@ def run_mojo_giraffe_cli(args: List[String]) raises -> Int:
     if out_sam.byte_length() > 0:
         if segment_offsets.byte_length() == 0:
             raise Error("MojoGiraffe -out_sam requires -segment_offsets")
-        os_mod.environ["METHYLGRAPHER_MOJO_EMIT"] = "sam"
-        os_mod.environ["METHYLGRAPHER_MOJO_SEGMENT_OFFSETS"] = segment_offsets
+        os_mod.environ["MOJO_ALIGN_EMIT"] = "sam"
+        os_mod.environ["MOJO_ALIGN_SEGMENT_OFFSETS"] = segment_offsets
         out_path = out_sam
         print(
             "MojoGiraffe QC SAM emit offsets=",

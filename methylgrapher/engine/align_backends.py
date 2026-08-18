@@ -9,9 +9,9 @@ Backends (``METHYLGRAPHER_ALIGN_ENGINE`` / ``align_engine``):
 Environment:
 
 - ``METHYLGRAPHER_GPU_GIRAFFE_FALLBACK`` — ``mojo`` (default) | ``vg`` | ``error``
-- ``METHYLGRAPHER_MOJO_GIRAFFE_BIN`` — path to ``methylGrapher`` / wrapper
+- ``MOJO_ALIGN_GIRAFFE_BIN`` — path to ``methylGrapher`` / wrapper
 - ``METHYLGRAPHER_GIRAFFE_GFA`` — explicit GFA for fixture path
-- ``METHYLGRAPHER_MOJO_GIRAFFE_MAX_GFA_BYTES`` — GFA size cap (GBZ path ignores this)
+- ``MOJO_ALIGN_GIRAFFE_MAX_GFA_BYTES`` — GFA size cap (GBZ path ignores this)
 - ``METHYLGRAPHER_GIRAFFE_DEVICE`` — ``auto`` | ``cpu`` | ``nvidia`` | ``amd``
 """
 
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from engine.giraffe_gbz_helper import resolve_gbz_quartet, segment_cache_ready
+from engine.mojo_align_env import getenv, install_prefix
 from engine.quartet_map import mojo_giraffe_ready
 
 AlignEngine = Literal["cpu_vg", "gpu_giraffe", "mojo_giraffe"]
@@ -82,15 +83,16 @@ def build_vg_giraffe_gaf_cmd(
 
 
 def resolve_mojo_giraffe_bin() -> Optional[str]:
-    env = os.environ.get("METHYLGRAPHER_MOJO_GIRAFFE_BIN", "").strip()
+    env = getenv("GIRAFFE_BIN")
     if env and Path(env).exists():
         return env
     # Host checkouts: mojo-align/bin or staged flat image /opt/.../bin
     here = Path(__file__).resolve()
+    prefix = Path(install_prefix())
     for cand in (
         here.parents[2] / "bin" / "methylGrapher",  # mojo-align/bin
         here.parents[1] / "bin" / "methylGrapher",  # flat _flat_image/bin
-        Path("/opt/methylgrapher-mojo/bin/methylGrapher"),
+        prefix / "bin" / "methylGrapher",
         Path("/usr/local/bin/methylGrapher"),
     ):
         if cand.is_file():
@@ -134,12 +136,7 @@ def gfa_usable_for_mojo(gfa_path: str) -> bool:
     if not path.is_file():
         return False
     try:
-        max_b = int(
-            os.environ.get(
-                "METHYLGRAPHER_MOJO_GIRAFFE_MAX_GFA_BYTES",
-                str(_DEFAULT_MAX_GFA_BYTES),
-            )
-        )
+        max_b = int(getenv("GIRAFFE_MAX_GFA_BYTES", str(_DEFAULT_MAX_GFA_BYTES)))
     except ValueError:
         max_b = _DEFAULT_MAX_GFA_BYTES
     if max_b <= 0:
@@ -299,7 +296,7 @@ def resolve_map_command(
         bin_path = resolve_mojo_giraffe_bin()
         if not bin_path or not quartet or not fq1:
             return None
-        # READY defaults on (METHYLGRAPHER_MOJO_GIRAFFE_READY=1). Opt out with
+        # READY defaults on (MOJO_ALIGN_GIRAFFE_READY=1). Opt out with
         # 0/false/off to force vg while Buffy wall / DS20M gates are pending.
         if not mojo_giraffe_ready():
             return None
@@ -307,10 +304,7 @@ def resolve_map_command(
         # Production GBZ (~GB) must have a prebuilt segment pack; otherwise Align
         # would spend hours in `vg convert` / OOM building cache mid-map.
         max_direct = int(
-            os.environ.get(
-                "METHYLGRAPHER_MOJO_GBZ_DIRECT_MAX_BYTES",
-                str(64 * 1024 * 1024),
-            )
+            getenv("GBZ_DIRECT_MAX_BYTES", str(64 * 1024 * 1024))
         )
         try:
             gbz_bytes = Path(gbz_path).stat().st_size
@@ -338,6 +332,8 @@ def resolve_map_command(
     def _try_mojo_gfa(label: str) -> Optional[tuple[str, str]]:
         bin_path = resolve_mojo_giraffe_bin()
         if not bin_path or not gfa or not fq1:
+            return None
+        if not mojo_giraffe_ready():
             return None
         if not gfa_usable_for_mojo(gfa):
             return None

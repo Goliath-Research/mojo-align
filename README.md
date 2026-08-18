@@ -84,16 +84,15 @@ MethylPipeline `Dockerfile.mojo` expects a flat `engine/` + `src/` tree. Assembl
 
 ```bash
 bash scripts/stage_flat_image_tree.sh /tmp/mojo-flat
-export METHYLGRAPHER_MOJO_ROOT=/tmp/mojo-flat   # or point at this repo + stage in the build script
+export MOJO_ALIGN_ROOT=/tmp/mojo-flat   # or point at this repo + stage in the build script
 ```
 
-In-container paths remain `/opt/methylgrapher-mojo` + `methylGrapher` entrypoint.
+In-container paths are `/opt/mojo-align` + `methylGrapher` entrypoint.
 
-## Dual CI
+## CI
 
-- **This repo (`mojo-align`)** — primary: [`ci/azure-pipelines.yml`](ci/azure-pipelines.yml)
-- **`methylGrapher-mojo`** — kept during cutover for rollback / image pins until
-  `METHYLGRAPHER_MOJO_ROOT` points here and the fleet image rebuilds clean.
+- **This repo (`mojo-align`)** is the only live tree: [`ci/azure-pipelines.yml`](ci/azure-pipelines.yml)
+- **`methylGrapher-mojo`** is archived. Do not develop there; env family is `MOJO_ALIGN_*`.
 
 ## Migration notes
 

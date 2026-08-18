@@ -5,9 +5,11 @@ from std.ffi import external_call
 from std.memory import UnsafePointer
 from std.python import Python
 
+from mojo_align_env import giraffe_fixture_root
+
 
 def main() raises:
-    var path = "/home/ubuntu/methylGrapher-mojo/tests/data/giraffe_fixture/gbz_toy/toy.wl.C2T.shortread.withzip.min"
+    var path = giraffe_fixture_root() + "/gbz_toy/toy.wl.C2T.shortread.withzip.min"
     var os_mod = Python.import_module("os")
     var st = os_mod.stat(path)
     var size = Int(py=st.st_size)

@@ -1,5 +1,5 @@
 # GAF emitter (named-coordinates path column) for Mojo Giraffe.
-# When METHYLGRAPHER_MOJO_EMIT=sam, streams linear SAM instead (QC BAM path).
+# When MOJO_ALIGN_EMIT=sam, streams linear SAM instead (QC BAM path).
 #
 # Production GAF: Mojo byte buffer + libc write (no Python per-hit I/O).
 # Named-coords via mmap (giraffe_named_coords.mojo). Do not flush every batch —
@@ -23,18 +23,17 @@ from giraffe_sam_emit import (
     open_sam_write,
     sam_emit_summary,
 )
+from mojo_align_env import getenv_align
 from utility import write_text_file
 
 
 def _emit_mode_sam() raises -> Bool:
-    var os_mod = Python.import_module("os")
-    var mode = String(os_mod.environ.get("METHYLGRAPHER_MOJO_EMIT", "")).lower()
+    var mode = getenv_align("EMIT", "").lower()
     return mode == "sam" or mode == "qc_sam"
 
 
 def _segment_offsets_root() raises -> String:
-    var os_mod = Python.import_module("os")
-    return String(os_mod.environ.get("METHYLGRAPHER_MOJO_SEGMENT_OFFSETS", ""))
+    return getenv_align("SEGMENT_OFFSETS", "")
 
 
 def _extras_have_prefix(extras: String, prefix: String) -> Bool:
@@ -193,7 +192,7 @@ def open_gaf_write(path: String) raises -> PythonObject:
         var root = _segment_offsets_root()
         if root.byte_length() == 0:
             raise Error(
-                "METHYLGRAPHER_MOJO_EMIT=sam requires METHYLGRAPHER_MOJO_SEGMENT_OFFSETS"
+                "MOJO_ALIGN_EMIT=sam requires MOJO_ALIGN_SEGMENT_OFFSETS"
             )
         print("mojo_emit mode=sam offsets=", root, " out=", path, flush=True)
         return open_sam_write(path, root)

@@ -7,6 +7,8 @@ from std.ffi import external_call
 from std.memory import UnsafePointer
 from std.python import Python, PythonObject
 
+from mojo_align_env import ensure_python_path
+
 
 struct NamedCoordsMojo(Copyable, Movable):
     var addr: Int
@@ -141,10 +143,7 @@ def named_coords_try_open() raises -> NamedCoordsMojo:
     env_idx = String(env_idx.strip())
     if env_idx.byte_length() == 0:
         return named_coords_none()
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align/methylgrapher")
-    sys_mod.path.insert(0, "/home/ubuntu/mojo-align")
+    ensure_python_path()
     try:
         var nc = Python.import_module("engine.named_coords")
         if not Bool(nc.index_ready(env_idx)):

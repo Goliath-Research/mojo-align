@@ -5,6 +5,7 @@ from std.sys import exit
 from std.python import Python
 
 from giraffe_minimizer import minimizers_batch, minimizers_of_seq
+from mojo_align_env import ensure_python_path, giraffe_fixture_root
 
 
 def main() raises:
@@ -19,12 +20,9 @@ def main() raises:
         print("FAIL: expected host minimizers")
         exit(1)
 
-    # Parity vs Python MinimizerIndex.minimizers keys.
-    var sys_mod = Python.import_module("sys")
-    sys_mod.path.insert(0, "/home/ubuntu/methylGrapher-mojo")
-    sys_mod.path.insert(0, "/opt/methylgrapher-mojo")
+    ensure_python_path()
     var minmod = Python.import_module("engine.minimizer_index")
-    var toy = "/home/ubuntu/methylGrapher-mojo/tests/data/giraffe_fixture/gbz_toy/toy.wl.C2T.shortread.withzip.min"
+    var toy = giraffe_fixture_root() + "/gbz_toy/toy.wl.C2T.shortread.withzip.min"
     var idx = minmod.MinimizerIndex(toy)
     var py = idx.minimizers(seq)
     idx.close()

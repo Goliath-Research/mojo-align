@@ -20,6 +20,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from engine.mojo_align_env import getenv
+
 FORMAT_DENSE_V1 = "dense-v1"
 FORMAT_JSONL_V1 = "jsonl-v1"
 _U64 = struct.Struct("<Q")
@@ -28,7 +30,7 @@ _U64 = struct.Struct("<Q")
 def pack_dir_candidates(gbz_path: str) -> List[Path]:
     candidates = [Path(gbz_path + ".mojo_segments")]
     name = Path(gbz_path).name + ".mojo_segments"
-    env = os.environ.get("METHYLGRAPHER_MOJO_SEGMENTS_CACHE", "").strip()
+    env = getenv("SEGMENTS_CACHE")
     roots: List[Path] = []
     if env:
         roots.append(Path(env))
