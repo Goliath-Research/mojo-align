@@ -14,7 +14,7 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PATH="$HOME/.pixi/bin:${PATH:-}"
 
-DEFAULT_REF="/work/genomes/linear/GRCh38/ensembl-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+DEFAULT_REF="/work/genomes/linear/GRCh38/ensembl-116/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
 REF="${1:-$DEFAULT_REF}"
 K="${2:-${METHYLGRAPHER_LINEAR_K:-15}}"
 
