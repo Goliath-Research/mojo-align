@@ -1,7 +1,8 @@
 # mojo-align
 
-Mojo align monorepo for Epimethyl WGBS SamplePrep. History imported from
-`methylGrapher-mojo`. Unified CLI remains `bin/methylGrapher`.
+Mojo align monorepo for Epimethyl WGBS SamplePrep. Git history includes the
+former tree that was named `methylGrapher-mojo` (that repository no longer
+exists). Unified CLI remains `bin/methylGrapher`.
 
 ## Packages
 
@@ -91,8 +92,8 @@ In-container paths are `/opt/mojo-align` + `methylGrapher` entrypoint.
 
 ## CI
 
-- **This repo (`mojo-align`)** is the only live tree: [`ci/azure-pipelines.yml`](ci/azure-pipelines.yml)
-- **`methylGrapher-mojo`** is archived. Do not develop there; env family is `MOJO_ALIGN_*`.
+- **This repo (`mojo-align`)** is the only tree: [`ci/azure-pipelines.yml`](ci/azure-pipelines.yml)
+- Env family is `MOJO_ALIGN_*`.
 
 ## Migration notes
 

@@ -309,7 +309,7 @@ reference only).
 ## 2026-07-28 — Initial scaffold
 
 **Completed:**
-- Repository created: `DavidAtGoliathResearch/methylGrapher-mojo`
+- Repository created under the former name `methylGrapher-mojo` (history now lives in this repo)
 - `mojoproject.toml` — package manifest for `magic` toolchain
 - All 7 source modules stubbed as `.mojo` files with full docstrings,
   struct definitions, and function signatures mirroring the Python originals
