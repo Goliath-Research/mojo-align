@@ -356,7 +356,7 @@ vs Docker `epimethyl/methylgrapher:1.70` (stock 0.2.0). See
 **Dual-ship (MethylPipeline):**
 - `actionConfig.methylgrapher_wgbs.engine` = `python`|`mojo`
 - Image `epimethyl/methylgrapher:1.70-mojo` built via
-  `scripts/build_methylgrapher_mojo_image.sh`; smoke passed on 64K pages.
+  `scripts/build_mojo_align_image.sh`; smoke passed on 64K pages.
 - Default remains `python` until cutover gate
   (`docs/plans/methylgrapher-mojo-cutover-gate.md`).
 
