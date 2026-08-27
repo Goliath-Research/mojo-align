@@ -36,10 +36,11 @@ def bin_histogram_add_host(
     bin_counts: PythonObject, pos_idx: PythonObject, bin_idx: PythonObject
 ) raises:
     var np = Python.import_module("numpy")
-    var builtins = Python.import_module("builtins")
+    # Python.tuple(a, b) is Mojo's multi-arg constructor. builtins.tuple(a, b)
+    # would call Python's tuple() which accepts only one iterable.
     np.add.at(
         bin_counts,
-        builtins.tuple(
+        Python.tuple(
             np.asarray(pos_idx, dtype=np.intp), np.asarray(bin_idx, dtype=np.intp)
         ),
         1,
@@ -53,6 +54,7 @@ def scatter_add_u32_on_device(
     var resolved = select_device(device)
     var backend = probe_device_context(resolved)
     comptime if has_accelerator():
+        from std.atomic import Atomic
         from std.gpu import block_dim, block_idx, thread_idx
         from std.gpu.host import DeviceContext
         from std.memory import UnsafePointer
@@ -67,7 +69,9 @@ def scatter_add_u32_on_device(
             if i >= n:
                 return
             var j = Int(index[i])
-            dst[j] = dst[j] + src[i]
+            # Duplicate indices must accumulate (np.add.at). A plain
+            # load-add-store drops concurrent writes to the same j.
+            _ = Atomic[DType.uint32].fetch_add(dst + j, src[i])
 
         if backend.startswith("devicecontext-cuda") or backend.startswith(
             "devicecontext-hip"
@@ -121,8 +125,31 @@ def scatter_add_u32_on_device(
     scatter_add_u32_host(acc, idx, values)
 
 
+def _smoke_host_kernels() raises:
+    """Exercise host add.at paths, including 2-D histogram index tuples."""
+    var np = Python.import_module("numpy")
+    var acc = np.zeros(4, dtype=np.uint32)
+    scatter_add_u32_host(
+        acc,
+        np.array([1, 1, 2], dtype=np.intp),
+        np.array([3, 4, 5], dtype=np.uint32),
+    )
+    if Int(py=acc[1]) != 7 or Int(py=acc[2]) != 5:
+        raise Error("scatter_add_u32_host duplicate-index smoke failed")
+    var counts = np.zeros(Python.tuple(2, 4), dtype=np.uint32)
+    bin_histogram_add_host(
+        counts,
+        np.array([0, 0, 1], dtype=np.intp),
+        np.array([1, 1, 3], dtype=np.intp),
+    )
+    if Int(py=counts[0][1]) != 2 or Int(py=counts[1][3]) != 1:
+        raise Error("bin_histogram_add_host index-tuple smoke failed")
+
+
 def main() raises:
     var os_mod = Python.import_module("os")
     var device = String(os_mod.environ.get("METHYLGRAPHER_ALIGN_DEVICE", "auto"))
     var backend = probe_numeric_device(device)
     print("numeric centroid probe backend=", backend)
+    _smoke_host_kernels()
+    print("numeric centroid host smoke ok")
