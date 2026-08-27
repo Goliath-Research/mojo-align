@@ -12,6 +12,7 @@ exists). Unified CLI remains `bin/methylGrapher`.
 | `fq2bam-meth/` | Mojo linear WGBS mapper (`align.linear.mojo`) | *none (internal)* |
 | `giraffe/` | MojoGiraffe / GBZ stream map (`align.pangenome_wgbs.mojo`) | *none (internal)* |
 | `methylgrapher/` | Science + Align orchestration + `engine/` CLI | **MIT** — see [`methylgrapher/LICENSE`](methylgrapher/LICENSE) |
+| `numeric/` | Post-align DeviceContext kernels (centroid stream) | *none (internal)* |
 
 Only `methylgrapher/` carries an open-source license (upstream methylGrapher MIT).
 Do not attach LICENSE files to the other packages.
@@ -76,7 +77,7 @@ Details: [`fq2bam-meth/docs/LINEAR_PARITY.md`](fq2bam-meth/docs/LINEAR_PARITY.md
 Mojo include paths (also set by `bin/methylGrapher`):
 
 ```text
--I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src
+-I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src
 ```
 
 ## Fleet image staging

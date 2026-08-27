@@ -21,6 +21,7 @@ cp -a "$REPO_ROOT"/gpu-common/src/. "$DEST/src/"
 cp -a "$REPO_ROOT"/fq2bam-meth/src/. "$DEST/src/"
 cp -a "$REPO_ROOT"/giraffe/src/. "$DEST/src/"
 cp -a "$REPO_ROOT"/methylgrapher/src/. "$DEST/src/"
+cp -a "$REPO_ROOT"/numeric/src/. "$DEST/src/" 2>/dev/null || true
 
 # Engine: real science modules + load implementations (prefer real files over shims)
 cp -a "$REPO_ROOT"/methylgrapher/engine/. "$DEST/engine/"
@@ -38,6 +39,9 @@ cp -a "$REPO_ROOT"/methylgrapher/engine/mcall.py "$DEST/engine/"
 cp -a "$REPO_ROOT"/methylgrapher/engine/gfa.py "$DEST/engine/"
 cp -a "$REPO_ROOT"/methylgrapher/engine/utility.py "$DEST/engine/"
 cp -a "$REPO_ROOT"/methylgrapher/engine/mgmp.py "$DEST/engine/"
+if [[ -f "$REPO_ROOT/numeric/python/centroid_kernels.py" ]]; then
+  cp -a "$REPO_ROOT/numeric/python/centroid_kernels.py" "$DEST/engine/centroid_kernels.py"
+fi
 rm -f "$DEST/engine/_pkg_shim.py"
 
 # Scripts (legacy /opt/.../scripts paths)
@@ -50,6 +54,7 @@ cp -a "$REPO_ROOT"/giraffe/tests/. "$DEST/tests/" 2>/dev/null || true
 cp -a "$REPO_ROOT"/fq2bam-meth/tests/. "$DEST/tests/" 2>/dev/null || true
 cp -a "$REPO_ROOT"/gpu-common/tests/. "$DEST/tests/" 2>/dev/null || true
 cp -a "$REPO_ROOT"/methylgrapher/tests/. "$DEST/tests/" 2>/dev/null || true
+cp -a "$REPO_ROOT"/numeric/tests/. "$DEST/tests/" 2>/dev/null || true
 
 # Launcher for flat layout (single -I src)
 cat > "$DEST/bin/methylGrapher" << 'EOF'

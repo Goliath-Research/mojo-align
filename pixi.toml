@@ -12,6 +12,7 @@ python = ">=3.11,<3.14"
 pytest = ">=9.1.1,<10"
 
 [tasks]
-run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo"
-help = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo help"
+run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src methylgrapher/src/main.mojo"
+help = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src methylgrapher/src/main.mojo help"
+numeric-probe = "mojo -I gpu-common/src -I numeric/src numeric/src/centroid_kernels.mojo"
 test = "python -m pytest"
