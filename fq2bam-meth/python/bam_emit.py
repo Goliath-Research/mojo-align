@@ -370,8 +370,13 @@ class BamWriter:
         next_pos0s: Sequence[int],
         tlens: Sequence[int],
         nms: Sequence[int],
+        xms: Sequence[str] | None = None,
+        xgs: Sequence[str] | None = None,
     ) -> int:
-        """Pack one batch of alignments. Returns mapped count."""
+        """Pack one batch of alignments. Returns mapped count.
+
+        Optional ``xms`` / ``xgs`` write Bismark-style XM:Z and XG:Z aux tags.
+        """
         n = len(qnames)
         mapped = 0
         rec = bytearray(1024)
@@ -423,9 +428,13 @@ class BamWriter:
             n_cigar = len(cigar)
             seq_packed = _pack_seq(seq.encode("ascii", "replace")) if qlen else b""
             qual_b = _qual_phred(q, qlen)
-            # RG:Z + NM:i
+            # RG:Z + NM:i (+ optional XM:Z / XG:Z)
             tags = b"RGZ" + self._rg + b"\x00"
             tags += b"NM" + b"C" + struct.pack("<B", min(255, max(0, int(nms[i]))))
+            if xgs is not None and i < len(xgs) and xgs[i]:
+                tags += b"XGZ" + str(xgs[i]).encode("ascii") + b"\x00"
+            if xms is not None and i < len(xms) and xms[i]:
+                tags += b"XMZ" + str(xms[i]).encode("ascii") + b"\x00"
             block = 32 + l_qname + 4 * n_cigar + len(seq_packed) + qlen + len(tags)
             mq = max(0, min(255, int(mapqs[i])))
             ntid = int(next_tids[i])

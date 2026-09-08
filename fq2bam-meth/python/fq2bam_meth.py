@@ -914,6 +914,18 @@ def run_mojo_fq2bam_meth(
             shutil.copy2(bam_sorted, out_bam)
         _run([samtools, "index", str(out_bam)], log)
 
+    if os.environ.get("METHYLGRAPHER_WRITE_METH_TAGS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        from meth_tags import annotate_bam_meth_tags
+
+        annotate_bam_meth_tags(
+            out_bam, Path(reference_fasta), samtools=samtools, log=log
+        )
+
     fs = subprocess.run(
         [samtools, "flagstat", str(out_bam)], capture_output=True, text=True, check=False
     )

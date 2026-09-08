@@ -60,6 +60,41 @@ def test_bam_writer_roundtrip(tmp_path: Path):
     assert p[9] == "ACGTACGTAC"
     assert "RG:Z:mojo1" in lines[0]
     assert "NM:i:0" in lines[0]
+
+
+@pytest.mark.skipif(shutil.which("samtools") is None, reason="samtools required")
+def test_bam_writer_xm_xg_tags(tmp_path: Path):
+    bam = tmp_path / "meth.bam"
+    w = BamWriter(
+        str(bam), ["chr1"], [1000], rg_id="mojo1", level=1, sort_order="coordinate"
+    )
+    w.write_batch(
+        qnames=["r1"],
+        flags=[99],
+        tids=[0],
+        pos0s=[10],
+        mapqs=[60],
+        sls=[0],
+        srs=[0],
+        seqs=["ACGTACGTAC"],
+        quals=["IIIIIIIIII"],
+        next_tids=[0],
+        next_pos0s=[50],
+        tlens=[50],
+        nms=[0],
+        xms=[".Z..z....."],
+        xgs=["CT"],
+    )
+    w.close()
+    view = subprocess.run(
+        ["samtools", "view", str(bam)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    line = view.stdout.splitlines()[0]
+    assert "XM:Z:.Z..z....." in line
+    assert "XG:Z:CT" in line
     fs = subprocess.run(
         ["samtools", "flagstat", str(bam)],
         check=True,
