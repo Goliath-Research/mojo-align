@@ -1,21 +1,21 @@
 # mojo-align
 
-Mojo align monorepo for Epimethyl WGBS SamplePrep. Git history includes the
-former tree that was named `methylGrapher-mojo` (that repository no longer
+Open-source Mojo align monorepo for WGBS SamplePrep (MIT; linear path follows
+**bwa-meth**, `methylgrapher/` follows **methylGrapher**). Git history includes
+the former tree that was named `methylGrapher-mojo` (that repository no longer
 exists). Unified CLI remains `bin/methylGrapher`.
 
 ## Packages
 
 | Package | Role | License |
 |---------|------|---------|
-| `gpu-common/` | Portable DeviceContext device select + seed kernels + HBM preflight | *none (internal)* |
-| `fq2bam-meth/` | Mojo linear WGBS mapper (`align.linear.mojo`) | *none (internal)* |
-| `giraffe/` | MojoGiraffe / GBZ stream map (`align.pangenome_wgbs.mojo`) | *none (internal)* |
-| `methylgrapher/` | Science + Align orchestration + `engine/` CLI | **MIT** — see [`methylgrapher/LICENSE`](methylgrapher/LICENSE) |
-| `numeric/` | Post-align DeviceContext kernels (centroid stream) | *none (internal)* |
+| `gpu-common/` | Portable DeviceContext device select + seed kernels + HBM preflight | **MIT** — see [`LICENSE`](LICENSE) |
+| `fq2bam-meth/` | Mojo linear WGBS mapper (`align.linear.mojo`); published **bwa-meth** method class | **MIT** — see [`LICENSE`](LICENSE) |
+| `giraffe/` | MojoGiraffe / GBZ stream map (`align.pangenome_wgbs.mojo`) | **MIT** — see [`LICENSE`](LICENSE) |
+| `methylgrapher/` | Science + Align orchestration + `engine/` CLI | **MIT** — [`methylgrapher/LICENSE`](methylgrapher/LICENSE) (methylGrapher) |
+| `numeric/` | Post-align DeviceContext kernels (centroid stream) | **MIT** — see [`LICENSE`](LICENSE) |
 
-Only `methylgrapher/` carries an open-source license (upstream methylGrapher MIT).
-Do not attach LICENSE files to the other packages.
+The whole monorepo is MIT open source. Linear mapping follows [bwa-meth](https://github.com/brentp/bwa-meth); `methylgrapher/` is a methylGrapher derivative.
 
 ## Align paths + sample layout
 

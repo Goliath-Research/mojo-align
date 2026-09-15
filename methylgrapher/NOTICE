@@ -12,10 +12,10 @@ Copyright 2023-2025, Ting Wang Lab
 Authors / credits include Wenjin Zhang and Juan Macias
 (see engine/cli.py headers and python_reference/).
 
-Only this `methylgrapher/` package is released under the MIT License
-(see LICENSE in this directory). Sibling packages in the mojo-align
-repository (`gpu-common`, `fq2bam-meth`, `giraffe`) are Epimethyl internal
-code and do not carry an open-source license grant.
+The `methylgrapher/` package is MIT (see LICENSE in this directory). Sibling
+packages in the mojo-align repository (`gpu-common`, `fq2bam-meth`, `giraffe`,
+`numeric`) are also MIT; see the repository root LICENSE. Linear WGBS follows
+the published bwa-meth method class (MIT).
 
 Third-party tooling (not redistributed as source here)
 -----------------------------------------------------
