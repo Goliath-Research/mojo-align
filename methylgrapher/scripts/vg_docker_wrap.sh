@@ -11,5 +11,5 @@ exec docker run --rm \
   -v "${REPO_ROOT}:${REPO_ROOT}" \
   -v /tmp:/tmp \
   -w "${REPO_ROOT}" \
-  epimethyl/methylgrapher:1.70-mojo \
+  goliath/methylgrapher:1.70-mojo \
   vg "${ARGS[@]}"

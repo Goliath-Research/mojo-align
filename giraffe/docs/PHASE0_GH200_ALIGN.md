@@ -30,7 +30,7 @@ Conclusion: Parabricks accelerates stock pangenome BAM, but **cannot** satisfy m
 Run [`scripts/spike_gh200_dual_graph_align.sh`](../scripts/spike_gh200_dual_graph_align.sh):
 
 - Confirms Parabricks CLI gap (always).
-- Optional: tiny dual `vg giraffe` GAF via `epimethyl/methylgrapher:1.70-mojo` (needs image + indexes).
+- Optional: tiny dual `vg giraffe` GAF via `goliath/methylgrapher:1.70-mojo` (needs image + indexes).
 - Optional: Parabricks BAM wall on converted PE subset (speed reference only — not science GAF).
 
 Full-depth Buffy dual-map wall (~2 h gate) remains an operator measurement after Mojo Align lands; CPU vg alone was ~4 h for **one** QC giraffe on this cohort historically.

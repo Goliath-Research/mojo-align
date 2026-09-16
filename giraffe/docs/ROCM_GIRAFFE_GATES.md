@@ -27,7 +27,7 @@ Site pin:
     "align_engine": "gpu_giraffe",
     "giraffe_device": "auto",
     "align_device": "auto",
-    "image": "epimethyl/methylgrapher:1.70-mojo-rocm"
+    "image": "goliath/methylgrapher:1.70-mojo-rocm"
   }
 }
 ```

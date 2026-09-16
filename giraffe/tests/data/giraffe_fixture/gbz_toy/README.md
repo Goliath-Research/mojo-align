@@ -13,6 +13,6 @@ Built with `vg autoindex -w giraffe` from `../toy.wl.gfa` (vg 1.70).
 Rebuild:
 
 ```bash
-docker run --rm -v "$PWD/../..:/data" -w /data epimethyl/methylgrapher:1.70-mojo \
+docker run --rm -v "$PWD/../..:/data" -w /data goliath/methylgrapher:1.70-mojo \
   bash -lc 'vg autoindex -p giraffe_fixture/gbz_toy/toy -w giraffe -g giraffe_fixture/gbz_toy/toy.wl.gfa -t 4'
 ```

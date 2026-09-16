@@ -350,12 +350,12 @@ replaced; see its "Known TODOs" for the current plan).
 **Parity:** 20k-line GAF subset from `DPLST-051425-111148-DS20M` against
 `hprc-d9-bs.wl.gfa` (~43 GB). After restoring CLI defaults 20/0,
 `graph.methyl` (16993 rows) and `graph.cpg.tsv` (16776 rows) are identical
-vs Docker `epimethyl/methylgrapher:1.70` (stock 0.2.0). See
+vs Docker `goliath/methylgrapher:1.70` (stock 0.2.0). See
 `docs/BENCHMARK_MCALL.md`.
 
 **Dual-ship (MethylPipeline):**
 - `actionConfig.methylgrapher_wgbs.engine` = `python`|`mojo`
-- Image `epimethyl/methylgrapher:1.70-mojo` built via
+- Image `goliath/methylgrapher:1.70-mojo` built via
   `scripts/build_mojo_align_image.sh`; smoke passed on 64K pages.
 - Default remains `python` until cutover gate
   (`docs/plans/methylgrapher-mojo-cutover-gate.md`).
