@@ -56,7 +56,7 @@ mkdir -p \
 cat > "$SAMPLE_DIR/README.md" << EOF
 # parabricks_sample
 
-NVIDIA Clara Parabricks tutorial inputs staged for Epimethyl linear parity:
+NVIDIA Clara Parabricks tutorial inputs staged for GoliathOmics linear parity:
 
 - Source: \`$URL\`
 - Align paths: \`align.linear.parabricks/\` vs \`align.linear.mojo/\`
