@@ -6,12 +6,9 @@
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext
 from std.collections import List
-from std.ffi import external_call
-from std.memory import Pointer, UnsafePointer, unsafe_memmove
+from std.memory import Pointer, UnsafePointer, unsafe_memcpy, unsafe_memset
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
-
-from parallel_slot import clear_parallel_slot, parallel_slot_addr, set_parallel_slot
 
 from giraffe_fastq import giraffe_fq_read_header_seq
 from giraffe_gaf_emit import append_gaf_hits
@@ -163,151 +160,6 @@ def _mut_u8[origin: Origin](p: Pointer[UInt8, origin]) -> Pointer[UInt8, MutAnyO
     return Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p))
 
 
-def _memset_bytes[origin: Origin](dest: Pointer[UInt8, origin], value: Int, count: Int):
-    var p = _mut_u8(dest)
-    _ = external_call["memset", Pointer[UInt8, MutAnyOrigin]](p, value, UInt(count))
-
-
-struct _GiraffeOvSlot:
-    var emit_n: Int
-    var out_fh: Int
-    var pending_hits: Int
-    var batch_size: Int
-    var fq: Int
-    var paired: Bool
-    var batch1: Int
-    var batch2: Int
-    var ov_fail0: Int
-    var ov_fail1: Int
-
-    def __init__(
-        out self,
-        emit_n: Int,
-        out_fh: Int,
-        pending_hits: Int,
-        batch_size: Int,
-        fq: Int,
-        paired: Bool,
-        batch1: Int,
-        batch2: Int,
-        ov_fail0: Int,
-        ov_fail1: Int,
-    ):
-        self.emit_n = emit_n
-        self.out_fh = out_fh
-        self.pending_hits = pending_hits
-        self.batch_size = batch_size
-        self.fq = fq
-        self.paired = paired
-        self.batch1 = batch1
-        self.batch2 = batch2
-        self.ov_fail0 = ov_fail0
-        self.ov_fail1 = ov_fail1
-
-
-def _giraffe_ov_worker(wi: Int):
-    var slot = Pointer[_GiraffeOvSlot, MutAnyOrigin](
-        unsafe_from_address=parallel_slot_addr("MOJO_GIRAFFE_OV")
-    )
-    var emit_n = Pointer[Int, MutAnyOrigin](unsafe_from_address=slot[].emit_n)
-    var out_fh = Pointer[PythonObject, MutAnyOrigin](unsafe_from_address=slot[].out_fh)
-    var pending_hits = Pointer[List[AlignmentHit], MutAnyOrigin](
-        unsafe_from_address=slot[].pending_hits
-    )
-    var fq = Pointer[FastqPairStream, MutAnyOrigin](unsafe_from_address=slot[].fq)
-    var batch1 = Pointer[List[StreamReadGPU], MutAnyOrigin](unsafe_from_address=slot[].batch1)
-    var batch2 = Pointer[List[StreamReadGPU], MutAnyOrigin](unsafe_from_address=slot[].batch2)
-    var ov_fail0 = Pointer[Int, MutAnyOrigin](unsafe_from_address=slot[].ov_fail0)
-    var ov_fail1 = Pointer[Int, MutAnyOrigin](unsafe_from_address=slot[].ov_fail1)
-    try:
-        if wi == 0:
-            emit_n[] = append_gaf_hits(out_fh[], pending_hits[])
-        else:
-            var i = 0
-            while i < slot[].batch_size:
-                var r1 = _read_one_gpu_pipe(fq[].r1)
-                if r1.name.byte_length() == 0:
-                    break
-                batch1[].append(r1^)
-                if slot[].paired:
-                    var r2 = _read_one_gpu_pipe(fq[].r2)
-                    if r2.name.byte_length() == 0:
-                        raise Error("paired FASTQ length mismatch (R2 ended early)")
-                    batch2[].append(r2^)
-                i += 1
-    except e:
-        if wi == 0:
-            ov_fail0[] = 1
-        else:
-            ov_fail1[] = 1
-        print("mojo_stream emit||fastq overlap worker", wi, e)
-
-
-struct _GiraffeSyncSlot:
-    var ctx: Int
-    var batch_size: Int
-    var fq: Int
-    var next_paired: Bool
-    var next1: Int
-    var next2: Int
-    var sync_fail: Int
-    var prefetch_ok: Int
-
-    def __init__(
-        out self,
-        ctx: Int,
-        batch_size: Int,
-        fq: Int,
-        next_paired: Bool,
-        next1: Int,
-        next2: Int,
-        sync_fail: Int,
-        prefetch_ok: Int,
-    ):
-        self.ctx = ctx
-        self.batch_size = batch_size
-        self.fq = fq
-        self.next_paired = next_paired
-        self.next1 = next1
-        self.next2 = next2
-        self.sync_fail = sync_fail
-        self.prefetch_ok = prefetch_ok
-
-
-def _giraffe_sync_worker(wi: Int):
-    var slot = Pointer[_GiraffeSyncSlot, MutAnyOrigin](
-        unsafe_from_address=parallel_slot_addr("MOJO_GIRAFFE_SYNC")
-    )
-    var ctx = Pointer[DeviceContext, MutAnyOrigin](unsafe_from_address=slot[].ctx)
-    var fq = Pointer[FastqPairStream, MutAnyOrigin](unsafe_from_address=slot[].fq)
-    var next1 = Pointer[List[StreamReadGPU], MutAnyOrigin](unsafe_from_address=slot[].next1)
-    var next2 = Pointer[List[StreamReadGPU], MutAnyOrigin](unsafe_from_address=slot[].next2)
-    var sync_fail = Pointer[Int, MutAnyOrigin](unsafe_from_address=slot[].sync_fail)
-    var prefetch_ok = Pointer[Int, MutAnyOrigin](unsafe_from_address=slot[].prefetch_ok)
-    try:
-        if wi == 0:
-            ctx[].synchronize()
-        else:
-            var i = 0
-            while i < slot[].batch_size:
-                var r1 = _read_one_gpu_pipe(fq[].r1)
-                if r1.name.byte_length() == 0:
-                    break
-                next1[].append(r1^)
-                if slot[].next_paired:
-                    var r2 = _read_one_gpu_pipe(fq[].r2)
-                    if r2.name.byte_length() == 0:
-                        raise Error("paired FASTQ length mismatch (R2 ended early)")
-                    next2[].append(r2^)
-                i += 1
-    except e:
-        if wi == 0:
-            sync_fail[] = 1
-        else:
-            prefetch_ok[] = 0
-        print("mojo_stream sync||prefetch worker", wi, e)
-
-
 def gpu_native_stream_loop(
     mut pack: DensePack,
     mut min_idx: MojoMinIndex,
@@ -364,7 +216,7 @@ def gpu_native_stream_loop(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memcpy(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK
@@ -950,21 +802,44 @@ def gpu_native_stream_loop(
                     has_pending = False
                     t_write = Float64(py=time.perf_counter()) - Float64(py=t0)
             elif has_pending:
-                var ov_slot = _GiraffeOvSlot(
-                    Int(Pointer(to=emit_n)),
-                    Int(Pointer(to=out_fh)),
-                    Int(Pointer(to=pending_hits)),
-                    batch_size,
-                    Int(Pointer(to=fq)),
-                    paired,
-                    Int(Pointer(to=batch1)),
-                    Int(Pointer(to=batch2)),
-                    Int(Pointer(to=ov_fail0)),
-                    Int(Pointer(to=ov_fail1)),
-                )
-                set_parallel_slot("MOJO_GIRAFFE_OV", Int(Pointer(to=ov_slot)))
-                parallelize(_giraffe_ov_worker, 2, 2)
-                clear_parallel_slot("MOJO_GIRAFFE_OV")
+                def ov_work(wi: Int) {
+                    mut emit_n,
+                    imm out_fh,
+                    mut pending_hits,
+                    imm batch_size,
+                    mut fq,
+                    imm paired,
+                    mut batch1,
+                    mut batch2,
+                    mut ov_fail0,
+                    mut ov_fail1,
+                }:
+                    try:
+                        if wi == 0:
+                            emit_n = append_gaf_hits(out_fh, pending_hits)
+                        else:
+                            var i = 0
+                            while i < batch_size:
+                                var r1 = _read_one_gpu_pipe(fq.r1)
+                                if r1.name.byte_length() == 0:
+                                    break
+                                batch1.append(r1^)
+                                if paired:
+                                    var r2 = _read_one_gpu_pipe(fq.r2)
+                                    if r2.name.byte_length() == 0:
+                                        raise Error(
+                                            "paired FASTQ length mismatch (R2 ended early)"
+                                        )
+                                    batch2.append(r2^)
+                                i += 1
+                    except e:
+                        if wi == 0:
+                            ov_fail0 = 1
+                        else:
+                            ov_fail1 = 1
+                        print("mojo_stream emit||fastq overlap worker", wi, e)
+
+                parallelize(ov_work, 2, 2)
                 if ov_fail0 != 0 or ov_fail1 != 0:
                     raise Error("Giraffe emit||FASTQ overlap worker failed")
                 n_written += emit_n
@@ -1022,7 +897,7 @@ def gpu_native_stream_loop(
                 var stride = READ_STRIDE_CAP
                 var n_bases = n_reads * stride
                 # memset unused lanes to N so kmer kernels stay valid.
-                _memset_bytes(host_bases.unsafe_ptr(), 78, n_bases)
+                unsafe_memset(ptr=host_bases.unsafe_ptr(), value=UInt8(78), count=n_bases)
                 ri = 0
                 while ri < n_reads:
                     var s = seqs[ri]
@@ -1030,7 +905,7 @@ def gpu_native_stream_loop(
                     host_lens[ri] = Int32(L)
                     if L > 0:
                         var sb = s.as_bytes()
-                        unsafe_memmove(
+                        unsafe_memcpy(
                             dest=host_bases.unsafe_ptr() + ri * stride,
                             src=sb.unsafe_ptr(),
                             count=L,
@@ -1145,19 +1020,42 @@ def gpu_native_stream_loop(
                 var next_paired = paired
                 var prefetch_ok = 1
                 var sync_fail = 0
-                var sync_slot = _GiraffeSyncSlot(
-                    Int(Pointer(to=ctx)),
-                    batch_size,
-                    Int(Pointer(to=fq)),
-                    next_paired,
-                    Int(Pointer(to=next1)),
-                    Int(Pointer(to=next2)),
-                    Int(Pointer(to=sync_fail)),
-                    Int(Pointer(to=prefetch_ok)),
-                )
-                set_parallel_slot("MOJO_GIRAFFE_SYNC", Int(Pointer(to=sync_slot)))
-                parallelize(_giraffe_sync_worker, 2, 2)
-                clear_parallel_slot("MOJO_GIRAFFE_SYNC")
+                def sync_or_prefetch(wi: Int) {
+                    mut ctx,
+                    imm batch_size,
+                    mut fq,
+                    imm next_paired,
+                    mut next1,
+                    mut next2,
+                    mut sync_fail,
+                    mut prefetch_ok,
+                }:
+                    try:
+                        if wi == 0:
+                            ctx.synchronize()
+                        else:
+                            var i = 0
+                            while i < batch_size:
+                                var r1 = _read_one_gpu_pipe(fq.r1)
+                                if r1.name.byte_length() == 0:
+                                    break
+                                next1.append(r1^)
+                                if next_paired:
+                                    var r2 = _read_one_gpu_pipe(fq.r2)
+                                    if r2.name.byte_length() == 0:
+                                        raise Error(
+                                            "paired FASTQ length mismatch (R2 ended early)"
+                                        )
+                                    next2.append(r2^)
+                                i += 1
+                    except e:
+                        if wi == 0:
+                            sync_fail = 1
+                        else:
+                            prefetch_ok = 0
+                        print("mojo_stream sync||prefetch worker", wi, e)
+
+                parallelize(sync_or_prefetch, 2, 2)
                 if sync_fail != 0:
                     raise Error("Giraffe DeviceContext synchronize failed")
                 var t_sync_pref = time.perf_counter()

@@ -7,7 +7,7 @@
 
 from max.algorithm import parallelize
 from std.collections import Dict, List
-from std.memory import UnsafePointer, unsafe_memmove
+from std.memory import UnsafePointer, unsafe_memcpy
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 from std.time import perf_counter as _tick
@@ -216,7 +216,7 @@ def _gather_perm_to_writer(
         var dst = UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=bam_blob_addr + gout
         )
-        unsafe_memmove(dest=dst, src=src, count=rlen)
+        unsafe_memcpy(dest=dst, src=src, count=rlen)
         if apply_dup and Int(h_dup[orig]) != 0:
             _or_dup_flag(bp_out, gout)
         gout += rlen
@@ -365,7 +365,7 @@ def _u64_at(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
 def _copy_bytes(dst: Int, src: Int, nbytes: Int):
     if nbytes <= 0:
         return
-    unsafe_memmove(dest=_u8_at(dst), src=_u8_at(src), count=nbytes)
+    unsafe_memcpy(dest=_u8_at(dst), src=_u8_at(src), count=nbytes)
 
 
 def _unclipped5(flag: Int, pos0: Int, sl: Int, sr: Int, qlen: Int) -> Int:
@@ -1070,21 +1070,21 @@ def map_fastq_fm_gpu(
             DeviceStream,
             HostBuffer,
         )
-        from std.memory import UnsafePointer, unsafe_memmove
+        from std.memory import UnsafePointer, unsafe_memcpy
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
             src: UnsafePointer[UInt8, MutAnyOrigin],
-            dst_off: Int,
-            n: Int,
+            dst_off: Int64,
+            n: Int64,
         ):
-            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var tid = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if tid < n:
                 dst[dst_off + tid] = src[tid]
 
-        def upload_mmap_to_device(
+        def upload_mmap_to_device[dst_origin: Origin](
             ctx: DeviceContext,
-            dst: UnsafePointer[UInt8, MutAnyOrigin],
+            dst: UnsafePointer[UInt8, dst_origin],
             host_addr: Int,
             nbytes: Int,
             label: String,
@@ -1105,15 +1105,18 @@ def map_fastq_fm_gpu(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memcpy(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK
+                var dst_any = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=Int(dst)
+                )
                 ctx.enqueue_function[copy_bytes_offset_kernel](
-                    dst,
+                    dst_any,
                     stage.unsafe_ptr(),
-                    off,
-                    n,
+                    Int64(off),
+                    Int64(n),
                     grid_dim=grid,
                     block_dim=BLOCK,
                 )
@@ -1133,9 +1136,9 @@ def map_fastq_fm_gpu(
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
             codes: UnsafePointer[UInt8, MutAnyOrigin],
-            n: Int,
+            n: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n:
                 return
             var b = bases[idx]
@@ -1156,7 +1159,7 @@ def map_fastq_fm_gpu(
             pac: UnsafePointer[UInt8, MutAnyOrigin],
             contig_off: UnsafePointer[UInt64, MutAnyOrigin],
             contig_len: UnsafePointer[UInt32, MutAnyOrigin],
-            n_contigs: Int,
+            n_contigs: Int64,
             primary: UInt64,
             seq_len: UInt64,
             l_pac: UInt64,
@@ -1165,18 +1168,18 @@ def map_fastq_fm_gpu(
             l2_2: UInt64,
             l2_3: UInt64,
             l2_4: UInt64,
-            sa_intv: Int,
-            n_sa: Int,
+            sa_intv: Int64,
+            n_sa: Int64,
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            max_len: Int,
-            n_reads: Int,
-            seed_len: Int,
-            seed_stride: Int,
-            max_occ: Int,
-            max_diff: Int,
-            max_soft: Int,
-            max_adj: Int,
+            max_len: Int64,
+            n_reads: Int64,
+            seed_len: Int64,
+            seed_stride: Int64,
+            max_occ: Int64,
+            max_diff: Int64,
+            max_soft: Int64,
+            max_adj: Int64,
             out_rid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
             out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
@@ -1185,7 +1188,7 @@ def map_fastq_fm_gpu(
             out_sr: UnsafePointer[UInt32, MutAnyOrigin],
             out_nm: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var rid = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if rid >= n_reads:
                 return
             out_rid[rid] = Int32(-1)
@@ -1195,7 +1198,7 @@ def map_fastq_fm_gpu(
             out_sl[rid] = 0
             out_sr[rid] = 0
             out_nm[rid] = 0
-            var qlen = Int(read_lens[rid])
+            var qlen = Int64(read_lens[rid])
             if qlen < seed_len:
                 return
             var budget = max_diff
@@ -1218,13 +1221,13 @@ def map_fastq_fm_gpu(
             var L2_3 = l2_3
             var L2_4 = l2_4
 
-            var best_nm = 9999
-            var best_rid = -1
-            var best_pos = 0
-            var best_sl = 0
-            var best_sr = 0
+            var best_nm = Int64(9999)
+            var best_rid = Int64(-1)
+            var best_pos = Int64(0)
+            var best_sl = Int64(0)
+            var best_sr = Int64(0)
             var best_mq: UInt32 = 0
-            var best_flag = 0
+            var best_flag = Int64(0)
 
             # Unique SMEM: left-extend from each right endpoint until occ==1.
             var e = seed_len - 1
@@ -1234,18 +1237,18 @@ def map_fastq_fm_gpu(
                 var s = e
                 var uk: UInt64 = 0
                 var ul: UInt64 = 0
-                var us = -1
+                var us = Int64(-1)
                 var found = False
                 var last_k: UInt64 = 0
                 var last_l: UInt64 = 0
-                var last_s = -1
+                var last_s = Int64(-1)
                 while s >= 0:
-                    var cc = Int(codes[q_base + s])
+                    var cc = Int64(codes[q_base + s])
                     if cc > 3:
                         break
                     var ok: UInt64 = 0
                     var ol: UInt64 = 0
-                    var pass_i = 0
+                    var pass_i = Int64(0)
                     while pass_i < 2:
                         if pass_i == 0 and k == 0:
                             ok = 0
@@ -1255,7 +1258,7 @@ def map_fastq_fm_gpu(
                         if pass_i == 0:
                             kv = k - 1
                         var nocc: UInt64 = 0
-                        var k_m = Int(kv)
+                        var k_m = Int64(kv)
                         if k_m < 0:
                             nocc = 0
                         elif UInt64(k_m) == seq_len:
@@ -1271,12 +1274,12 @@ def map_fastq_fm_gpu(
                             var kko = UInt64(k_m)
                             if kko >= primary:
                                 kko -= 1
-                            var baseo = Int((kko >> 7) << 4)
+                            var baseo = Int64((kko >> 7) << 4)
                             nocc = UInt64(bwt[baseo + cc * 2]) | (
                                 UInt64(bwt[baseo + cc * 2 + 1]) << 32
                             )
                             var po = baseo + 8
-                            var endo = po + Int(
+                            var endo = po + Int64(
                                 (
                                     (
                                         (kko >> 5)
@@ -1311,7 +1314,7 @@ def map_fastq_fm_gpu(
                                 ) * UInt64(0x0101010101010101)
                                 nocc += yyo >> 56
                                 po += 2
-                            var bitso = Int(((~Int(kko)) & 31) << 1)
+                            var bitso = Int64(((~Int64(kko)) & 31) << 1)
                             var masko: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
                             if bitso > 0 and bitso < 64:
                                 masko = ~((UInt64(1) << UInt64(bitso)) - 1)
@@ -1339,10 +1342,10 @@ def map_fastq_fm_gpu(
                             ) * UInt64(0x0101010101010101)
                             nocc += yy5 >> 56
                             if cc == 0:
-                                nocc -= UInt64((~Int(kko)) & 31)
+                                nocc -= UInt64((~Int64(kko)) & 31)
 
                         if pass_i == 0:
-                            if Int(k) == 0:
+                            if Int64(k) == 0:
                                 ok = 0
                             else:
                                 ok = nocc
@@ -1360,7 +1363,7 @@ def map_fastq_fm_gpu(
                     l = Lc + ol
                     if k > l:
                         break
-                    var occ_n = Int(l - k + 1)
+                    var occ_n = Int64(l - k + 1)
                     var mlen = e - s + 1
                     if occ_n == 1 and mlen >= seed_len:
                         uk = k
@@ -1396,14 +1399,14 @@ def map_fastq_fm_gpu(
                             var xpsi = kk
                             if kk > primary:
                                 xpsi -= 1
-                            var bi = Int(xpsi)
+                            var bi = Int64(xpsi)
                             var bidx = ((bi >> 7) << 4) + 8 + ((bi & 0x7F) >> 4)
                             var w = bwt[bidx]
-                            var cc = Int((w >> UInt32(((~bi) & 15) << 1)) & 3)
+                            var cc = Int64((w >> UInt32(((~bi) & 15) << 1)) & 3)
                             var kv = kk
 
                             var nocc: UInt64 = 0
-                            var k_m = Int(kv)
+                            var k_m = Int64(kv)
                             if k_m < 0:
                                 nocc = 0
                             elif UInt64(k_m) == seq_len:
@@ -1419,12 +1422,12 @@ def map_fastq_fm_gpu(
                                 var kko = UInt64(k_m)
                                 if kko >= primary:
                                     kko -= 1
-                                var baseo = Int((kko >> 7) << 4)
+                                var baseo = Int64((kko >> 7) << 4)
                                 nocc = UInt64(bwt[baseo + cc * 2]) | (
                                     UInt64(bwt[baseo + cc * 2 + 1]) << 32
                                 )
                                 var po = baseo + 8
-                                var endo = po + Int(
+                                var endo = po + Int64(
                                     (
                                         (
                                             (kko >> 5)
@@ -1459,7 +1462,7 @@ def map_fastq_fm_gpu(
                                     ) * UInt64(0x0101010101010101)
                                     nocc += yyo >> 56
                                     po += 2
-                                var bitso = Int(((~Int(kko)) & 31) << 1)
+                                var bitso = Int64(((~Int64(kko)) & 31) << 1)
                                 var masko: UInt64 = UInt64(0xFFFFFFFFFFFFFFFF)
                                 if bitso > 0 and bitso < 64:
                                     masko = ~((UInt64(1) << UInt64(bitso)) - 1)
@@ -1487,7 +1490,7 @@ def map_fastq_fm_gpu(
                                 ) * UInt64(0x0101010101010101)
                                 nocc += yy5 >> 56
                                 if cc == 0:
-                                    nocc -= UInt64((~Int(kko)) & 31)
+                                    nocc -= UInt64((~Int64(kko)) & 31)
 
                             var Lc2: UInt64 = L2_0
                             if cc == 1:
@@ -1497,25 +1500,25 @@ def map_fastq_fm_gpu(
                             elif cc == 3:
                                 Lc2 = L2_3
                             kk = Lc2 + nocc
-                        var sidx = Int(kk // UInt64(sa_intv))
+                        var sidx = Int64(kk // UInt64(sa_intv))
                         if sidx <= 0 or sidx >= n_sa:
                             sa_ok = False
                         var sa_pos = sa_v
                         if sa_ok:
                             sa_pos = sa_v + sa[sidx - 1]
                         if sa_ok:
-                            var is_rev = 0
-                            var b0 = 0
+                            var is_rev = Int64(0)
+                            var b0 = Int64(0)
                             var plen = e - us + 1
                             if sa_pos < l_pac:
-                                b0 = Int(sa_pos) - us
+                                b0 = Int64(sa_pos) - us
                                 is_rev = 0
                             else:
                                 var seed_end = sa_pos + UInt64(plen) - 1
                                 if seed_end >= l_pac * 2:
                                     sa_ok = False
                                 else:
-                                    var fp_end = Int(l_pac * 2 - 1 - sa_pos)
+                                    var fp_end = Int64(l_pac * 2 - 1 - sa_pos)
                                     var fp_start = fp_end - (plen - 1)
                                     b0 = fp_start - (qlen - 1 - e)
                                     is_rev = 1
@@ -1529,14 +1532,14 @@ def map_fastq_fm_gpu(
                                     if probe < 0:
                                         probe = 0
                                     if UInt64(probe) >= l_pac:
-                                        probe = Int(l_pac) - 1
-                                    var lo = 0
+                                        probe = Int64(l_pac) - 1
+                                    var lo = Int64(0)
                                     var hi2 = n_contigs
-                                    var crid = -1
+                                    var crid = Int64(-1)
                                     while lo < hi2:
                                         var mid = (lo + hi2) // 2
-                                        var off = Int(contig_off[mid])
-                                        var ln = Int(contig_len[mid])
+                                        var off = Int64(contig_off[mid])
+                                        var ln = Int64(contig_len[mid])
                                         if probe < off:
                                             hi2 = mid
                                         elif probe >= off + ln:
@@ -1545,11 +1548,11 @@ def map_fastq_fm_gpu(
                                             crid = mid
                                             break
                                     if crid >= 0:
-                                        var coff = Int(contig_off[crid])
-                                        var clen = Int(contig_len[crid])
+                                        var coff = Int64(contig_off[crid])
+                                        var clen = Int64(contig_len[crid])
                                         var local = bstart - coff
-                                        var sl0 = 0
-                                        var sr0 = 0
+                                        var sl0 = Int64(0)
+                                        var sr0 = Int64(0)
                                         if local < 0:
                                             sl0 = -local
                                         if local + qlen > clen:
@@ -1559,20 +1562,20 @@ def map_fastq_fm_gpu(
                                             and sl0 <= clip_cap
                                             and sr0 <= clip_cap
                                         ):
-                                            var nm_all = 0
+                                            var nm_all = Int64(0)
                                             var j = sl0
                                             while j < qlen - sr0 and nm_all <= budget:
                                                 var ppos = bstart + j
-                                                var rb = Int(
+                                                var rb = Int64(
                                                     (
                                                         pac[ppos >> 2]
                                                         >> UInt8(((~ppos) & 3) << 1)
                                                     )
                                                     & 3
                                                 )
-                                                var qc = Int(codes[q_base + j])
+                                                var qc = Int64(codes[q_base + j])
                                                 if is_rev != 0:
-                                                    var qcr = Int(
+                                                    var qcr = Int64(
                                                         codes[q_base + (qlen - 1 - j)]
                                                     )
                                                     if qcr <= 3:
@@ -1591,7 +1594,7 @@ def map_fastq_fm_gpu(
                                                     if p0 < coff or p0 >= coff + clen:
                                                         sl += 1
                                                         continue
-                                                    var rb0 = Int(
+                                                    var rb0 = Int64(
                                                         (
                                                             pac[p0 >> 2]
                                                             >> UInt8(
@@ -1600,9 +1603,9 @@ def map_fastq_fm_gpu(
                                                         )
                                                         & 3
                                                     )
-                                                    var qc0 = Int(codes[q_base + sl])
+                                                    var qc0 = Int64(codes[q_base + sl])
                                                     if is_rev != 0:
-                                                        var q0r = Int(
+                                                        var q0r = Int64(
                                                             codes[
                                                                 q_base
                                                                 + (qlen - 1 - sl)
@@ -1627,7 +1630,7 @@ def map_fastq_fm_gpu(
                                                     if p1 < coff or p1 >= coff + clen:
                                                         sr += 1
                                                         continue
-                                                    var rb1 = Int(
+                                                    var rb1 = Int64(
                                                         (
                                                             pac[p1 >> 2]
                                                             >> UInt8(
@@ -1636,9 +1639,9 @@ def map_fastq_fm_gpu(
                                                         )
                                                         & 3
                                                     )
-                                                    var qc1 = Int(codes[q_base + jr])
+                                                    var qc1 = Int64(codes[q_base + jr])
                                                     if is_rev != 0:
-                                                        var q1r = Int(
+                                                        var q1r = Int64(
                                                             codes[
                                                                 q_base
                                                                 + (qlen - 1 - jr)
@@ -1661,7 +1664,7 @@ def map_fastq_fm_gpu(
                                                     jm < qlen - sr and nm <= budget
                                                 ):
                                                     var pm = bstart + jm
-                                                    var rbm = Int(
+                                                    var rbm = Int64(
                                                         (
                                                             pac[pm >> 2]
                                                             >> UInt8(
@@ -1670,9 +1673,9 @@ def map_fastq_fm_gpu(
                                                         )
                                                         & 3
                                                     )
-                                                    var qcm = Int(codes[q_base + jm])
+                                                    var qcm = Int64(codes[q_base + jm])
                                                     if is_rev != 0:
-                                                        var qmr = Int(
+                                                        var qmr = Int64(
                                                             codes[
                                                                 q_base
                                                                 + (qlen - 1 - jm)
@@ -1730,14 +1733,14 @@ def map_fastq_fm_gpu(
                                             ):
                                                 # 1bp deletion on a coarse g grid.
                                                 if bstart + qlen + 1 <= coff + clen:
-                                                    var g = 0
+                                                    var g = Int64(0)
                                                     while g <= qlen:
-                                                        var nm_d = 1
-                                                        var t = 0
+                                                        var nm_d = Int64(1)
+                                                        var t = Int64(0)
                                                         while (
                                                             t < g and nm_d <= budget
                                                         ):
-                                                            var rcd = Int(
+                                                            var rcd = Int64(
                                                                 (
                                                                     pac[
                                                                         (bstart + t)
@@ -1758,7 +1761,7 @@ def map_fastq_fm_gpu(
                                                                 )
                                                                 & 3
                                                             )
-                                                            var qcd = Int(
+                                                            var qcd = Int64(
                                                                 codes[q_base + t]
                                                             )
                                                             if (
@@ -1772,7 +1775,7 @@ def map_fastq_fm_gpu(
                                                             t < qlen
                                                             and nm_d <= budget
                                                         ):
-                                                            var rcd2 = Int(
+                                                            var rcd2 = Int64(
                                                                 (
                                                                     pac[
                                                                         (
@@ -1798,7 +1801,7 @@ def map_fastq_fm_gpu(
                                                                 )
                                                                 & 3
                                                             )
-                                                            var qcd2 = Int(
+                                                            var qcd2 = Int64(
                                                                 codes[q_base + t]
                                                             )
                                                             if (
@@ -1837,15 +1840,15 @@ def map_fastq_fm_gpu(
             pac: UnsafePointer[UInt8, MutAnyOrigin],
             contig_off: UnsafePointer[UInt64, MutAnyOrigin],
             contig_len: UnsafePointer[UInt32, MutAnyOrigin],
-            n_contigs: Int,
+            n_contigs: Int64,
             l_pac: UInt64,
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            max_len: Int,
-            n_pairs: Int,
-            window: Int,
-            max_diff: Int,
-            max_soft: Int,
+            max_len: Int64,
+            n_pairs: Int64,
+            window: Int64,
+            max_diff: Int64,
+            max_soft: Int64,
             out_rid: UnsafePointer[Int32, MutAnyOrigin],
             out_pos: UnsafePointer[UInt32, MutAnyOrigin],
             out_mapq: UnsafePointer[UInt32, MutAnyOrigin],
@@ -1856,13 +1859,13 @@ def map_fastq_fm_gpu(
         ):
             # If exactly one mate mapped, gapless-scan ±window on that contig
             # (prefer opposite strand). 1bp deletion only at the best locus.
-            var pi = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var pi = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if pi >= n_pairs:
                 return
             var i1 = pi
             var i2 = pi + n_pairs
-            var m1 = Int(out_rid[i1]) >= 0
-            var m2 = Int(out_rid[i2]) >= 0
+            var m1 = Int64(out_rid[i1]) >= 0
+            var m2 = Int64(out_rid[i2]) >= 0
             if m1 == m2:
                 return
             var src = i1
@@ -1870,15 +1873,15 @@ def map_fastq_fm_gpu(
             if m2:
                 src = i2
                 dst = i1
-            var crid = Int(out_rid[src])
+            var crid = Int64(out_rid[src])
             if crid < 0 or crid >= n_contigs:
                 return
-            var qlen = Int(read_lens[dst])
+            var qlen = Int64(read_lens[dst])
             if qlen < 24:
                 return
-            var coff = Int(contig_off[crid])
-            var clen = Int(contig_len[crid])
-            var mate_pos = Int(out_pos[src])
+            var coff = Int64(contig_off[crid])
+            var clen = Int64(contig_len[crid])
+            var mate_pos = Int64(out_pos[src])
             var win = window
             if win < 32:
                 win = 32
@@ -1898,16 +1901,16 @@ def map_fastq_fm_gpu(
             if budget > qlen // 2:
                 budget = qlen // 2
             var q_base = dst * max_len
-            var best_nm = 9999
-            var best_pos = 0
-            var best_flag = 0
-            var scan_nm = 9999
+            var best_nm = Int64(9999)
+            var best_pos = Int64(0)
+            var best_flag = Int64(0)
+            var scan_nm = Int64(9999)
             var scan_local = lo
-            var scan_rev = 0
-            var mate_rev = (Int(out_flag[src]) & 16) != 0
-            var pass_s = 0
+            var scan_rev = Int64(0)
+            var mate_rev = (Int64(out_flag[src]) & 16) != 0
+            var pass_s = Int64(0)
             while pass_s < 2:
-                var is_rev = 1
+                var is_rev = Int64(1)
                 if pass_s == 0:
                     if mate_rev:
                         is_rev = 0
@@ -1924,16 +1927,16 @@ def map_fastq_fm_gpu(
                     if bstart < 0 or UInt64(bstart + qlen) > l_pac:
                         local += 1
                         continue
-                    var nm = 0
-                    var j = 0
+                    var nm = Int64(0)
+                    var j = Int64(0)
                     while j < qlen and nm <= budget + 4:
                         var ppos = bstart + j
-                        var rb = Int(
+                        var rb = Int64(
                             (pac[ppos >> 2] >> UInt8(((~ppos) & 3) << 1)) & 3
                         )
-                        var qc = Int(codes[q_base + j])
+                        var qc = Int64(codes[q_base + j])
                         if is_rev != 0:
-                            var qcr = Int(codes[q_base + (qlen - 1 - j)])
+                            var qcr = Int64(codes[q_base + (qlen - 1 - j)])
                             if qcr <= 3:
                                 qc = 3 - qcr
                             else:
@@ -1954,18 +1957,18 @@ def map_fastq_fm_gpu(
             if best_nm > budget and scan_nm < 9999:
                 var bstart = coff + scan_local
                 if bstart >= 0 and UInt64(bstart + qlen + 1) <= l_pac:
-                    var g = 0
+                    var g = Int64(0)
                     while g <= qlen:
-                        var nm_d = 1
-                        var t = 0
+                        var nm_d = Int64(1)
+                        var t = Int64(0)
                         while t < g and nm_d <= budget:
                             var p0 = bstart + t
-                            var rb0 = Int(
+                            var rb0 = Int64(
                                 (pac[p0 >> 2] >> UInt8(((~p0) & 3) << 1)) & 3
                             )
-                            var qc0 = Int(codes[q_base + t])
+                            var qc0 = Int64(codes[q_base + t])
                             if scan_rev != 0:
-                                var q0r = Int(codes[q_base + (qlen - 1 - t)])
+                                var q0r = Int64(codes[q_base + (qlen - 1 - t)])
                                 if q0r <= 3:
                                     qc0 = 3 - q0r
                                 else:
@@ -1975,12 +1978,12 @@ def map_fastq_fm_gpu(
                             t += 1
                         while t < qlen and nm_d <= budget:
                             var p1 = bstart + t + 1
-                            var rb1 = Int(
+                            var rb1 = Int64(
                                 (pac[p1 >> 2] >> UInt8(((~p1) & 3) << 1)) & 3
                             )
-                            var qc1 = Int(codes[q_base + t])
+                            var qc1 = Int64(codes[q_base + t])
                             if scan_rev != 0:
-                                var q1r = Int(codes[q_base + (qlen - 1 - t)])
+                                var q1r = Int64(codes[q_base + (qlen - 1 - t)])
                                 if q1r <= 3:
                                     qc1 = 3 - q1r
                                 else:
@@ -2056,7 +2059,7 @@ def map_fastq_fm_gpu(
         )
         var host_coff = ctx.enqueue_create_host_buffer[DType.uint64](n_contigs)
         var host_clen = ctx.enqueue_create_host_buffer[DType.uint32](n_contigs)
-        var ci = 0
+        var ci = Int(0)
         while ci < n_contigs:
             host_coff[ci] = UInt64(index.contig_offset(ci))
             host_clen[ci] = UInt32(index.contig_length(ci))
@@ -2111,7 +2114,7 @@ def map_fastq_fm_gpu(
         var bam_cap = 1
         var bam_blob = ctx.enqueue_create_host_buffer[DType.uint8](1)
         var rg_s = _env_str("METHYLGRAPHER_RG_ID", "mojo1")
-        var sort_tile = 0
+        var sort_tile = Int(0)
         var meta_cap = 1
         var use_runs = False
         if emit_bam:
@@ -2255,15 +2258,15 @@ def map_fastq_fm_gpu(
         var rg_bytes = rg_s.as_bytes()
         var rg_p = rg_bytes.unsafe_ptr()
         var rg_n = rg_s.byte_length()
-        var paired_i = 0
+        var paired_i = Int(0)
         if paired:
             paired_i = 1
 
-        var n_mapped = 0
-        var n_reads = 0
-        var n_total = 0
-        var n_batches = 0
-        var tile_chunks = 0
+        var n_mapped = Int(0)
+        var n_reads = Int(0)
+        var n_total = Int(0)
+        var n_batches = Int(0)
+        var tile_chunks = Int(0)
         var t_map0 = time_mod.perf_counter()
         var t_gpu = time_mod.perf_counter() * 0
         var t_emit = time_mod.perf_counter() * 0
@@ -2335,7 +2338,7 @@ def map_fastq_fm_gpu(
                 k_pack,
                 dev_bases.unsafe_ptr(),
                 dev_codes.unsafe_ptr(),
-                n_bases,
+                Int64(n_bases),
                 grid_dim=grid_b,
                 block_dim=256,
             )
@@ -2346,7 +2349,7 @@ def map_fastq_fm_gpu(
                 index_pac.unsafe_ptr(),
                 index_coff.unsafe_ptr(),
                 index_clen.unsafe_ptr(),
-                n_contigs,
+                Int64(n_contigs),
                 primary,
                 seq_len,
                 l_pac,
@@ -2355,18 +2358,18 @@ def map_fastq_fm_gpu(
                 l2_2,
                 l2_3,
                 l2_4,
-                sa_intv,
-                n_sa,
+                Int64(sa_intv),
+                Int64(n_sa),
                 dev_codes.unsafe_ptr(),
                 dev_lens.unsafe_ptr(),
-                max_len,
-                n_seq,
-                seed_len,
-                seed_stride,
-                max_occ,
-                max_diff,
-                max_soft,
-                max_adj,
+                Int64(max_len),
+                Int64(n_seq),
+                Int64(seed_len),
+                Int64(seed_stride),
+                Int64(max_occ),
+                Int64(max_diff),
+                Int64(max_soft),
+                Int64(max_adj),
                 dev_rid.unsafe_ptr(),
                 dev_pos.unsafe_ptr(),
                 dev_mapq.unsafe_ptr(),
@@ -2385,15 +2388,15 @@ def map_fastq_fm_gpu(
                     index_pac.unsafe_ptr(),
                     index_coff.unsafe_ptr(),
                     index_clen.unsafe_ptr(),
-                    n_contigs,
+                    Int64(n_contigs),
                     l_pac,
                     dev_codes.unsafe_ptr(),
                     dev_lens.unsafe_ptr(),
-                    max_len,
-                    n_pairs,
-                    rescue_win,
-                    max_diff,
-                    max_soft,
+                    Int64(max_len),
+                    Int64(n_pairs),
+                    Int64(rescue_win),
+                    Int64(max_diff),
+                    Int64(max_soft),
                     dev_rid.unsafe_ptr(),
                     dev_pos.unsafe_ptr(),
                     dev_mapq.unsafe_ptr(),
@@ -2500,7 +2503,7 @@ def map_fastq_fm_gpu(
                 while si < n_seq:
                     var ln = Int(host_lens[si])
                     if ln > 0:
-                        unsafe_memmove(
+                        unsafe_memcpy(
                             dest=_u8_at(bases_addr + si * max_len),
                             src=_u8_at(Int(seq_ap[si])),
                             count=ln,
@@ -2656,8 +2659,53 @@ def map_fastq_fm_gpu(
                 var ov_fail = List[Int](length=2, fill=0)
                 var ov_t = List[Float64](length=2, fill=Float64(0))
 
-                @__parameter
-                def ov_work(i: Int):
+                def ov_work(i: Int) {
+                    mut ov_packed,
+                    mut ov_fail,
+                    mut ov_t,
+                    mut fq_stream,
+                    mut arena_spare,
+                    mut arena_ready,
+                    imm paired,
+                    imm n1_ready,
+                    imm batch_size,
+                    imm emit_rid,
+                    imm emit_pos,
+                    imm emit_mapq,
+                    imm emit_flag,
+                    imm emit_sl,
+                    imm emit_sr,
+                    imm emit_nm,
+                    imm h_n1_name_a,
+                    imm h_n1_name_n,
+                    imm h_n1_orig_a,
+                    imm h_n1_orig_n,
+                    imm h_n1_qual_a,
+                    imm h_n1_qual_n,
+                    imm h_n2_name_a,
+                    imm h_n2_name_n,
+                    imm h_n2_orig_a,
+                    imm h_n2_orig_n,
+                    imm h_n2_qual_a,
+                    imm h_n2_qual_n,
+                    imm bam_blob,
+                    imm bam_cap,
+                    imm rid_to_tid,
+                    imm rg_p,
+                    imm rg_n,
+                    imm h_coord,
+                    imm h_dhi,
+                    imm h_dlo,
+                    imm h_rec,
+                    imm h_len,
+                    imm h_score,
+                    imm h_pair,
+                    mut n_reads,
+                    mut n_mapped,
+                    imm tile_chunks,
+                    imm meta_cap,
+                    imm n_total,
+                }:
                     var tw = _tick()
                     try:
                         if i == 0:
@@ -2684,7 +2732,9 @@ def map_fastq_fm_gpu(
                                 Int(h_n2_orig_n.unsafe_ptr()),
                                 Int(h_n2_qual_a.unsafe_ptr()),
                                 Int(h_n2_qual_n.unsafe_ptr()),
-                                bam_blob.unsafe_ptr(),
+                                UnsafePointer[UInt8, MutAnyOrigin](
+                                    unsafe_from_address=Int(bam_blob.unsafe_ptr())
+                                ),
                                 bam_cap,
                                 rid_to_tid,
                                 rg_p,
@@ -3094,7 +3144,9 @@ def map_fastq_fm_gpu(
                     Int(h_n2_orig_n.unsafe_ptr()),
                     Int(h_n2_qual_a.unsafe_ptr()),
                     Int(h_n2_qual_n.unsafe_ptr()),
-                    bam_blob.unsafe_ptr(),
+                    UnsafePointer[UInt8, MutAnyOrigin](
+                        unsafe_from_address=Int(bam_blob.unsafe_ptr())
+                    ),
                     bam_cap,
                     rid_to_tid,
                     rg_p,

@@ -12,12 +12,10 @@
 
 from max.algorithm import parallelize
 from std.collections import Dict, List
-from std.memory import Pointer
 from std.python import Python, PythonObject
 from std.sys import exit
 
 from gfa import GraphicalFragmentAssemblyMemory
-from parallel_slot import clear_parallel_slot, parallel_slot_addr, set_parallel_slot
 from mcall_core import AlignmentPath, Indel, alignment_path_parse, cs_tag_parse
 from utility import bool_from_str, open_text_write, phred_to_int, reverse_complement
 
@@ -550,55 +548,6 @@ def get_kv_value(args: List[String], key: String, default: String) -> String:
     return default
 
 
-struct _McallSlot:
-    var alignments: Int
-    var results: Int
-    var gfa: Int
-    var cg_only: Bool
-    var genotyping: Bool
-
-    def __init__(
-        out self,
-        alignments: Int,
-        results: Int,
-        gfa: Int,
-        cg_only: Bool,
-        genotyping: Bool,
-    ):
-        self.alignments = alignments
-        self.results = results
-        self.gfa = gfa
-        self.cg_only = cg_only
-        self.genotyping = genotyping
-
-
-def _mcall_fragment_worker(fi: Int):
-    var slot = Pointer[_McallSlot, MutAnyOrigin](
-        unsafe_from_address=parallel_slot_addr("MOJO_MCALL_SLOT")
-    )
-    var alignments = Pointer[List[List[ParsedAlignment]], MutAnyOrigin](
-        unsafe_from_address=slot[].alignments
-    )
-    var results = Pointer[List[MethylCallResult], MutAnyOrigin](
-        unsafe_from_address=slot[].results
-    )
-    var gfa = Pointer[GraphicalFragmentAssemblyMemory, MutAnyOrigin](
-        unsafe_from_address=slot[].gfa
-    )
-    try:
-        var alns = alignments[][fi].copy()
-        var segs = _collect_segment_ids(alns)
-        var seq_dict = gfa[].get_sequences_by_segment_ID(segs)
-        results[][fi] = alignment_to_methylation(
-            alns,
-            seq_dict,
-            cg_only=slot[].cg_only,
-            perform_gcall=slot[].genotyping,
-        )
-    except e:
-        print("Native MethylCall fragment error:", e)
-
-
 def run_methylcall_native(args: List[String]) raises -> Int:
     """Native MethylCall driver (argv shape matches engine.cli MethylCall)."""
     _ensure_repo_on_sys_path()
@@ -683,16 +632,27 @@ def run_methylcall_native(args: List[String]) raises -> Int:
         for _ in range(n_frags):
             frag_results.append(MethylCallResult())
 
-        var mcall_slot = _McallSlot(
-            Int(Pointer(to=frag_alignments)),
-            Int(Pointer(to=frag_results)),
-            Int(Pointer(to=gfa_instance)),
-            cg_only,
-            genotyping_cytosine,
-        )
-        set_parallel_slot("MOJO_MCALL_SLOT", Int(Pointer(to=mcall_slot)))
-        parallelize(_mcall_fragment_worker, n_frags, process_count)
-        clear_parallel_slot("MOJO_MCALL_SLOT")
+        def work(fi: Int) {
+            imm frag_alignments,
+            mut frag_results,
+            imm gfa_instance,
+            imm cg_only,
+            imm genotyping_cytosine,
+        }:
+            try:
+                var alns = frag_alignments[fi].copy()
+                var segs = _collect_segment_ids(alns)
+                var seq_dict = gfa_instance.get_sequences_by_segment_ID(segs)
+                frag_results[fi] = alignment_to_methylation(
+                    alns,
+                    seq_dict,
+                    cg_only=cg_only,
+                    perform_gcall=genotyping_cytosine,
+                )
+            except e:
+                print("Native MethylCall fragment error:", e)
+
+        parallelize(work, n_frags, process_count)
 
         # Write shard tmp lines. Always emit the full 5-column form so merge
         # is independent of cross-fragment segment-run compression.

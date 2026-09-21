@@ -7,7 +7,7 @@
 # (same rule as the old GPU kernel).
 
 from std.collections import List
-from std.memory import UnsafePointer, unsafe_memmove
+from std.memory import UnsafePointer, unsafe_memcpy
 from std.python import Python
 from std.sys import has_accelerator
 
@@ -52,24 +52,24 @@ def gpu_sort_markdup(
         comptime BLOCK = 256
 
         def init_idx_kernel(
-            idx: UnsafePointer[UInt32, MutAnyOrigin], n0: Int
+            idx: UnsafePointer[UInt32, MutAnyOrigin], n0: Int64
         ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var i = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if i < n0:
                 idx[i] = UInt32(i)
 
         def hist_kernel(
             keys: UnsafePointer[UInt64, MutAnyOrigin],
-            n0: Int,
-            shift: Int,
-            n_threads: Int,
+            n0: Int64,
+            shift: Int64,
+            n_threads: Int64,
             hist: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            var t = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var t = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if t >= n_threads:
                 return
             var base = t * BINS
-            var d = 0
+            var d = Int64(0)
             while d < BINS:
                 hist[base + d] = 0
                 d += 1
@@ -79,20 +79,20 @@ def gpu_sort_markdup(
                 end = n0
             var i = start
             while i < end:
-                var digit = Int((keys[i] >> shift) & 255)
+                var digit = Int64((keys[i] >> UInt64(shift)) & 255)
                 hist[base + digit] = hist[base + digit] + 1
                 i += 1
 
         def col_sum_kernel(
             hist: UnsafePointer[UInt32, MutAnyOrigin],
-            n_threads: Int,
+            n_threads: Int64,
             totals: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            var d = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var d = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if d >= BINS:
                 return
             var s: UInt32 = 0
-            var t = 0
+            var t = Int64(0)
             while t < n_threads:
                 s = s + hist[t * BINS + d]
                 t += 1
@@ -100,15 +100,15 @@ def gpu_sort_markdup(
 
         def scan_hist_kernel(
             hist: UnsafePointer[UInt32, MutAnyOrigin],
-            n_threads: Int,
+            n_threads: Int64,
             digit_base: UnsafePointer[UInt32, MutAnyOrigin],
             offsets: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            var d = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var d = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if d >= BINS:
                 return
             var running = digit_base[d]
-            var t = 0
+            var t = Int64(0)
             while t < n_threads:
                 var slot = t * BINS + d
                 var c = hist[slot]
@@ -121,23 +121,23 @@ def gpu_sort_markdup(
             idx_in: UnsafePointer[UInt32, MutAnyOrigin],
             keys_out: UnsafePointer[UInt64, MutAnyOrigin],
             idx_out: UnsafePointer[UInt32, MutAnyOrigin],
-            n0: Int,
-            shift: Int,
-            n_threads: Int,
+            n0: Int64,
+            shift: Int64,
+            n_threads: Int64,
             offsets: UnsafePointer[UInt32, MutAnyOrigin],
         ):
-            var t = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var t = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if t >= n_threads:
                 return
-            var local = InlineArray[UInt32, BINS](fill=UInt32(0))
+            var local = Array[UInt32, BINS](fill=UInt32(0))
             var start = t * RADIX_R
             var end = start + RADIX_R
             if end > n0:
                 end = n0
             var i = start
             while i < end:
-                var digit = Int((keys_in[i] >> shift) & 255)
-                var pos = Int(offsets[t * BINS + digit] + local[digit])
+                var digit = Int64((keys_in[i] >> UInt64(shift)) & 255)
+                var pos = Int64(offsets[t * BINS + digit] + local[digit])
                 local[digit] = local[digit] + 1
                 keys_out[pos] = keys_in[i]
                 idx_out[pos] = idx_in[i]
@@ -147,11 +147,11 @@ def gpu_sort_markdup(
             src: UnsafePointer[UInt64, MutAnyOrigin],
             perm: UnsafePointer[UInt32, MutAnyOrigin],
             dst: UnsafePointer[UInt64, MutAnyOrigin],
-            n0: Int,
+            n0: Int64,
         ):
-            var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var i = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if i < n0:
-                dst[i] = src[Int(perm[i])]
+                dst[i] = src[Int64(perm[i])]
 
         def radix8(
             ctx: DeviceContext,
@@ -171,27 +171,43 @@ def gpu_sort_markdup(
             var p = 0
             while p < 8:
                 var shift = p * 8
-                var keys_in = ka.unsafe_ptr()
-                var keys_out = kb.unsafe_ptr()
-                var idx_in = ia.unsafe_ptr()
-                var idx_out = ib.unsafe_ptr()
+                var keys_in = UnsafePointer[UInt64, MutAnyOrigin](
+                    unsafe_from_address=Int(ka.unsafe_ptr())
+                )
+                var keys_out = UnsafePointer[UInt64, MutAnyOrigin](
+                    unsafe_from_address=Int(kb.unsafe_ptr())
+                )
+                var idx_in = UnsafePointer[UInt32, MutAnyOrigin](
+                    unsafe_from_address=Int(ia.unsafe_ptr())
+                )
+                var idx_out = UnsafePointer[UInt32, MutAnyOrigin](
+                    unsafe_from_address=Int(ib.unsafe_ptr())
+                )
                 if (p & 1) == 1:
-                    keys_in = kb.unsafe_ptr()
-                    keys_out = ka.unsafe_ptr()
-                    idx_in = ib.unsafe_ptr()
-                    idx_out = ia.unsafe_ptr()
+                    keys_in = UnsafePointer[UInt64, MutAnyOrigin](
+                        unsafe_from_address=Int(kb.unsafe_ptr())
+                    )
+                    keys_out = UnsafePointer[UInt64, MutAnyOrigin](
+                        unsafe_from_address=Int(ka.unsafe_ptr())
+                    )
+                    idx_in = UnsafePointer[UInt32, MutAnyOrigin](
+                        unsafe_from_address=Int(ib.unsafe_ptr())
+                    )
+                    idx_out = UnsafePointer[UInt32, MutAnyOrigin](
+                        unsafe_from_address=Int(ia.unsafe_ptr())
+                    )
                 ctx.enqueue_function[hist_kernel](
                     keys_in,
-                    n_t,
-                    shift,
-                    n_threads,
+                    Int64(n_t),
+                    Int64(shift),
+                    Int64(n_threads),
                     hist.unsafe_ptr(),
                     grid_dim=grid_t,
                     block_dim=BLOCK,
                 )
                 ctx.enqueue_function[col_sum_kernel](
                     hist.unsafe_ptr(),
-                    n_threads,
+                    Int64(n_threads),
                     tot.unsafe_ptr(),
                     grid_dim=1,
                     block_dim=BINS,
@@ -207,7 +223,7 @@ def gpu_sort_markdup(
                 ctx.enqueue_copy(src_buf=h_base, dst_buf=tot)
                 ctx.enqueue_function[scan_hist_kernel](
                     hist.unsafe_ptr(),
-                    n_threads,
+                    Int64(n_threads),
                     tot.unsafe_ptr(),
                     offb.unsafe_ptr(),
                     grid_dim=1,
@@ -218,9 +234,9 @@ def gpu_sort_markdup(
                     idx_in,
                     keys_out,
                     idx_out,
-                    n_t,
-                    shift,
-                    n_threads,
+                    Int64(n_t),
+                    Int64(shift),
+                    Int64(n_threads),
                     offb.unsafe_ptr(),
                     grid_dim=grid_t,
                     block_dim=BLOCK,
@@ -243,35 +259,35 @@ def gpu_sort_markdup(
         var h_dlo = ctx.enqueue_create_host_buffer[DType.uint64](n)
         var h_score = ctx.enqueue_create_host_buffer[DType.uint32](n)
         var h_pair = ctx.enqueue_create_host_buffer[DType.uint32](n)
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=h_coord.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=coord_addr
             ),
             count=n,
         )
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=h_dhi.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=dup_hi_addr
             ),
             count=n,
         )
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=h_dlo.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=dup_lo_addr
             ),
             count=n,
         )
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=h_score.unsafe_ptr(),
             src=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=score_addr
             ),
             count=n,
         )
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=h_pair.unsafe_ptr(),
             src=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=pair_addr
@@ -309,7 +325,7 @@ def gpu_sort_markdup(
             var base = t * tile
             var n_t = tlen[t]
             var grid_n = (n_t + BLOCK - 1) // BLOCK
-            unsafe_memmove(
+            unsafe_memcpy(
                 dest=h_tile_key.unsafe_ptr(),
                 src=h_dlo.unsafe_ptr() + base,
                 count=n_t,
@@ -317,7 +333,7 @@ def gpu_sort_markdup(
             ctx.enqueue_copy(src_buf=h_tile_key, dst_buf=d_key_a)
             ctx.enqueue_function[init_idx_kernel](
                 d_idx_a.unsafe_ptr(),
-                n_t,
+                Int64(n_t),
                 grid_dim=grid_n,
                 block_dim=BLOCK,
             )
@@ -334,7 +350,7 @@ def gpu_sort_markdup(
                 h_base,
                 n_t,
             )
-            unsafe_memmove(
+            unsafe_memcpy(
                 dest=h_tile_hi.unsafe_ptr(),
                 src=h_dhi.unsafe_ptr() + base,
                 count=n_t,
@@ -344,7 +360,7 @@ def gpu_sort_markdup(
                 d_hi_src.unsafe_ptr(),
                 d_idx_a.unsafe_ptr(),
                 d_key_a.unsafe_ptr(),
-                n_t,
+                Int64(n_t),
                 grid_dim=grid_n,
                 block_dim=BLOCK,
             )
@@ -455,7 +471,7 @@ def gpu_sort_markdup(
             var base2 = t * tile
             var n_t2 = tlen[t]
             var grid_n2 = (n_t2 + BLOCK - 1) // BLOCK
-            unsafe_memmove(
+            unsafe_memcpy(
                 dest=h_tile_key.unsafe_ptr(),
                 src=h_coord.unsafe_ptr() + base2,
                 count=n_t2,
@@ -463,7 +479,7 @@ def gpu_sort_markdup(
             ctx.enqueue_copy(src_buf=h_tile_key, dst_buf=d_key_a)
             ctx.enqueue_function[init_idx_kernel](
                 d_idx_a.unsafe_ptr(),
-                n_t2,
+                Int64(n_t2),
                 grid_dim=grid_n2,
                 block_dim=BLOCK,
             )
@@ -511,14 +527,14 @@ def gpu_sort_markdup(
             headc[bestc] = headc[bestc] + 1
             out_c += 1
 
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=perm_addr
             ),
             src=h_perm.unsafe_ptr(),
             count=n,
         )
-        unsafe_memmove(
+        unsafe_memcpy(
             dest=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=is_dup_addr
             ),

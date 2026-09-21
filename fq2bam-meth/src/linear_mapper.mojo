@@ -89,7 +89,8 @@ def _read_one(fh: PythonObject) raises -> FastqRead:
         bare = String(parts[0])
     var slash = bare.split("/")
     if len(slash) > 0:
-        bare = String(slash[0])
+        var slash_head = String(slash[0])
+        bare = slash_head
     if q.byte_length() == 0:
         q = String("*")
     return FastqRead(bare, s, q)

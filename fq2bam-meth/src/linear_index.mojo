@@ -175,10 +175,12 @@ struct LinearIndex(Copyable, Movable):
                 name = String(line[byte = 1 : line.byte_length()])
                 var sp = name.split(" ")
                 if len(sp) > 0:
-                    name = String(sp[0])
+                    var sp_head = String(sp[0])
+                    name = sp_head
                 var tab = name.split("\t")
                 if len(tab) > 0:
-                    name = String(tab[0])
+                    var tab_head = String(tab[0])
+                    name = tab_head
                 seq = String("")
             else:
                 seq += line.upper()

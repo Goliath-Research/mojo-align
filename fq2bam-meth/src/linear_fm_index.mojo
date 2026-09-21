@@ -54,7 +54,7 @@ struct FmIndex(Copyable, Movable):
     var sa_intv: Int
     var n_sa: Int
     var bwt_size: Int
-    var L2: InlineArray[UInt64, 5]
+    var L2: Array[UInt64, 5]
     var bwt_addr: Int
     var sa_addr: Int
     var pac_addr: Int
@@ -72,7 +72,7 @@ struct FmIndex(Copyable, Movable):
         self.sa_intv = 32
         self.n_sa = 0
         self.bwt_size = 0
-        self.L2 = InlineArray[UInt64, 5](fill=UInt64(0))
+        self.L2 = Array[UInt64, 5](fill=UInt64(0))
         self.bwt_addr = 0
         self.sa_addr = 0
         self.pac_addr = 0

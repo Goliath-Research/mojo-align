@@ -98,7 +98,8 @@ def _read_one(fh: PythonObject) raises -> FastqRec:
         bare = String(parts[0])
     var slash = bare.split("/")
     if len(slash) > 0:
-        bare = String(slash[0])
+        var slash_head = String(slash[0])
+        bare = slash_head
     if q.byte_length() == 0:
         q = String("*")
     return FastqRec(bare, s, q)
@@ -332,21 +333,21 @@ def map_fastq_dense_gpu_locate(
     else:
         from max.gpu import block_dim, block_idx, thread_idx
         from max.gpu.host import DeviceContext
-        from std.memory import UnsafePointer, unsafe_memmove
+        from std.memory import UnsafePointer, unsafe_memcpy
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
             src: UnsafePointer[UInt8, MutAnyOrigin],
-            dst_off: Int,
-            n: Int,
+            dst_off: Int64,
+            n: Int64,
         ):
-            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var tid = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if tid < n:
                 dst[dst_off + tid] = src[tid]
 
-        def upload_mmap_to_device(
+        def upload_mmap_to_device[dst_origin: Origin](
             ctx: DeviceContext,
-            dst: UnsafePointer[UInt8, MutAnyOrigin],
+            dst: UnsafePointer[UInt8, dst_origin],
             host_addr: Int,
             nbytes: Int,
             label: String,
@@ -367,15 +368,18 @@ def map_fastq_dense_gpu_locate(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memcpy(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK
+                var dst_any = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=Int(dst)
+                )
                 ctx.enqueue_function[copy_bytes_offset_kernel](
-                    dst,
+                    dst_any,
                     stage.unsafe_ptr(),
-                    off,
-                    n,
+                    Int64(off),
+                    Int64(n),
                     grid_dim=grid,
                     block_dim=BLOCK,
                 )
@@ -395,9 +399,9 @@ def map_fastq_dense_gpu_locate(
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
             codes: UnsafePointer[UInt8, MutAnyOrigin],
-            n: Int,
+            n: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n:
                 return
             var b = bases[idx]
@@ -417,27 +421,27 @@ def map_fastq_dense_gpu_locate(
             keys: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            n_reads: Int,
-            max_len: Int,
-            k_len: Int,
-            seed_stride: Int,
-            slots_per_read: Int,
+            n_reads: Int64,
+            max_len: Int64,
+            k_len: Int64,
+            seed_stride: Int64,
+            slots_per_read: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             var n_slots = n_reads * slots_per_read
             if idx >= n_slots:
                 return
             var rid = idx // slots_per_read
             var slot = idx % slots_per_read
             var q_off = slot * seed_stride
-            var L = Int(read_lens[rid])
+            var L = Int64(read_lens[rid])
             keys[idx] = UInt64(0xFFFFFFFFFFFFFFFF)
             q_offs[idx] = UInt32(q_off)
             if q_off + k_len > L:
                 return
             var base = rid * max_len + q_off
             var key: UInt64 = 0
-            var j = 0
+            var j = Int64(0)
             while j < k_len:
                 var c = codes[base + j]
                 if c > 3:
@@ -452,11 +456,11 @@ def map_fastq_dense_gpu_locate(
             offsets: UnsafePointer[UInt64, MutAnyOrigin],
             out_start: UnsafePointer[UInt64, MutAnyOrigin],
             out_end: UnsafePointer[UInt64, MutAnyOrigin],
-            n_slots: Int,
-            n_table: Int,
-            max_occ: Int,
+            n_slots: Int64,
+            n_table: Int64,
+            max_occ: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n_slots:
                 return
             out_start[idx] = 0
@@ -464,7 +468,7 @@ def map_fastq_dense_gpu_locate(
             var key = keys[idx]
             if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
                 return
-            var lo = 0
+            var lo = Int64(0)
             var hi = n_table
             while lo < hi:
                 var mid = (lo + hi) // 2
@@ -479,7 +483,7 @@ def map_fastq_dense_gpu_locate(
                 return
             var start = offsets[lo]
             var end = offsets[lo + 1]
-            var occ = Int(end - start)
+            var occ = Int64(end - start)
             if occ <= 0 or occ > max_occ:
                 return
             out_start[idx] = start
@@ -491,12 +495,12 @@ def map_fastq_dense_gpu_locate(
             offsets: UnsafePointer[UInt64, MutAnyOrigin],
             out_start: UnsafePointer[UInt64, MutAnyOrigin],
             out_end: UnsafePointer[UInt64, MutAnyOrigin],
-            n_slots: Int,
-            n_table: Int,
-            max_occ: Int,
+            n_slots: Int64,
+            n_table: Int64,
+            max_occ: Int64,
         ):
             """Interpolation search on sorted numeric 2-bit keys."""
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n_slots:
                 return
             out_start[idx] = 0
@@ -504,9 +508,9 @@ def map_fastq_dense_gpu_locate(
             var key = keys[idx]
             if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
                 return
-            var lo = 0
+            var lo = Int64(0)
             var hi = n_table - 1
-            var steps = 0
+            var steps = Int64(0)
             while lo <= hi and key >= kmers[lo] and key <= kmers[hi] and steps < 64:
                 steps += 1
                 if kmers[hi] == kmers[lo]:
@@ -515,7 +519,7 @@ def map_fastq_dense_gpu_locate(
                         break
                     return
                 var span = kmers[hi] - kmers[lo]
-                var mid = lo + Int(((key - kmers[lo]) * UInt64(hi - lo)) // span)
+                var mid = lo + Int64(((key - kmers[lo]) * UInt64(hi - lo)) // span)
                 if mid < lo:
                     mid = lo
                 if mid > hi:
@@ -535,7 +539,7 @@ def map_fastq_dense_gpu_locate(
                 return
             var start = offsets[lo]
             var end = offsets[lo + 1]
-            var occ = Int(end - start)
+            var occ = Int64(end - start)
             if occ <= 0 or occ > max_occ:
                 return
             out_start[idx] = start
@@ -545,20 +549,20 @@ def map_fastq_dense_gpu_locate(
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             rc_codes: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            n_reads: Int,
-            max_len: Int,
+            n_reads: Int64,
+            max_len: Int64,
         ):
             """Reverse-complement 2-bit codes per read (strand 16 path)."""
-            var rid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var rid = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if rid >= n_reads:
                 return
-            var L = Int(read_lens[rid])
+            var L = Int64(read_lens[rid])
             var base = rid * max_len
-            var i = 0
+            var i = Int64(0)
             while i < max_len:
                 rc_codes[base + i] = 255
                 i += 1
-            var j = 0
+            var j = Int64(0)
             while j < L:
                 var c = codes[base + (L - 1 - j)]
                 var r: UInt8 = 255
@@ -571,22 +575,22 @@ def map_fastq_dense_gpu_locate(
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             rc_codes: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            n_active: Int,
+            n_active: Int64,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
-            max_len: Int,
+            max_len: Int64,
         ):
             """RC only need_rc reads (same layout as full rc_codes_kernel)."""
-            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var tid = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if tid >= n_active:
                 return
-            var rid = Int(rid_map[tid])
-            var L = Int(read_lens[rid])
+            var rid = Int64(rid_map[tid])
+            var L = Int64(read_lens[rid])
             var base = rid * max_len
-            var i = 0
+            var i = Int64(0)
             while i < max_len:
                 rc_codes[base + i] = 255
                 i += 1
-            var j = 0
+            var j = Int64(0)
             while j < L:
                 var c = codes[base + (L - 1 - j)]
                 var r: UInt8 = 255
@@ -600,31 +604,31 @@ def map_fastq_dense_gpu_locate(
             keys: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            n_active: Int,
+            n_active: Int64,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
-            max_len: Int,
-            k_len: Int,
-            seed_stride: Int,
-            slots_per_read: Int,
+            max_len: Int64,
+            k_len: Int64,
+            seed_stride: Int64,
+            slots_per_read: Int64,
         ):
             """Encode seeds for compacted rid_map; writes into full slot layout."""
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             var n_slots = n_active * slots_per_read
             if idx >= n_slots:
                 return
             var ai = idx // slots_per_read
             var slot = idx % slots_per_read
-            var rid = Int(rid_map[ai])
+            var rid = Int64(rid_map[ai])
             var sidx = rid * slots_per_read + slot
             var q_off = slot * seed_stride
-            var L = Int(read_lens[rid])
+            var L = Int64(read_lens[rid])
             keys[sidx] = UInt64(0xFFFFFFFFFFFFFFFF)
             q_offs[sidx] = UInt32(q_off)
             if q_off + k_len > L:
                 return
             var base = rid * max_len + q_off
             var key: UInt64 = 0
-            var j = 0
+            var j = Int64(0)
             while j < k_len:
                 var c = codes[base + j]
                 if c > 3:
@@ -639,27 +643,27 @@ def map_fastq_dense_gpu_locate(
             offsets: UnsafePointer[UInt64, MutAnyOrigin],
             out_start: UnsafePointer[UInt64, MutAnyOrigin],
             out_end: UnsafePointer[UInt64, MutAnyOrigin],
-            n_active: Int,
+            n_active: Int64,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
-            slots_per_read: Int,
-            n_table: Int,
-            max_occ: Int,
+            slots_per_read: Int64,
+            n_table: Int64,
+            max_occ: Int64,
         ):
             """Binary-search locate for compacted rid_map slots only."""
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             var n_slots = n_active * slots_per_read
             if idx >= n_slots:
                 return
             var ai = idx // slots_per_read
             var slot = idx % slots_per_read
-            var rid = Int(rid_map[ai])
+            var rid = Int64(rid_map[ai])
             var sidx = rid * slots_per_read + slot
             out_start[sidx] = 0
             out_end[sidx] = 0
             var key = keys[sidx]
             if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
                 return
-            var lo = 0
+            var lo = Int64(0)
             var hi = n_table
             while lo < hi:
                 var mid = (lo + hi) // 2
@@ -674,7 +678,7 @@ def map_fastq_dense_gpu_locate(
                 return
             var start = offsets[lo]
             var end = offsets[lo + 1]
-            var occ = Int(end - start)
+            var occ = Int64(end - start)
             if occ <= 0 or occ > max_occ:
                 return
             out_start[sidx] = start
@@ -686,28 +690,28 @@ def map_fastq_dense_gpu_locate(
             offsets: UnsafePointer[UInt64, MutAnyOrigin],
             out_start: UnsafePointer[UInt64, MutAnyOrigin],
             out_end: UnsafePointer[UInt64, MutAnyOrigin],
-            n_active: Int,
+            n_active: Int64,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
-            slots_per_read: Int,
-            n_table: Int,
-            max_occ: Int,
+            slots_per_read: Int64,
+            n_table: Int64,
+            max_occ: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             var n_slots = n_active * slots_per_read
             if idx >= n_slots:
                 return
             var ai = idx // slots_per_read
             var slot = idx % slots_per_read
-            var rid = Int(rid_map[ai])
+            var rid = Int64(rid_map[ai])
             var sidx = rid * slots_per_read + slot
             out_start[sidx] = 0
             out_end[sidx] = 0
             var key = keys[sidx]
             if key == UInt64(0xFFFFFFFFFFFFFFFF) or n_table <= 0:
                 return
-            var lo = 0
+            var lo = Int64(0)
             var hi = n_table - 1
-            var steps = 0
+            var steps = Int64(0)
             while lo <= hi and key >= kmers[lo] and key <= kmers[hi] and steps < 64:
                 steps += 1
                 if kmers[hi] == kmers[lo]:
@@ -716,7 +720,7 @@ def map_fastq_dense_gpu_locate(
                         break
                     return
                 var span = kmers[hi] - kmers[lo]
-                var mid = lo + Int(((key - kmers[lo]) * UInt64(hi - lo)) // span)
+                var mid = lo + Int64(((key - kmers[lo]) * UInt64(hi - lo)) // span)
                 if mid < lo:
                     mid = lo
                 if mid > hi:
@@ -736,7 +740,7 @@ def map_fastq_dense_gpu_locate(
                 return
             var start = offsets[lo]
             var end = offsets[lo + 1]
-            var occ = Int(end - start)
+            var occ = Int64(end - start)
             if occ <= 0 or occ > max_occ:
                 return
             out_start[sidx] = start
@@ -747,25 +751,25 @@ def map_fastq_dense_gpu_locate(
             occ_end: UnsafePointer[UInt64, MutAnyOrigin],
             q_offs: UnsafePointer[UInt32, MutAnyOrigin],
             postings: UnsafePointer[UInt32, MutAnyOrigin],
-            n_postings: Int,
+            n_postings: Int64,
             # Packed 2-bit ref codes (0..3 / 255), not ASCII.
             sequences: UnsafePointer[UInt8, MutAnyOrigin],
             contig_off: UnsafePointer[UInt64, MutAnyOrigin],
-            n_contigs: Int,
+            n_contigs: Int64,
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             read_lens: UnsafePointer[UInt32, MutAnyOrigin],
-            max_len: Int,
-            slots_per_read: Int,
-            n_reads: Int,
-            max_diff: Int,
-            max_soft: Int,
-            max_indel: Int,
-            vote_occ: Int,
+            max_len: Int64,
+            slots_per_read: Int64,
+            n_reads: Int64,
+            max_diff: Int64,
+            max_soft: Int64,
+            max_indel: Int64,
+            vote_occ: Int64,
             # 0 = serial vote + rescue; 1 = high-occ (legacy); 2 = merge warp votes + extend.
-            pass_mode: Int,
+            pass_mode: Int64,
             # When n_active >= 0, threads map through rid_map (compacted unmapped).
             # When n_active < 0, thread i handles read i (full batch).
-            n_active: Int,
+            n_active: Int64,
             rid_map: UnsafePointer[Int32, MutAnyOrigin],
             lane_keys: UnsafePointer[UInt64, MutAnyOrigin],
             lane_ns: UnsafePointer[Int32, MutAnyOrigin],
@@ -783,18 +787,18 @@ def map_fastq_dense_gpu_locate(
             out_ilen: UnsafePointer[UInt32, MutAnyOrigin],
         ):
             """Two-pass extend: fast vote/rescue, then compacted high-occ for unmapped."""
-            var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
-            var rid: Int
+            var tid = Int64(block_idx.x * block_dim.x + thread_idx.x)
+            var rid: Int64
             if n_active >= 0:
                 if tid >= n_active:
                     return
-                rid = Int(rid_map[tid])
+                rid = Int64(rid_map[tid])
             else:
                 rid = tid
                 if rid >= n_reads:
                     return
             # Pass 1 safety: leave already-mapped reads alone.
-            if pass_mode == 1 and Int(out_cid[rid]) >= 0:
+            if pass_mode == 1 and Int64(out_cid[rid]) >= 0:
                 return
             out_cid[rid] = Int32(-1)
             out_pos[rid] = 0
@@ -806,35 +810,35 @@ def map_fastq_dense_gpu_locate(
             out_iop[rid] = 0
             out_iat[rid] = 0
             out_ilen[rid] = 0
-            var qlen = Int(read_lens[rid])
+            var qlen = Int64(read_lens[rid])
             if qlen <= 0:
                 return
 
             comptime TOP = 256
             comptime KEEP = 16
-            var cand_key = InlineArray[UInt64, TOP](fill=UInt64(0xFFFFFFFFFFFFFFFF))
-            var cand_n = InlineArray[Int32, TOP](fill=Int32(0))
-            var n_cand = 0
+            var cand_key = Array[UInt64, TOP](fill=UInt64(0xFFFFFFFFFFFFFFFF))
+            var cand_n = Array[Int32, TOP](fill=Int32(0))
+            var n_cand = Int64(0)
 
             # Vote using seeds sorted by increasing occupancy (rare first).
             # Dual C2T packs are highly repetitive — processing common seeds
             # first fills TOP with decoys and drops the true locus.
             comptime MAX_SLOTS = 128
-            var ord_slot = InlineArray[Int32, MAX_SLOTS](fill=Int32(-1))
-            var ord_occ = InlineArray[Int32, MAX_SLOTS](fill=Int32(0))
-            var n_ord = 0
-            var slot_g = 0
+            var ord_slot = Array[Int32, MAX_SLOTS](fill=Int32(-1))
+            var ord_occ = Array[Int32, MAX_SLOTS](fill=Int32(0))
+            var n_ord = Int64(0)
+            var slot_g = Int64(0)
             while slot_g < slots_per_read and n_ord < MAX_SLOTS:
                 var sidx_g = rid * slots_per_read + slot_g
-                var a_g = Int(occ_start[sidx_g])
-                var b_g = Int(occ_end[sidx_g])
+                var a_g = Int64(occ_start[sidx_g])
+                var b_g = Int64(occ_end[sidx_g])
                 var occ_g = b_g - a_g
                 if occ_g > 0 and a_g >= 0 and b_g <= n_postings:
                     # Insert by ascending occ.
                     var ins = n_ord
-                    var t = 0
+                    var t = Int64(0)
                     while t < n_ord:
-                        if occ_g < Int(ord_occ[t]):
+                        if occ_g < Int64(ord_occ[t]):
                             ins = t
                             break
                         t += 1
@@ -860,17 +864,17 @@ def map_fastq_dense_gpu_locate(
                 comptime WARP = 32
                 comptime TOP_LANE = 32
                 comptime EMPTY = UInt64(0xFFFFFFFFFFFFFFFF)
-                var ln = 0
+                var ln = Int64(0)
                 while ln < WARP:
-                    var nc = Int(lane_ncand[rid * WARP + ln])
+                    var nc = Int64(lane_ncand[rid * WARP + ln])
                     var base = (rid * WARP + ln) * TOP_LANE
-                    var j = 0
+                    var j = Int64(0)
                     while j < nc and j < TOP_LANE:
                         var vk = lane_keys[base + j]
                         var vn = lane_ns[base + j]
                         if vk != EMPTY and vn > 0:
-                            var found = -1
-                            var ci = 0
+                            var found = Int64(-1)
+                            var ci = Int64(0)
                             while ci < n_cand:
                                 if cand_key[ci] == vk:
                                     found = ci
@@ -883,9 +887,9 @@ def map_fastq_dense_gpu_locate(
                                 cand_n[n_cand] = vn
                                 n_cand += 1
                             else:
-                                var min_i = 0
+                                var min_i = Int64(0)
                                 var min_n = cand_n[0]
-                                var zj = 1
+                                var zj = Int64(1)
                                 while zj < TOP:
                                     if cand_n[zj] < min_n:
                                         min_n = cand_n[zj]
@@ -897,30 +901,30 @@ def map_fastq_dense_gpu_locate(
                         j += 1
                     ln += 1
             elif pass_mode == 0:
-                var last_i = -1
-                var oi = 0
+                var last_i = Int64(-1)
+                var oi = Int64(0)
                 while oi < n_ord:
-                    var occ_v = Int(ord_occ[oi])
+                    var occ_v = Int64(ord_occ[oi])
                     if occ_v > vote_cap:
                         oi += 1
                         continue
-                    var slot = Int(ord_slot[oi])
+                    var slot = Int64(ord_slot[oi])
                     var sidx = rid * slots_per_read + slot
-                    var a = Int(occ_start[sidx])
-                    var b = Int(occ_end[sidx])
-                    var q_off = Int(q_offs[sidx])
+                    var a = Int64(occ_start[sidx])
+                    var b = Int64(occ_end[sidx])
+                    var q_off = Int64(q_offs[sidx])
                     var pi = a
                     while pi < b:
-                        var cid = Int(postings[pi * 2])
-                        var pos = Int(postings[pi * 2 + 1])
+                        var cid = Int64(postings[pi * 2])
+                        var pos = Int64(postings[pi * 2 + 1])
                         if cid >= 0 and cid < n_contigs and pos >= q_off:
                             var start0 = pos - q_off
                             var vk = (UInt64(cid) << 32) | UInt64(start0)
-                            var found = -1
+                            var found = Int64(-1)
                             if last_i >= 0 and cand_key[last_i] == vk:
                                 found = last_i
                             else:
-                                var ci = 0
+                                var ci = Int64(0)
                                 while ci < n_cand:
                                     if cand_key[ci] == vk:
                                         found = ci
@@ -935,9 +939,9 @@ def map_fastq_dense_gpu_locate(
                                 last_i = n_cand
                                 n_cand += 1
                             else:
-                                var min_i = 0
+                                var min_i = Int64(0)
                                 var min_n = cand_n[0]
-                                var zj = 1
+                                var zj = Int64(1)
                                 while zj < TOP:
                                     if cand_n[zj] < min_n:
                                         min_n = cand_n[zj]
@@ -951,11 +955,11 @@ def map_fastq_dense_gpu_locate(
                     # Early-stop vote once a locus has clear multi-seed support.
                     # Keeps mapped-rate gate; avoids scanning every low-occ seed.
                     if n_cand > 0 and oi + 1 < n_ord:
-                        var b1 = 0
-                        var b2 = 0
-                        var zi = 0
+                        var b1 = Int64(0)
+                        var b2 = Int64(0)
+                        var zi = Int64(0)
                         while zi < n_cand:
-                            var zv = Int(cand_n[zi])
+                            var zv = Int64(cand_n[zi])
                             if zv > b1:
                                 b2 = b1
                                 b1 = zv
@@ -969,14 +973,14 @@ def map_fastq_dense_gpu_locate(
                     oi += 1
 
             # Select up to KEEP highest-vote candidates.
-            var pick_i = InlineArray[Int32, KEEP](fill=Int32(-1))
-            var pick_n = InlineArray[Int32, KEEP](fill=Int32(0))
-            var n_pick = 0
-            var ci2 = 0
+            var pick_i = Array[Int32, KEEP](fill=Int32(-1))
+            var pick_n = Array[Int32, KEEP](fill=Int32(0))
+            var n_pick = Int64(0)
+            var ci2 = Int64(0)
             while (pass_mode == 0 or pass_mode == 2) and ci2 < n_cand:
                 var votes = cand_n[ci2]
                 var inserted = False
-                var p = 0
+                var p = Int64(0)
                 while p < n_pick:
                     if votes > pick_n[p]:
                         var shift = n_pick
@@ -1020,33 +1024,33 @@ def map_fastq_dense_gpu_locate(
                 shift_cap = 6
 
             # Best accepted among candidates (lowest edit cost, then votes).
-            var best_cost = 9999
+            var best_cost = Int64(9999)
             var best_votes: Int32 = 0
-            var best_cid = -1
-            var best_pos = 0
-            var best_sl = 0
-            var best_sr = 0
-            var best_iop = 0
-            var best_iat = 0
-            var best_ilen = 0
+            var best_cid = Int64(-1)
+            var best_pos = Int64(0)
+            var best_sl = Int64(0)
+            var best_sr = Int64(0)
+            var best_iop = Int64(0)
+            var best_iat = Int64(0)
+            var best_ilen = Int64(0)
 
             # Adj order: 0 first, then ±1, ±2, … so exact/vote hits exit
             # before paying for shift_cap×KEEP gapless scans.
-            var pk = 0
+            var pk = Int64(0)
             while pk < n_pick and n_cand > 0:
-                var ix = Int(pick_i[pk])
+                var ix = Int64(pick_i[pk])
                 var bkey = cand_key[ix]
                 var votes = pick_n[pk]
-                var bcid = Int(bkey >> 32)
-                var bstart0 = Int(bkey & UInt64(0xFFFFFFFF))
+                var bcid = Int64(bkey >> 32)
+                var bstart0 = Int64(bkey & UInt64(0xFFFFFFFF))
                 if bcid >= 0 and bcid < n_contigs and bstart0 >= 0:
-                    var off0 = Int(contig_off[bcid])
-                    var off1 = Int(contig_off[bcid + 1])
+                    var off0 = Int64(contig_off[bcid])
+                    var off1 = Int64(contig_off[bcid + 1])
                     var clen = off1 - off0
 
-                    var adj_i = 0
+                    var adj_i = Int64(0)
                     while adj_i <= shift_cap * 2:
-                        var adj = 0
+                        var adj = Int64(0)
                         if adj_i > 0:
                             var mag = (adj_i + 1) // 2
                             if (adj_i & 1) == 1:
@@ -1061,8 +1065,8 @@ def map_fastq_dense_gpu_locate(
 
                         # Interior probes: if more mismatches than budget+indel,
                         # gapless/softclip/single-indel cannot accept this adj.
-                        var probe_nm = 0
-                        var pkp = 1
+                        var probe_nm = Int64(0)
+                        var pkp = Int64(1)
                         while pkp <= 6:
                             var jp = (pkp * (qlen - 1)) // 7
                             if jp < clip_cap:
@@ -1081,8 +1085,8 @@ def map_fastq_dense_gpu_locate(
 
                         # Gapless + end soft-clip. Early-abort once NM exceeds
                         # budget (softclip path still runs and re-scores).
-                        var nm_all = 0
-                        var j = 0
+                        var nm_all = Int64(0)
+                        var j = Int64(0)
                         while j < qlen and nm_all <= budget:
                             var rc = sequences[ref_base + j]
                             var qc = codes[q_base + j]
@@ -1090,8 +1094,8 @@ def map_fastq_dense_gpu_locate(
                                 nm_all += 1
                             j += 1
 
-                        var sl = 0
-                        var sr = 0
+                        var sl = Int64(0)
+                        var sr = Int64(0)
                         var nm = nm_all
                         if nm_all > budget:
                             while sl < clip_cap:
@@ -1144,14 +1148,14 @@ def map_fastq_dense_gpu_locate(
                             and adj == 0
                             and (nm > budget or alen < 24)
                         ):
-                            var dlen = 1
+                            var dlen = Int64(1)
                             while dlen <= indel_cap:
                                 # Deletion of dlen ref bases after query offset g.
                                 if bstart + qlen + dlen <= clen:
-                                    var g = 0
+                                    var g = Int64(0)
                                     while g <= qlen:
                                         var nm_d = dlen
-                                        var t = 0
+                                        var t = Int64(0)
                                         while t < g and nm_d <= budget:
                                             var rcd = sequences[ref_base + t]
                                             var qcd = codes[q_base + t]
@@ -1188,10 +1192,10 @@ def map_fastq_dense_gpu_locate(
 
                                 # Insertion of dlen query bases after offset g.
                                 if qlen > dlen and bstart + (qlen - dlen) <= clen:
-                                    var gi = 0
+                                    var gi = Int64(0)
                                     while gi <= qlen - dlen:
                                         var nm_i = dlen
-                                        var ti = 0
+                                        var ti = Int64(0)
                                         while ti < gi and nm_i <= budget:
                                             var rci = sequences[ref_base + ti]
                                             var qci = codes[q_base + ti]
@@ -1244,14 +1248,14 @@ def map_fastq_dense_gpu_locate(
             # Pass 1: high-occ exact tally for still-unmapped reads.
             if pass_mode == 1 or best_cid < 0:
                 comptime HX = 48
-                var hx_key = InlineArray[UInt64, HX](fill=UInt64(0xFFFFFFFFFFFFFFFF))
-                var hx_n = InlineArray[Int32, HX](fill=Int32(0))
-                var hx_min_occ = InlineArray[Int32, HX](fill=Int32(0x7FFFFFFF))
-                var n_hx = 0
-                var ri = 0
-                var n_high_tried = 0
+                var hx_key = Array[UInt64, HX](fill=UInt64(0xFFFFFFFFFFFFFFFF))
+                var hx_n = Array[Int32, HX](fill=Int32(0))
+                var hx_min_occ = Array[Int32, HX](fill=Int32(0x7FFFFFFF))
+                var n_hx = Int64(0)
+                var ri = Int64(0)
+                var n_high_tried = Int64(0)
                 while ri < n_ord:
-                    var occ_r = Int(ord_occ[ri])
+                    var occ_r = Int64(ord_occ[ri])
                     if occ_r <= 0:
                         ri += 1
                         continue
@@ -1270,29 +1274,29 @@ def map_fastq_dense_gpu_locate(
                         if n_high_tried > 96:
                             ri += 1
                             continue
-                    var slot_r = Int(ord_slot[ri])
+                    var slot_r = Int64(ord_slot[ri])
                     var sidx_r = rid * slots_per_read + slot_r
-                    var a_r = Int(occ_start[sidx_r])
-                    var b_r = Int(occ_end[sidx_r])
-                    var q_off_r = Int(q_offs[sidx_r])
+                    var a_r = Int64(occ_start[sidx_r])
+                    var b_r = Int64(occ_end[sidx_r])
+                    var q_off_r = Int64(q_offs[sidx_r])
 
                     if high_occ:
                         var pi_h = a_r
                         while pi_h < b_r:
-                            var cid_h = Int(postings[pi_h * 2])
-                            var pos_h = Int(postings[pi_h * 2 + 1])
+                            var cid_h = Int64(postings[pi_h * 2])
+                            var pos_h = Int64(postings[pi_h * 2 + 1])
                             if (
                                 cid_h >= 0
                                 and cid_h < n_contigs
                                 and pos_h >= q_off_r
                             ):
                                 var bs_h = pos_h - q_off_r
-                                var o0_h = Int(contig_off[cid_h])
-                                var o1_h = Int(contig_off[cid_h + 1])
+                                var o0_h = Int64(contig_off[cid_h])
+                                var o1_h = Int64(contig_off[cid_h + 1])
                                 if bs_h >= 0 and bs_h + qlen <= (o1_h - o0_h):
                                     var ref_h = o0_h + bs_h
-                                    var nm_h = 0
-                                    var jh = 0
+                                    var nm_h = Int64(0)
+                                    var jh = Int64(0)
                                     while jh < qlen and nm_h == 0:
                                         var rch = sequences[ref_h + jh]
                                         var qch = codes[q_base + jh]
@@ -1303,8 +1307,8 @@ def map_fastq_dense_gpu_locate(
                                         var vk_h = (UInt64(cid_h) << 32) | UInt64(
                                             bs_h
                                         )
-                                        var found_h = -1
-                                        var ci_h = 0
+                                        var found_h = Int64(-1)
+                                        var ci_h = Int64(0)
                                         while ci_h < n_hx:
                                             if hx_key[ci_h] == vk_h:
                                                 found_h = ci_h
@@ -1322,11 +1326,11 @@ def map_fastq_dense_gpu_locate(
                             pi_h += 1
                         # Early-stop high-occ scan once plurality is clear.
                         if n_hx > 0:
-                            var b1 = 0
-                            var b2 = 0
-                            var zi = 0
+                            var b1 = Int64(0)
+                            var b2 = Int64(0)
+                            var zi = Int64(0)
                             while zi < n_hx:
-                                var zv = Int(hx_n[zi])
+                                var zv = Int64(hx_n[zi])
                                 if zv > b1:
                                     b2 = b1
                                     b1 = zv
@@ -1335,7 +1339,7 @@ def map_fastq_dense_gpu_locate(
                                 zi += 1
                             if b1 >= 3 and b1 > b2:
                                 # Skip remaining high-occ seeds.
-                                while ri + 1 < n_ord and Int(ord_occ[ri + 1]) > vote_cap:
+                                while ri + 1 < n_ord and Int64(ord_occ[ri + 1]) > vote_cap:
                                     ri += 1
                         ri += 1
                         continue
@@ -1343,21 +1347,21 @@ def map_fastq_dense_gpu_locate(
                     # Low-occ rescue: gapless → softclip → single-indel.
                     var pi_r = a_r
                     while pi_r < b_r:
-                        var cid_r = Int(postings[pi_r * 2])
-                        var pos_r = Int(postings[pi_r * 2 + 1])
+                        var cid_r = Int64(postings[pi_r * 2])
+                        var pos_r = Int64(postings[pi_r * 2 + 1])
                         if (
                             cid_r >= 0
                             and cid_r < n_contigs
                             and pos_r >= q_off_r
                         ):
                             var bstart_r = pos_r - q_off_r
-                            var off0_r = Int(contig_off[cid_r])
-                            var off1_r = Int(contig_off[cid_r + 1])
+                            var off0_r = Int64(contig_off[cid_r])
+                            var off1_r = Int64(contig_off[cid_r + 1])
                             var clen_r = off1_r - off0_r
                             if bstart_r >= 0 and bstart_r + qlen <= clen_r:
                                 var ref_r = off0_r + bstart_r
-                                var nm_r = 0
-                                var jr = 0
+                                var nm_r = Int64(0)
+                                var jr = Int64(0)
                                 while jr < qlen and nm_r <= budget:
                                     var rc = sequences[ref_r + jr]
                                     var qc = codes[q_base + jr]
@@ -1365,12 +1369,12 @@ def map_fastq_dense_gpu_locate(
                                         nm_r += 1
                                     jr += 1
 
-                                var sl_r = 0
-                                var sr_r = 0
+                                var sl_r = Int64(0)
+                                var sr_r = Int64(0)
                                 var cost_r = nm_r
-                                var iop_r = 0
-                                var iat_r = 0
-                                var ilen_r = 0
+                                var iop_r = Int64(0)
+                                var iat_r = Int64(0)
+                                var ilen_r = Int64(0)
                                 var pos_out = bstart_r
 
                                 if nm_r > budget and clip_cap > 0:
@@ -1403,7 +1407,7 @@ def map_fastq_dense_gpu_locate(
 
                                 # Single indel at seed locus (size 1..indel_cap).
                                 if indel_cap > 0 and cost_r > budget:
-                                    var dlen = 1
+                                    var dlen = Int64(1)
                                     while dlen <= indel_cap:
                                         if bstart_r + qlen + dlen <= clen_r:
                                             var g = q_off_r
@@ -1419,7 +1423,7 @@ def map_fastq_dense_gpu_locate(
                                             var gg = g0
                                             while gg <= g1:
                                                 var nm_d = dlen
-                                                var t = 0
+                                                var t = Int64(0)
                                                 while t < gg and nm_d <= budget:
                                                     var rcd = sequences[ref_r + t]
                                                     var qcd = codes[q_base + t]
@@ -1466,7 +1470,7 @@ def map_fastq_dense_gpu_locate(
                                             var gi = g0i
                                             while gi <= g1i:
                                                 var nm_i = dlen
-                                                var ti = 0
+                                                var ti = Int64(0)
                                                 while ti < gi and nm_i <= budget:
                                                     var rci = sequences[ref_r + ti]
                                                     var qci = codes[q_base + ti]
@@ -1531,14 +1535,14 @@ def map_fastq_dense_gpu_locate(
                 # Tie-break by rarer seed evidence (lower min occ) so multi-copy
                 # exact repeats prefer the locus supported by rarer kmers.
                 if n_hx > 0:
-                    var best_hi = 0
-                    var second_hi = 0
-                    var best_hx_i = -1
-                    var best_mocc = 0x7FFFFFFF
-                    var hi = 0
+                    var best_hi = Int64(0)
+                    var second_hi = Int64(0)
+                    var best_hx_i = Int64(-1)
+                    var best_mocc = Int64(0x7FFFFFFF)
+                    var hi = Int64(0)
                     while hi < n_hx:
-                        var vn = Int(hx_n[hi])
-                        var mo = Int(hx_min_occ[hi])
+                        var vn = Int64(hx_n[hi])
+                        var mo = Int64(hx_min_occ[hi])
                         if vn > best_hi:
                             second_hi = best_hi
                             best_hi = vn
@@ -1561,7 +1565,7 @@ def map_fastq_dense_gpu_locate(
                         and (
                             best_cid < 0
                             or best_cost > 0
-                            or Int(best_votes) < best_hi
+                            or Int64(best_votes) < best_hi
                         )
                     ):
                         var bk = hx_key[best_hx_i]
@@ -1572,8 +1576,8 @@ def map_fastq_dense_gpu_locate(
                                 best_votes = 5
                         else:
                             best_votes = 1
-                        best_cid = Int(bk >> 32)
-                        best_pos = Int(bk & UInt64(0xFFFFFFFF))
+                        best_cid = Int64(bk >> 32)
+                        best_pos = Int64(bk & UInt64(0xFFFFFFFF))
                         best_sl = 0
                         best_sr = 0
                         best_iop = 0
@@ -1692,7 +1696,7 @@ def map_fastq_dense_gpu_locate(
         ctx.enqueue_function[pack_bases_kernel](
             dev_seq.unsafe_ptr(),
             dev_ref_codes.unsafe_ptr(),
-            seq_bytes,
+            Int64(seq_bytes),
             grid_dim=(seq_bytes + 255) // 256,
             block_dim=256,
         )
@@ -1745,9 +1749,9 @@ def map_fastq_dense_gpu_locate(
         var do_profile = (
             prof_raw == "1" or prof_raw == "true" or prof_raw == "yes"
         )
-        var n_mapped = 0
-        var n_reads = 0
-        var n_batches = 0
+        var n_mapped = Int(0)
+        var n_reads = Int(0)
+        var n_batches = Int(0)
         comptime BLOCK = 256
         # Profile accumulators (seconds); only updated when do_profile.
         var t_fw_loc = time_mod.perf_counter() * 0.0
@@ -1798,11 +1802,11 @@ def map_fastq_dense_gpu_locate(
         # Dummy host buffers; replaced before first H2D when batch non-empty.
         var host_bases = ctx.enqueue_create_host_buffer[DType.uint8](1)
         var host_lens = ctx.enqueue_create_host_buffer[DType.uint32](1)
-        var n_seq = 0
-        var max_len = 0
+        var n_seq = Int(0)
+        var max_len = Int(0)
         var slots_per = 1
-        var n_slots = 0
-        var n_bases = 0
+        var n_slots = Int(0)
+        var n_bases = Int(0)
         var need_pack = True
         # Deferred SAM emit: format previous batch while current pass-0 runs.
         var pend_emit = False
@@ -1839,7 +1843,7 @@ def map_fastq_dense_gpu_locate(
                         seqs.append(r.seq)
                 n_seq = len(seqs)
                 max_len = 0
-                var ri0 = 0
+                var ri0 = Int(0)
                 while ri0 < n_seq:
                     var L0 = seqs[ri0].byte_length()
                     if L0 > max_len:
@@ -1854,13 +1858,13 @@ def map_fastq_dense_gpu_locate(
                 n_bases = n_seq * max_len
                 host_bases = ctx.enqueue_create_host_buffer[DType.uint8](n_bases)
                 host_lens = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
-                var si = 0
+                var si = Int(0)
                 while si < n_seq:
                     var s = seqs[si]
                     var L = s.byte_length()
                     host_lens[si] = UInt32(L)
                     var base = si * max_len
-                    var p = 0
+                    var p = Int(0)
                     while p < max_len:
                         if p < L:
                             host_bases[base + p] = UInt8(
@@ -1922,7 +1926,7 @@ def map_fastq_dense_gpu_locate(
             ctx.enqueue_function[pack_bases_kernel](
                 dev_bases.unsafe_ptr(),
                 dev_codes.unsafe_ptr(),
-                n_bases,
+                Int64(n_bases),
                 grid_dim=grid_b,
                 block_dim=BLOCK,
             )
@@ -1939,11 +1943,11 @@ def map_fastq_dense_gpu_locate(
                 dev_keys.unsafe_ptr(),
                 dev_qoff.unsafe_ptr(),
                 dev_lens.unsafe_ptr(),
-                n_seq,
-                max_len,
-                k_len,
-                seed_stride,
-                slots_per,
+                Int64(n_seq),
+                Int64(max_len),
+                Int64(k_len),
+                Int64(seed_stride),
+                Int64(slots_per),
                 grid_dim=grid_s,
                 block_dim=BLOCK,
             )
@@ -1954,9 +1958,9 @@ def map_fastq_dense_gpu_locate(
                     dev_offsets.unsafe_ptr(),
                     dev_start.unsafe_ptr(),
                     dev_end.unsafe_ptr(),
-                    n_slots,
-                    n_table,
-                    max_occ,
+                    Int64(n_slots),
+                    Int64(n_table),
+                    Int64(max_occ),
                     grid_dim=grid_s,
                     block_dim=BLOCK,
                 )
@@ -1967,9 +1971,9 @@ def map_fastq_dense_gpu_locate(
                     dev_offsets.unsafe_ptr(),
                     dev_start.unsafe_ptr(),
                     dev_end.unsafe_ptr(),
-                    n_slots,
-                    n_table,
-                    max_occ,
+                    Int64(n_slots),
+                    Int64(n_table),
+                    Int64(max_occ),
                     grid_dim=grid_s,
                     block_dim=BLOCK,
                 )
@@ -1993,21 +1997,21 @@ def map_fastq_dense_gpu_locate(
                 dev_end.unsafe_ptr(),
                 dev_qoff.unsafe_ptr(),
                 dev_postings.unsafe_ptr(),
-                n_post,
+                Int64(n_post),
                 dev_ref_codes.unsafe_ptr(),
                 dev_coff.unsafe_ptr(),
-                n_contigs,
+                Int64(n_contigs),
                 dev_codes.unsafe_ptr(),
                 dev_lens.unsafe_ptr(),
-                max_len,
-                slots_per,
-                n_seq,
-                max_diff,
-                max_soft,
-                max_indel,
-                vote_fast,
-                0,
-                -1,
+                Int64(max_len),
+                Int64(slots_per),
+                Int64(n_seq),
+                Int64(max_diff),
+                Int64(max_soft),
+                Int64(max_indel),
+                Int64(vote_fast),
+                Int64(0),
+                Int64(-1),
                 dev_rid_dummy.unsafe_ptr(),
                 dummy_lane_key.unsafe_ptr(),
                 dummy_lane_n.unsafe_ptr(),
@@ -2035,11 +2039,11 @@ def map_fastq_dense_gpu_locate(
             )
             var next_host_bases = ctx.enqueue_create_host_buffer[DType.uint8](1)
             var next_host_lens = ctx.enqueue_create_host_buffer[DType.uint32](1)
-            var next_n_seq = 0
-            var next_max_len = 0
+            var next_n_seq = Int(0)
+            var next_max_len = Int(0)
             var next_slots_per = 1
-            var next_n_slots = 0
-            var next_n_bases = 0
+            var next_n_slots = Int(0)
+            var next_n_bases = Int(0)
             var next_ready = False
             if len(next_b1) > 0:
                 var next_seqs = List[String]()
@@ -2050,7 +2054,7 @@ def map_fastq_dense_gpu_locate(
                         next_seqs.append(r.seq)
                 next_n_seq = len(next_seqs)
                 next_max_len = 0
-                var nri = 0
+                var nri = Int(0)
                 while nri < next_n_seq:
                     var nL = next_seqs[nri].byte_length()
                     if nL > next_max_len:
@@ -2071,13 +2075,13 @@ def map_fastq_dense_gpu_locate(
                 next_host_lens = ctx.enqueue_create_host_buffer[DType.uint32](
                     next_n_seq
                 )
-                var nsi = 0
+                var nsi = Int(0)
                 while nsi < next_n_seq:
                     var ns = next_seqs[nsi]
                     var nLen = ns.byte_length()
                     next_host_lens[nsi] = UInt32(nLen)
                     var nbase = nsi * next_max_len
-                    var np = 0
+                    var np = Int(0)
                     while np < next_max_len:
                         if np < nLen:
                             next_host_bases[nbase + np] = UInt8(
@@ -2092,7 +2096,7 @@ def map_fastq_dense_gpu_locate(
             # Overlap: emit previous batch SAM while this batch's pass-0 runs.
             if pend_emit:
                 var pn1 = len(pend_b1)
-                var pj = 0
+                var pj = Int(0)
                 while pj < pn1:
                     var use_rc = False
                     var f_cid = Int(pend_cid_f[pj])
@@ -2219,8 +2223,8 @@ def map_fastq_dense_gpu_locate(
             if do_profile:
                 t_fw_v0 += time_mod.perf_counter() - tp0
                 tp0 = time_mod.perf_counter()
-            var n_unmap_f = 0
-            var ui = 0
+            var n_unmap_f = Int(0)
+            var ui = Int(0)
             while ui < n_seq:
                 if Int(host_cid_fw[ui]) < 0:
                     n_unmap_f += 1
@@ -2230,7 +2234,7 @@ def map_fastq_dense_gpu_locate(
                 var host_rid_f = ctx.enqueue_create_host_buffer[DType.int32](
                     n_unmap_f
                 )
-                var w = 0
+                var w = Int(0)
                 ui = 0
                 while ui < n_seq:
                     if Int(host_cid_fw[ui]) < 0:
@@ -2246,21 +2250,21 @@ def map_fastq_dense_gpu_locate(
                         dev_end.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_postings.unsafe_ptr(),
-                        n_post,
+                        Int64(n_post),
                         dev_ref_codes.unsafe_ptr(),
                         dev_coff.unsafe_ptr(),
-                        n_contigs,
+                        Int64(n_contigs),
                         dev_codes.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        max_len,
-                        slots_per,
-                        n_seq,
-                        max_diff,
-                        max_soft,
-                        max_indel,
-                        vote_occ,
-                        0,
-                        n_unmap_f,
+                        Int64(max_len),
+                        Int64(slots_per),
+                        Int64(n_seq),
+                        Int64(max_diff),
+                        Int64(max_soft),
+                        Int64(max_indel),
+                        Int64(vote_occ),
+                        Int64(0),
+                        Int64(n_unmap_f),
                         dev_rid_f.unsafe_ptr(),
                         dummy_lane_key.unsafe_ptr(),
                         dummy_lane_n.unsafe_ptr(),
@@ -2303,21 +2307,21 @@ def map_fastq_dense_gpu_locate(
                         dev_end.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_postings.unsafe_ptr(),
-                        n_post,
+                        Int64(n_post),
                         dev_ref_codes.unsafe_ptr(),
                         dev_coff.unsafe_ptr(),
-                        n_contigs,
+                        Int64(n_contigs),
                         dev_codes.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        max_len,
-                        slots_per,
-                        n_seq,
-                        max_diff,
-                        max_soft,
-                        max_indel,
-                        vote_occ,
-                        1,
-                        n_unmap_f,
+                        Int64(max_len),
+                        Int64(slots_per),
+                        Int64(n_seq),
+                        Int64(max_diff),
+                        Int64(max_soft),
+                        Int64(max_indel),
+                        Int64(vote_occ),
+                        Int64(1),
+                        Int64(n_unmap_f),
                         dev_rid_f.unsafe_ptr(),
                         dummy_lane_key.unsafe_ptr(),
                         dummy_lane_n.unsafe_ptr(),
@@ -2349,7 +2353,7 @@ def map_fastq_dense_gpu_locate(
                     ctx.enqueue_copy(src_buf=dev_cid_f, dst_buf=host_cid_fw)
                     ctx.enqueue_copy(src_buf=dev_nm_f, dst_buf=host_nm_fw)
                     ctx.synchronize()
-                var n_need_rc = 0
+                var n_need_rc = Int(0)
                 ui = 0
                 while ui < n_seq:
                     # Exact FW hit (NM=0) is definitive — RC cannot improve NM.
@@ -2368,7 +2372,7 @@ def map_fastq_dense_gpu_locate(
                 var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
                     n_seq
                 )
-                var zi0 = 0
+                var zi0 = Int(0)
                 while zi0 < n_seq:
                     host_cid_r_init[zi0] = Int32(-1)
                     zi0 += 1
@@ -2378,7 +2382,7 @@ def map_fastq_dense_gpu_locate(
                     var host_rid_rc = ctx.enqueue_create_host_buffer[DType.int32](
                         n_need_rc
                     )
-                    var wrc = 0
+                    var wrc = Int(0)
                     ui = 0
                     while ui < n_seq:
                         if Int(host_cid_fw[ui]) < 0 or Int(host_nm_fw[ui]) > 0:
@@ -2399,9 +2403,9 @@ def map_fastq_dense_gpu_locate(
                         dev_codes.unsafe_ptr(),
                         dev_rc.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        n_need_rc,
+                        Int64(n_need_rc),
                         dev_rid_rc.unsafe_ptr(),
-                        max_len,
+                        Int64(max_len),
                         grid_dim=grid_rc,
                         block_dim=BLOCK,
                     )
@@ -2410,12 +2414,12 @@ def map_fastq_dense_gpu_locate(
                         dev_keys.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        n_need_rc,
+                        Int64(n_need_rc),
                         dev_rid_rc.unsafe_ptr(),
-                        max_len,
-                        k_len,
-                        seed_stride,
-                        slots_per,
+                        Int64(max_len),
+                        Int64(k_len),
+                        Int64(seed_stride),
+                        Int64(slots_per),
                         grid_dim=grid_rc_s,
                         block_dim=BLOCK,
                     )
@@ -2426,11 +2430,11 @@ def map_fastq_dense_gpu_locate(
                             dev_offsets.unsafe_ptr(),
                             dev_start.unsafe_ptr(),
                             dev_end.unsafe_ptr(),
-                            n_need_rc,
+                            Int64(n_need_rc),
                             dev_rid_rc.unsafe_ptr(),
-                            slots_per,
-                            n_table,
-                            max_occ,
+                            Int64(slots_per),
+                            Int64(n_table),
+                            Int64(max_occ),
                             grid_dim=grid_rc_s,
                             block_dim=BLOCK,
                         )
@@ -2441,11 +2445,11 @@ def map_fastq_dense_gpu_locate(
                             dev_offsets.unsafe_ptr(),
                             dev_start.unsafe_ptr(),
                             dev_end.unsafe_ptr(),
-                            n_need_rc,
+                            Int64(n_need_rc),
                             dev_rid_rc.unsafe_ptr(),
-                            slots_per,
-                            n_table,
-                            max_occ,
+                            Int64(slots_per),
+                            Int64(n_table),
+                            Int64(max_occ),
                             grid_dim=grid_rc_s,
                             block_dim=BLOCK,
                         )
@@ -2459,21 +2463,21 @@ def map_fastq_dense_gpu_locate(
                         dev_end.unsafe_ptr(),
                         dev_qoff.unsafe_ptr(),
                         dev_postings.unsafe_ptr(),
-                        n_post,
+                        Int64(n_post),
                         dev_ref_codes.unsafe_ptr(),
                         dev_coff.unsafe_ptr(),
-                        n_contigs,
+                        Int64(n_contigs),
                         dev_rc.unsafe_ptr(),
                         dev_lens.unsafe_ptr(),
-                        max_len,
-                        slots_per,
-                        n_seq,
-                        max_diff,
-                        max_soft,
-                        max_indel,
-                        vote_fast,
-                        0,
-                        n_need_rc,
+                        Int64(max_len),
+                        Int64(slots_per),
+                        Int64(n_seq),
+                        Int64(max_diff),
+                        Int64(max_soft),
+                        Int64(max_indel),
+                        Int64(vote_fast),
+                        Int64(0),
+                        Int64(n_need_rc),
                         dev_rid_rc.unsafe_ptr(),
                         dummy_lane_key.unsafe_ptr(),
                         dummy_lane_n.unsafe_ptr(),
@@ -2503,8 +2507,8 @@ def map_fastq_dense_gpu_locate(
                     if do_profile:
                         t_rc_v0 += time_mod.perf_counter() - tp0
                         tp0 = time_mod.perf_counter()
-                    var n_unmap_r = 0
-                    var uir = 0
+                    var n_unmap_r = Int(0)
+                    var uir = Int(0)
                     while uir < n_need_rc:
                         var rr = Int(host_rid_rc[uir])
                         if Int(host_cid_r_compact[rr]) < 0:
@@ -2514,7 +2518,7 @@ def map_fastq_dense_gpu_locate(
                         var host_rid_r = ctx.enqueue_create_host_buffer[
                             DType.int32
                         ](n_unmap_r)
-                        var wr = 0
+                        var wr = Int(0)
                         uir = 0
                         while uir < n_need_rc:
                             var rr2 = Int(host_rid_rc[uir])
@@ -2533,21 +2537,21 @@ def map_fastq_dense_gpu_locate(
                                 dev_end.unsafe_ptr(),
                                 dev_qoff.unsafe_ptr(),
                                 dev_postings.unsafe_ptr(),
-                                n_post,
+                                Int64(n_post),
                                 dev_ref_codes.unsafe_ptr(),
                                 dev_coff.unsafe_ptr(),
-                                n_contigs,
+                                Int64(n_contigs),
                                 dev_rc.unsafe_ptr(),
                                 dev_lens.unsafe_ptr(),
-                                max_len,
-                                slots_per,
-                                n_seq,
-                                max_diff,
-                                max_soft,
-                                max_indel,
-                                vote_occ,
-                                0,
-                                n_unmap_r,
+                                Int64(max_len),
+                                Int64(slots_per),
+                                Int64(n_seq),
+                                Int64(max_diff),
+                                Int64(max_soft),
+                                Int64(max_indel),
+                                Int64(vote_occ),
+                                Int64(0),
+                                Int64(n_unmap_r),
                                 dev_rid_r.unsafe_ptr(),
                                 dummy_lane_key.unsafe_ptr(),
                                 dummy_lane_n.unsafe_ptr(),
@@ -2596,21 +2600,21 @@ def map_fastq_dense_gpu_locate(
                                 dev_end.unsafe_ptr(),
                                 dev_qoff.unsafe_ptr(),
                                 dev_postings.unsafe_ptr(),
-                                n_post,
+                                Int64(n_post),
                                 dev_ref_codes.unsafe_ptr(),
                                 dev_coff.unsafe_ptr(),
-                                n_contigs,
+                                Int64(n_contigs),
                                 dev_rc.unsafe_ptr(),
                                 dev_lens.unsafe_ptr(),
-                                max_len,
-                                slots_per,
-                                n_seq,
-                                max_diff,
-                                max_soft,
-                                max_indel,
-                                vote_occ,
-                                1,
-                                n_unmap_r,
+                                Int64(max_len),
+                                Int64(slots_per),
+                                Int64(n_seq),
+                                Int64(max_diff),
+                                Int64(max_soft),
+                                Int64(max_indel),
+                                Int64(vote_occ),
+                                Int64(1),
+                                Int64(n_unmap_r),
                                 dev_rid_r.unsafe_ptr(),
                                 dummy_lane_key.unsafe_ptr(),
                                 dummy_lane_n.unsafe_ptr(),
@@ -2638,7 +2642,7 @@ def map_fastq_dense_gpu_locate(
                 var host_cid_r_init = ctx.enqueue_create_host_buffer[DType.int32](
                     n_seq
                 )
-                var zi = 0
+                var zi = Int(0)
                 while zi < n_seq:
                     host_cid_r_init[zi] = Int32(-1)
                     zi += 1
@@ -2751,7 +2755,7 @@ def map_fastq_dense_gpu_locate(
         # Final deferred SAM emit (last batch had no successor pass-0).
         if pend_emit:
             var pn1 = len(pend_b1)
-            var pj = 0
+            var pj = Int(0)
             while pj < pn1:
                 var use_rc = False
                 var f_cid = Int(pend_cid_f[pj])

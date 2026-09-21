@@ -20,7 +20,7 @@ def main() raises:
         raise Error("contig f1 not found in .ann")
     var pos0 = index.contig_offset(rid) + 1000000
     comptime KLEN = 32
-    var codes = InlineArray[UInt8, KLEN](fill=UInt8(0))
+    var codes = Array[UInt8, KLEN](fill=UInt8(0))
     var i = 0
     while i < KLEN:
         var b = index.pac_base(pos0 + i)

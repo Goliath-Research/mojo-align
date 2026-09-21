@@ -6,7 +6,7 @@
 
 from std.collections import List
 from std.ffi import external_call
-from std.memory import UnsafePointer, unsafe_memmove
+from std.memory import UnsafePointer, unsafe_memcpy, unsafe_memmove, unsafe_memset
 from std.python import Python, PythonObject
 
 
@@ -289,7 +289,7 @@ def _arena_push_raw(
     var off = a.used
     if n > 0:
         if convert == 0:
-            unsafe_memmove(
+            unsafe_memcpy(
                 dest=_fq_u8(Int(a.data.unsafe_ptr()) + off),
                 src=_fq_u8(src_addr),
                 count=n,
@@ -464,9 +464,7 @@ def fq_pack_bases(
         n_seq = n1 * 2
     var n_bases = n_seq * max_len
     if n_bases > 0:
-        _ = external_call["memset", UnsafePointer[UInt8, MutAnyOrigin]](
-            _fq_u8(dest_addr), Int32(78), UInt(n_bases)
-        )
+        unsafe_memset(ptr=_fq_u8(dest_addr), value=UInt8(78), count=n_bases)
     var lens = _fq_u32(lens_addr)
     var base = Int(a.data.unsafe_ptr())
     var i = 0
@@ -474,7 +472,7 @@ def fq_pack_bases(
         var ln = a.seq1_len[i]
         lens[i] = UInt32(ln)
         if ln > 0:
-            unsafe_memmove(
+            unsafe_memcpy(
                 dest=_fq_u8(dest_addr + i * max_len),
                 src=_fq_u8(base + a.seq1_off[i]),
                 count=ln,
@@ -486,7 +484,7 @@ def fq_pack_bases(
             var ln2 = a.seq2_len[i]
             lens[n1 + i] = UInt32(ln2)
             if ln2 > 0:
-                unsafe_memmove(
+                unsafe_memcpy(
                     dest=_fq_u8(dest_addr + (n1 + i) * max_len),
                     src=_fq_u8(base + a.seq2_off[i]),
                     count=ln2,
