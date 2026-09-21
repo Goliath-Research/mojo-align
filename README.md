@@ -80,6 +80,14 @@ Mojo include paths (also set by `bin/methylGrapher`):
 -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src
 ```
 
+## Supported platforms
+
+The pixi environment supports Linux x86-64 (`linux-64`) and Linux ARM64
+(`linux-aarch64`) hosts. Host architecture is independent of the implemented
+compute backends: this repository provides CPU execution plus NVIDIA CUDA and
+AMD HIP accelerator paths through Mojo `DeviceContext`. TPU and AWS Trainium
+backends are not implemented.
+
 ## Fleet image staging
 
 MethylPipeline `Dockerfile.mojo` expects a flat `engine/` + `src/` tree. Assemble:

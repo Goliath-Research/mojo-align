@@ -12,5 +12,5 @@ authors = ["David Izada Rodriguez <davidizadar@GoliathResearch.com>"]
 channel = "https://conda.modular.com/max"
 
 [scripts]
-run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src methylgrapher/src/main.mojo"
+run = "mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src methylgrapher/src/main.mojo"
 test = "python -m pytest"

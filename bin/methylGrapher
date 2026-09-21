@@ -17,12 +17,13 @@ export PATH="$HOME/.pixi/bin:$PATH"
 
 cd "$REPO_ROOT"
 
-# Mojo include paths for the four packages (flat imports preserved).
+# Mojo include paths for the packages (flat imports preserved).
 MOJO_I=(
   -I gpu-common/src
   -I fq2bam-meth/src
   -I giraffe/src
   -I methylgrapher/src
+  -I numeric/src
 )
 
 # Python: engine package under methylgrapher/; scripts for legacy helpers.

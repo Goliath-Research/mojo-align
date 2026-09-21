@@ -34,7 +34,7 @@ steps:
       set -euo pipefail
       export PATH="$HOME/.pixi/bin:$PATH"
       export PYTHONPATH="$PWD/methylgrapher:$PWD/giraffe/scripts:$PWD/giraffe/python:$PWD/fq2bam-meth/python:$PWD/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
-      pixi run mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src \
+      pixi run mojo -I gpu-common/src -I fq2bam-meth/src -I giraffe/src -I methylgrapher/src -I numeric/src \
         methylgrapher/src/main.mojo help | head -40
       ./bin/methylGrapher help | head -20
     displayName: Mojo + CLI help smoke
