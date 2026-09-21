@@ -248,16 +248,16 @@ def minimizers_batch_devicecontext(
         )
 
     comptime if has_accelerator():
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext
         from std.memory import UnsafePointer
 
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
             codes: UnsafePointer[UInt8, MutAnyOrigin],
-            n: Int,
+            n: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n:
                 return
             var b = bases[idx]
@@ -279,11 +279,11 @@ def minimizers_batch_devicecontext(
             hashes_f: UnsafePointer[UInt64, MutAnyOrigin],
             hashes_r: UnsafePointer[UInt64, MutAnyOrigin],
             valid: UnsafePointer[UInt8, MutAnyOrigin],
-            n_bases: Int,
-            k_len: Int,
-            stride: Int,
+            n_bases: Int64,
+            k_len: Int64,
+            stride: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n_bases:
                 return
             var pos = idx % stride
@@ -297,7 +297,7 @@ def minimizers_batch_devicecontext(
             var base = (idx // stride) * stride + pos
             var fk: UInt64 = 0
             var rk: UInt64 = 0
-            var j = 0
+            var j = Int64(0)
             while j < k_len:
                 var c = codes[base + j]
                 if c > 3:
@@ -389,7 +389,7 @@ def minimizers_batch_devicecontext(
             ctx.enqueue_function[pack_bases_kernel](
                 dev_bases.unsafe_ptr(),
                 dev_codes.unsafe_ptr(),
-                n_bases,
+                Int64(n_bases),
                 grid_dim=grid,
                 block_dim=BLOCK,
             )
@@ -400,9 +400,9 @@ def minimizers_batch_devicecontext(
                 dev_hf.unsafe_ptr(),
                 dev_hr.unsafe_ptr(),
                 dev_valid.unsafe_ptr(),
-                n_bases,
-                k,
-                max_len,
+                Int64(n_bases),
+                Int64(k),
+                Int64(max_len),
                 grid_dim=grid,
                 block_dim=BLOCK,
             )

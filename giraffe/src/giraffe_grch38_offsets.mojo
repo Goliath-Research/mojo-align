@@ -92,7 +92,8 @@ struct Grch38Offsets(Copyable, Movable):
                 while line.byte_length() > 0 and (
                     line.endswith("\n") or line.endswith("\r")
                 ):
-                    line = String(line[byte = 0 : line.byte_length() - 1])
+                    var trimmed = String(line[byte = 0 : line.byte_length() - 1])
+                    line = trimmed
                 if line.byte_length() == 0:
                     continue
                 var tab = line.find("\t")

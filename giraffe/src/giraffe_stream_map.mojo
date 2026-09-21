@@ -61,7 +61,8 @@ def _strip_nl(mut s: String):
     while s.byte_length() > 0:
         var last = String(s[byte = s.byte_length() - 1 : s.byte_length()])
         if last == "\n" or last == "\r":
-            s = String(s[byte = 0 : s.byte_length() - 1])
+            var trimmed = String(s[byte = 0 : s.byte_length() - 1])
+            s = trimmed
         else:
             break
 
@@ -106,7 +107,8 @@ def _parse_mg_fastq_fields(n: String, s: String) -> StreamRead:
         bare = String(parts[0])
     var sp = bare.split(" ")
     if len(sp) > 0:
-        bare = String(sp[0])
+        var first = String(sp[0])
+        bare = first
     return StreamRead(bare, s, original, conversion)
 
 

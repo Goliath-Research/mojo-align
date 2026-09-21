@@ -55,8 +55,8 @@ def scatter_add_u32_on_device(
     var backend = probe_device_context(resolved)
     comptime if has_accelerator():
         from std.atomic import Atomic
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext
         from std.memory import UnsafePointer
 
         def scatter_u32_kernel(

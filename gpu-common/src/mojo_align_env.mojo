@@ -9,11 +9,13 @@ def getenv_align(suffix: String, default: String = "") raises -> String:
     var new_key = "MOJO_ALIGN_" + suffix
     var old_key = "METHYLGRAPHER_MOJO_" + suffix
     var value = String(os_mod.environ.get(new_key, ""))
-    value = String(value.strip())
+    var stripped_value = String(value.strip())
+    value = stripped_value
     if value.byte_length() > 0:
         return value
     var legacy = String(os_mod.environ.get(old_key, ""))
-    legacy = String(legacy.strip())
+    var stripped_legacy = String(legacy.strip())
+    legacy = stripped_legacy
     if legacy.byte_length() > 0:
         print("warning: ", old_key, " is deprecated; use ", new_key, flush=True)
         return legacy

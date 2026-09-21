@@ -92,7 +92,7 @@ fn parallel_mcall(
     # TODO: replace serial loop with parallelize() once Dict thread-safety
     # semantics are confirmed in the Mojo runtime.
     #
-    # parallelize[batch_worker](n_batches, thread_count)
+    # parallelize(batch_worker, n_batches, thread_count)
     #
     # For now, process serially:
     for b_idx in range(n_batches):

@@ -7,7 +7,7 @@
 # (same rule as the old GPU kernel).
 
 from std.collections import List
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer, unsafe_memmove
 from std.python import Python
 from std.sys import has_accelerator
 
@@ -44,8 +44,8 @@ def gpu_sort_markdup(
     comptime if not has_accelerator():
         raise Error("gpu_sort_markdup requires accelerator build")
     else:
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
         comptime RADIX_R = 256
         comptime BINS = 256
@@ -243,35 +243,35 @@ def gpu_sort_markdup(
         var h_dlo = ctx.enqueue_create_host_buffer[DType.uint64](n)
         var h_score = ctx.enqueue_create_host_buffer[DType.uint32](n)
         var h_pair = ctx.enqueue_create_host_buffer[DType.uint32](n)
-        memcpy(
+        unsafe_memmove(
             dest=h_coord.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=coord_addr
             ),
             count=n,
         )
-        memcpy(
+        unsafe_memmove(
             dest=h_dhi.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=dup_hi_addr
             ),
             count=n,
         )
-        memcpy(
+        unsafe_memmove(
             dest=h_dlo.unsafe_ptr(),
             src=UnsafePointer[UInt64, MutAnyOrigin](
                 unsafe_from_address=dup_lo_addr
             ),
             count=n,
         )
-        memcpy(
+        unsafe_memmove(
             dest=h_score.unsafe_ptr(),
             src=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=score_addr
             ),
             count=n,
         )
-        memcpy(
+        unsafe_memmove(
             dest=h_pair.unsafe_ptr(),
             src=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=pair_addr
@@ -309,7 +309,7 @@ def gpu_sort_markdup(
             var base = t * tile
             var n_t = tlen[t]
             var grid_n = (n_t + BLOCK - 1) // BLOCK
-            memcpy(
+            unsafe_memmove(
                 dest=h_tile_key.unsafe_ptr(),
                 src=h_dlo.unsafe_ptr() + base,
                 count=n_t,
@@ -334,7 +334,7 @@ def gpu_sort_markdup(
                 h_base,
                 n_t,
             )
-            memcpy(
+            unsafe_memmove(
                 dest=h_tile_hi.unsafe_ptr(),
                 src=h_dhi.unsafe_ptr() + base,
                 count=n_t,
@@ -455,7 +455,7 @@ def gpu_sort_markdup(
             var base2 = t * tile
             var n_t2 = tlen[t]
             var grid_n2 = (n_t2 + BLOCK - 1) // BLOCK
-            memcpy(
+            unsafe_memmove(
                 dest=h_tile_key.unsafe_ptr(),
                 src=h_coord.unsafe_ptr() + base2,
                 count=n_t2,
@@ -511,14 +511,14 @@ def gpu_sort_markdup(
             headc[bestc] = headc[bestc] + 1
             out_c += 1
 
-        memcpy(
+        unsafe_memmove(
             dest=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=perm_addr
             ),
             src=h_perm.unsafe_ptr(),
             count=n,
         )
-        memcpy(
+        unsafe_memmove(
             dest=UnsafePointer[UInt32, MutAnyOrigin](
                 unsafe_from_address=is_dup_addr
             ),

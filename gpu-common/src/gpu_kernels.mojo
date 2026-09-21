@@ -47,7 +47,7 @@ def probe_device_context(device: String) raises -> String:
             return String("devicecontext-cpu")
         return String("host-fallback-no-accelerator")
     else:
-        from std.gpu.host import DeviceContext
+        from max.gpu.host import DeviceContext
 
         if api == "cpu":
             try:
@@ -101,16 +101,16 @@ def seed_kmers_on_device(
     )
 
     comptime if has_accelerator():
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext
         from std.memory import UnsafePointer
 
         def pack_bases_kernel(
             bases: UnsafePointer[UInt8, MutAnyOrigin],
             codes: UnsafePointer[UInt8, MutAnyOrigin],
-            n: Int,
+            n: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n:
                 return
             var b = bases[idx]
@@ -139,11 +139,11 @@ def seed_kmers_on_device(
         def kmer_hash_kernel(
             codes: UnsafePointer[UInt8, MutAnyOrigin],
             out_hash: UnsafePointer[UInt64, MutAnyOrigin],
-            n_bases: Int,
-            k_len: Int,
-            stride: Int,
+            n_bases: Int64,
+            k_len: Int64,
+            stride: Int64,
         ):
-            var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+            var idx = Int64(block_idx.x * block_dim.x + thread_idx.x)
             if idx >= n_bases:
                 return
             var pos = idx % stride
@@ -152,7 +152,7 @@ def seed_kmers_on_device(
                 return
             var base = (idx // stride) * stride + pos
             var key: UInt64 = 0
-            var j = 0
+            var j = Int64(0)
             while j < k_len:
                 var c = codes[base + j]
                 if c > 3:
@@ -160,7 +160,14 @@ def seed_kmers_on_device(
                     return
                 key = (key << 2) | UInt64(c)
                 j += 1
-            out_hash[idx] = wang_hash_u64(key)
+            key = (~key) + (key << 21)
+            key = key ^ (key >> 24)
+            key = (key + (key << 3)) + (key << 8)
+            key = key ^ (key >> 14)
+            key = (key + (key << 2)) + (key << 4)
+            key = key ^ (key >> 28)
+            key = key + (key << 31)
+            out_hash[idx] = key
 
         if backend.startswith("devicecontext-cuda") or backend.startswith(
             "devicecontext-hip"
@@ -201,16 +208,16 @@ def seed_kmers_on_device(
             ctx.enqueue_function[pack_bases_kernel](
                 dev_bases.unsafe_ptr(),
                 dev_codes.unsafe_ptr(),
-                n_bases,
+                Int64(n_bases),
                 grid_dim=grid,
                 block_dim=BLOCK,
             )
             ctx.enqueue_function[kmer_hash_kernel](
                 dev_codes.unsafe_ptr(),
                 dev_hash.unsafe_ptr(),
-                n_bases,
-                k,
-                max_len,
+                Int64(n_bases),
+                Int64(k),
+                Int64(max_len),
                 grid_dim=grid,
                 block_dim=BLOCK,
             )

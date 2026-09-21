@@ -49,7 +49,8 @@ def _strip_nl(mut s: String):
     while s.byte_length() > 0:
         var last = String(s[byte = s.byte_length() - 1 : s.byte_length()])
         if last == "\n" or last == "\r":
-            s = String(s[byte = 0 : s.byte_length() - 1])
+            var trimmed = String(s[byte = 0 : s.byte_length() - 1])
+            s = trimmed
         else:
             break
 
@@ -89,7 +90,8 @@ def _read_one(fh: PythonObject) raises -> FastqRec:
     _strip_nl(s)
     _strip_nl(q)
     if n.startswith("@"):
-        n = String(n[byte = 1 : n.byte_length()])
+        var name_body = String(n[byte = 1 : n.byte_length()])
+        n = name_body
     var bare = n
     var parts = n.split(" ")
     if len(parts) > 0:
@@ -328,9 +330,9 @@ def map_fastq_dense_gpu_locate(
     comptime if not has_accelerator():
         raise Error("map_fastq_dense_gpu_locate requires accelerator build")
     else:
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
-        from std.memory import UnsafePointer, memcpy
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext
+        from std.memory import UnsafePointer, unsafe_memmove
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
@@ -365,7 +367,7 @@ def map_fastq_dense_gpu_locate(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                memcpy(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK

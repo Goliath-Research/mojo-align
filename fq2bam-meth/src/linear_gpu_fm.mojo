@@ -5,9 +5,9 @@
 # gapless/softclip extend on the forward pac (f*/r* contigs). Default remains
 # parity until Clara gates pass.
 
-from std.algorithm import parallelize
+from max.algorithm import parallelize
 from std.collections import Dict, List
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer, unsafe_memmove
 from std.python import Python, PythonObject
 from std.sys import has_accelerator
 from std.time import perf_counter as _tick
@@ -216,7 +216,7 @@ def _gather_perm_to_writer(
         var dst = UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=bam_blob_addr + gout
         )
-        memcpy(dest=dst, src=src, count=rlen)
+        unsafe_memmove(dest=dst, src=src, count=rlen)
         if apply_dup and Int(h_dup[orig]) != 0:
             _or_dup_flag(bp_out, gout)
         gout += rlen
@@ -365,7 +365,7 @@ def _u64_at(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
 def _copy_bytes(dst: Int, src: Int, nbytes: Int):
     if nbytes <= 0:
         return
-    memcpy(dest=_u8_at(dst), src=_u8_at(src), count=nbytes)
+    unsafe_memmove(dest=_u8_at(dst), src=_u8_at(src), count=nbytes)
 
 
 def _unclipped5(flag: Int, pos0: Int, sl: Int, sr: Int, qlen: Int) -> Int:
@@ -1061,8 +1061,8 @@ def map_fastq_fm_gpu(
     comptime if not has_accelerator():
         raise Error("map_fastq_fm_gpu requires accelerator build")
     else:
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import (
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import (
             DeviceBuffer,
             DeviceContext,
             DeviceEvent,
@@ -1070,7 +1070,7 @@ def map_fastq_fm_gpu(
             DeviceStream,
             HostBuffer,
         )
-        from std.memory import UnsafePointer, memcpy
+        from std.memory import UnsafePointer, unsafe_memmove
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
@@ -1105,7 +1105,7 @@ def map_fastq_fm_gpu(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                memcpy(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK
@@ -2500,7 +2500,7 @@ def map_fastq_fm_gpu(
                 while si < n_seq:
                     var ln = Int(host_lens[si])
                     if ln > 0:
-                        memcpy(
+                        unsafe_memmove(
                             dest=_u8_at(bases_addr + si * max_len),
                             src=_u8_at(Int(seq_ap[si])),
                             count=ln,
@@ -2656,7 +2656,7 @@ def map_fastq_fm_gpu(
                 var ov_fail = List[Int](length=2, fill=0)
                 var ov_t = List[Float64](length=2, fill=Float64(0))
 
-                @parameter
+                @__parameter
                 def ov_work(i: Int):
                     var tw = _tick()
                     try:
@@ -2709,7 +2709,7 @@ def map_fastq_fm_gpu(
                         print("MojoLinear GPU-fm overlap worker", i, e)
                     ov_t[i] = _tick() - tw
 
-                parallelize[ov_work](2, 2)
+                parallelize(ov_work, 2, 2)
                 if ov_fail[0] != 0 or ov_fail[1] != 0:
                     raise Error("FM pack||FASTQ overlap worker failed")
                 _ = bam_arena.append_raw(

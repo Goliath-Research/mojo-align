@@ -45,7 +45,8 @@ struct GraphIndex(Copyable, Movable):
             while line.byte_length() > 0:
                 var last = String(line[byte = line.byte_length() - 1 : line.byte_length()])
                 if last == "\n" or last == "\r":
-                    line = String(line[byte = 0 : line.byte_length() - 1])
+                    var trimmed = String(line[byte = 0 : line.byte_length() - 1])
+                    line = trimmed
                 else:
                     break
             if line.byte_length() == 0:

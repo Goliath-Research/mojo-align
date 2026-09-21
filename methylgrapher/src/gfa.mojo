@@ -51,7 +51,8 @@ struct GraphicalFragmentAssemblyMemory(Copyable, Movable):
                     line[byte = line.byte_length() - 1 : line.byte_length()]
                 )
                 if last == "\n" or last == "\r":
-                    line = String(line[byte = 0 : line.byte_length() - 1])
+                    var trimmed = String(line[byte = 0 : line.byte_length() - 1])
+                    line = trimmed
                 else:
                     break
             var parts = line.split("\t")

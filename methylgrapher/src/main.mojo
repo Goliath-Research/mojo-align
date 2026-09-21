@@ -1,5 +1,5 @@
 # src/main.mojo
-# methylGrapher-mojo CLI dispatcher — Mojo 1.0 entry point.
+# methylGrapher-mojo CLI dispatcher — Mojo 1.1 entry point.
 #
 # Native: help, vg_check, Align, MojoGiraffe, MethylCall, MergeCpG,
 # ConversionRate. PrepareGenome / Main / MergeGAF forward to engine.cli via
@@ -11,8 +11,8 @@
 #   mojo src/main.mojo help
 #   mojo src/main.mojo MethylCall -work_dir <dir> -index_prefix <prefix> ...
 #
-# Mojo 1.0.0b2 notes: `fn` was removed (all `def`); stdlib imports need the
-# `std.` prefix; Python interop is `from std.python import Python`.
+# Mojo 1.1: `def` only; stdlib imports use the `std.` prefix; Python interop is
+# `from std.python import Python`. GPU kernel scalars are Int64.
 
 from std.python import Python
 from std.sys import argv as sys_argv, exit

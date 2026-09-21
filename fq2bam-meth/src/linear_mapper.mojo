@@ -35,7 +35,8 @@ def _strip_nl(mut s: String):
     while s.byte_length() > 0:
         var last = String(s[byte = s.byte_length() - 1 : s.byte_length()])
         if last == "\n" or last == "\r":
-            s = String(s[byte = 0 : s.byte_length() - 1])
+            var trimmed = String(s[byte = 0 : s.byte_length() - 1])
+            s = trimmed
         else:
             break
 
@@ -80,7 +81,8 @@ def _read_one(fh: PythonObject) raises -> FastqRead:
     _strip_nl(s)
     _strip_nl(q)
     if n.startswith("@"):
-        n = String(n[byte = 1 : n.byte_length()])
+        var name_body = String(n[byte = 1 : n.byte_length()])
+        n = name_body
     var bare = n
     var parts = n.split(" ")
     if len(parts) > 0:

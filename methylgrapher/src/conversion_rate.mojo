@@ -21,7 +21,8 @@ def _strip_line(line: String) -> String:
     while s.byte_length() > 0:
         var last = String(s[byte = s.byte_length() - 1 : s.byte_length()])
         if last == "\n" or last == "\r":
-            s = String(s[byte = 0 : s.byte_length() - 1])
+            var trimmed = String(s[byte = 0 : s.byte_length() - 1])
+            s = trimmed
         else:
             break
     return s

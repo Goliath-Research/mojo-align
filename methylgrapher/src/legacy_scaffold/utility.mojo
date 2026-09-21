@@ -36,7 +36,7 @@ fn reverse_complement(seq: String) -> String:
 # ---------------------------------------------------------------------------
 # Phred score lookup tables
 # ---------------------------------------------------------------------------
-# Precomputed at compile time via @parameter + VariadicList
+# Precomputed at compile time via @__parameter + VariadicList
 # ASCII 33..126 covers all standard Phred+33 characters.
 
 fn phred_to_int(qual_char: String) -> Int:

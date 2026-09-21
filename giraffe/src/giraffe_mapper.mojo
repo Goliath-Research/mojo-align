@@ -38,7 +38,8 @@ def _strip_nl(mut s: String):
     while s.byte_length() > 0:
         var last = String(s[byte = s.byte_length() - 1 : s.byte_length()])
         if last == "\n" or last == "\r":
-            s = String(s[byte = 0 : s.byte_length() - 1])
+            var trimmed = String(s[byte = 0 : s.byte_length() - 1])
+            s = trimmed
         else:
             break
 
@@ -80,7 +81,8 @@ def _parse_mg_fastq_fields(n: String, s: String) -> FastqRead:
         bare = String(parts[0])
     var sp = bare.split(" ")
     if len(sp) > 0:
-        bare = String(sp[0])
+        var first = String(sp[0])
+        bare = first
     return FastqRead(bare, s, original, conversion)
 
 
@@ -98,7 +100,8 @@ def _parse_fastq(path: String) raises -> List[FastqRead]:
         _strip_nl(n)
         _strip_nl(s)
         if n.startswith("@"):
-            n = String(n[byte = 1 : n.byte_length()])
+            var stripped = String(n[byte = 1 : n.byte_length()])
+            n = stripped
         rows.append(_parse_mg_fastq_fields(n, s))
     fh.close()
     return rows^

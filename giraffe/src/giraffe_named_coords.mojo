@@ -140,7 +140,8 @@ def named_coords_try_open() raises -> NamedCoordsMojo:
         os_mod.environ.get("METHYLGRAPHER_NAMED_COORDS_INDEX", "")
     )
     # strip via Python to keep a real String (Mojo String.strip -> StringSlice).
-    env_idx = String(env_idx.strip())
+    var stripped_env_idx = String(env_idx.strip())
+    env_idx = stripped_env_idx
     if env_idx.byte_length() == 0:
         return named_coords_none()
     ensure_python_path()

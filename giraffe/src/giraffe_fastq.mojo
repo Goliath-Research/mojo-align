@@ -75,7 +75,8 @@ def giraffe_fq_read_header_seq(
     var n = _ascii_span(buf_addr, hoff, hlen)
     var s = _ascii_span(buf_addr, soff, slen)
     if n.startswith("@"):
-        n = String(n[byte = 1 : n.byte_length()])
+        var stripped_name = String(n[byte = 1 : n.byte_length()])
+        n = stripped_name
     name = n^
     seq = s^
     return True

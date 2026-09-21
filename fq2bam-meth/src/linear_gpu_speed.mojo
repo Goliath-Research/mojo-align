@@ -72,9 +72,9 @@ def map_fastq_dense_gpu_speed(
     comptime if not has_accelerator():
         raise Error("map_fastq_dense_gpu_speed requires accelerator build")
     else:
-        from std.gpu import block_dim, block_idx, thread_idx
-        from std.gpu.host import DeviceContext
-        from std.memory import UnsafePointer, memcpy
+        from max.gpu import block_dim, block_idx, thread_idx
+        from max.gpu.host import DeviceContext
+        from std.memory import UnsafePointer, unsafe_memmove
 
         def copy_bytes_offset_kernel(
             dst: UnsafePointer[UInt8, MutAnyOrigin],
@@ -109,7 +109,7 @@ def map_fastq_dense_gpu_speed(
                 var src = UnsafePointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=host_addr + off
                 )
-                memcpy(dest=host.unsafe_ptr(), src=src, count=n)
+                unsafe_memmove(dest=host.unsafe_ptr(), src=src, count=n)
                 var stage = ctx.enqueue_create_buffer[DType.uint8](n)
                 ctx.enqueue_copy(src_buf=host, dst_buf=stage)
                 var grid = (n + BLOCK - 1) // BLOCK

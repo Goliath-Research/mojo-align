@@ -30,7 +30,14 @@ MOJO_I=(
 export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ "${METHYLGRAPHER_ENGINE:-}" == "mojo" ]]; then
-    exec pixi run mojo "${MOJO_I[@]}" methylgrapher/src/main.mojo "$@"
+    # Mojo 1.1 will not emit kernels for Maxwell (sm_50) and older. Set
+    # METHYLGRAPHER_TARGET_ACCELERATOR=sm_90 on those hosts so the CPU program
+    # still builds. Hopper and newer GPUs can leave it unset.
+    MOJO_TARGET=()
+    if [[ -n "${METHYLGRAPHER_TARGET_ACCELERATOR:-}" ]]; then
+        MOJO_TARGET=(run --target-accelerator "${METHYLGRAPHER_TARGET_ACCELERATOR}")
+    fi
+    exec pixi run mojo "${MOJO_TARGET[@]}" "${MOJO_I[@]}" methylgrapher/src/main.mojo "$@"
 else
     exec pixi run python -m engine.cli "$@"
 fi
