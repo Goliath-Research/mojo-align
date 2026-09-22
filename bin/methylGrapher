@@ -30,14 +30,19 @@ MOJO_I=(
 export PYTHONPATH="${REPO_ROOT}/methylgrapher:${REPO_ROOT}/giraffe/scripts:${REPO_ROOT}/giraffe/python:${REPO_ROOT}/fq2bam-meth/python:${REPO_ROOT}/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ "${METHYLGRAPHER_ENGINE:-}" == "mojo" ]]; then
-    # Mojo 1.1 will not emit kernels for Maxwell (sm_50) and older. Set
-    # METHYLGRAPHER_TARGET_ACCELERATOR=sm_90 on those hosts so the CPU program
-    # still builds. Hopper and newer GPUs can leave it unset.
-    MOJO_TARGET=()
-    if [[ -n "${METHYLGRAPHER_TARGET_ACCELERATOR:-}" ]]; then
-        MOJO_TARGET=(run --target-accelerator "${METHYLGRAPHER_TARGET_ACCELERATOR}")
+    # Mojo 1.1 eagerly emits reachable GPU kernels, so compilation must target
+    # a supported production accelerator even when this host only has sm_50.
+    # Operators can override this for another deployed architecture.
+    TARGET_ACCELERATOR="${METHYLGRAPHER_TARGET_ACCELERATOR:-}"
+    if [[ -z "$TARGET_ACCELERATOR" ]]; then
+        if [[ -n "${METHYLGRAPHER_AMDGPU_ARCH:-}" ]]; then
+            TARGET_ACCELERATOR="amdgpu:${METHYLGRAPHER_AMDGPU_ARCH}"
+        else
+            TARGET_ACCELERATOR="nvidia:sm_90"
+        fi
     fi
-    exec pixi run mojo "${MOJO_TARGET[@]}" "${MOJO_I[@]}" methylgrapher/src/main.mojo "$@"
+    exec pixi run mojo run --target-accelerator "$TARGET_ACCELERATOR" \
+        "${MOJO_I[@]}" methylgrapher/src/main.mojo "$@"
 else
     exec pixi run python -m engine.cli "$@"
 fi
