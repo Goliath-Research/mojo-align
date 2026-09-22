@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pixi
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pixi.sh/install.sh | bash
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Mojo 1.1 toolchain
+        run: |
+          set -euo pipefail
+          pixi --version
+          pixi install
+
+      - name: Mojo help smoke
+        env:
+          METHYLGRAPHER_ENGINE: mojo
+          METHYLGRAPHER_TARGET_ACCELERATOR: sm_90
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.pixi/bin:$PATH"
+          export PYTHONPATH="$PWD/methylgrapher:$PWD/giraffe/scripts:$PWD/giraffe/python:$PWD/fq2bam-meth/python:$PWD/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+          pixi run mojo run --target-accelerator sm_90 \
+            -I gpu-common/src -I fq2bam-meth/src -I giraffe/src \
+            -I methylgrapher/src -I numeric/src \
+            methylgrapher/src/main.mojo help
+          ./bin/methylGrapher help
+
+      - name: Pytest subset
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.pixi/bin:$PATH"
+          export PYTHONPATH="$PWD/methylgrapher:$PWD/giraffe/scripts:$PWD/giraffe/python:$PWD/fq2bam-meth/python:$PWD/gpu-common/python${PYTHONPATH:+:$PYTHONPATH}"
+          pixi run python -m pytest \
+            gpu-common/tests \
+            fq2bam-meth/tests/test_fq2bam_meth.py \
+            methylgrapher/tests/test_align_backends.py \
+            methylgrapher/tests/test_align_backends_ready.py \
+            giraffe/tests/test_giraffe_gaf_parity.py \
+            -q --tb=line
+
+      - name: Stage flat image tree
+        run: |
+          set -euo pipefail
+          bash scripts/stage_flat_image_tree.sh "$PWD/_flat_image"
+          test -f _flat_image/src/main.mojo
+          test -f _flat_image/engine/cli.py
+          test -f _flat_image/src/linear_mapper.mojo
+          test -f _flat_image/src/gpu_kernels.mojo

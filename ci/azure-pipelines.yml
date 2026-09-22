@@ -1,6 +1,6 @@
-# mojo-align primary CI (pixi pytest + Mojo help smoke).
-# Azure DevOps: New pipeline → mojo-align → /ci/azure-pipelines.yml
-# Pool: self-hosted build-arm64 (Mojo linux-aarch64).
+# Superseded. GitHub Actions is the CI for this repository:
+# .github/workflows/ci.yml
+# This Azure Pipelines file is kept only as a record of the old build-arm64 pool.
 
 trigger:
   branches:
