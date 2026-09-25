@@ -6,7 +6,8 @@
 #
 # DEST defaults to ./_flat_image. Layout:
 #   DEST/{engine,src,scripts,tests,bin,pixi.toml,...}
-# so MethylPipeline Dockerfile.mojo can COPY engine/ src/ scripts/ tests/ unchanged.
+# so GoliathOmics workers/docker/methylgrapher/Dockerfile.mojo can COPY
+# engine/ src/ scripts/ tests/ unchanged.
 
 set -euo pipefail
 

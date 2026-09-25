@@ -88,13 +88,16 @@ compute backends: this repository provides CPU execution plus NVIDIA CUDA and
 AMD HIP accelerator paths through Mojo `DeviceContext`. TPU and AWS Trainium
 backends are not implemented.
 
-## Fleet image staging
+## Fleet image
 
-MethylPipeline `Dockerfile.mojo` expects a flat `engine/` + `src/` tree. Assemble:
+This repo does not build the worker image. GoliathOmics `Dockerfile.mojo` expects a flat `engine/` + `src/` tree. Assemble it, then build from the GoliathOmics checkout (Docker image, and a `.sif` when Apptainer is installed):
 
 ```bash
 bash scripts/stage_flat_image_tree.sh /tmp/mojo-flat
-export MOJO_ALIGN_ROOT=/tmp/mojo-flat   # or point at this repo + stage in the build script
+export MOJO_ALIGN_ROOT=/tmp/mojo-flat   # or point at this repo; the build script stages it
+# in the GoliathOmics repo:
+#   bash scripts/build_mojo_align_image.sh
+#   bash scripts/run_mojo_align_sif.sh /work/goliath/images/methylgrapher-1.70-mojo-cuda.sif -- Align ...
 ```
 
 In-container paths are `/opt/mojo-align` + `methylGrapher` entrypoint.
